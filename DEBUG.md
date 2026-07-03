@@ -1865,3 +1865,70 @@ the legacy ego_route (open-ended forward walker) is unaffected.
   vehicle bbox. Verified for Charger; should hold for any
   driving-class blueprint.
 
+
+## 24. Retrained UFLD checkpoint available in the UI [DONE]
+
+**What changed.** A second UFLD V2 checkpoint has been added to the
+stack, trained on a 5× larger dataset (75 000 frames vs the original
+15 000). Both models are now selectable from the "Lane model" dropdown
+in the Features frame of `UI.py`, so the operator can flip between
+them without editing config or rebuilding.
+
+- **`UFLD_F1=0.87.pth`** — original §3.1 fine-tune, F1 = 0.87 on the
+  15 K test split (Town03/04/10 clear-weather only).
+- **`UFLD_F1=0.67.pth`** — new §3.3 retrain, F1 = 0.67 on the
+  75 K test split (Town01/02/03/04/05/10HD × clear + rain).
+
+Both files live in `src/perception/models/`. The UI passes the
+selected `.pth` filename to `lane_detection_node` via
+`--ros-args -p model_filename:=<ref>` at LKAS: ON. See `LANE_MODELS`
+at the top of [UI.py](UI.py).
+
+**Why the F1 dropped from 0.87 to 0.67 — it didn't, the yardstick
+changed.** The old number was measured on the old test split (3 easy
+towns, all clear). The new number is measured on 6 towns including
+Town01 curb-only roads + rain in every town. Direct apples-to-apples
+requires evaluating the old checkpoint on the *new* test split
+first — planned as follow-up. See full details in
+[`00_Lane_Assistant/02_UFLD_V2/DEBUG.md §3.3`](../../00_Lane_Assistant/02_UFLD_V2/DEBUG.md#33-retraining-on-75-k-frames-6-towns--2-weather).
+
+**Effective training samples per epoch was 61 550, not 75 000.**
+
+- `list/train_gt.txt` has 84 000 lines (raw), which is what the trainer
+  iterates each epoch.
+- After deduplication only **61 550 unique image references** remain.
+- Each unique frame was therefore shown ~1.37 times per epoch — the
+  extra ~22 K exposures were repeats, not new information.
+
+Root cause is on the *collector* side, not the trainer: `collect_dataset.py`
+opens the list files in append mode (`open(list_dir / fname, 'a')`) and
+writes the 70 / 15 / 15 split at the end of each per-town run. During the
+overnight batch several runs hit the CARLA teardown race — process exit
+code `rc=134` from `terminate called after throwing an instance of
+'std::runtime_error': trying to operate on a destroyed actor` in the
+`finally:` NPC-destroy loop — *after* the loop had already written the
+split lines. `collect_all.sh` then retried the failed ranges, and each
+retry appended a second set of split lines pointing at the same on-disk
+PNGs. Cache builder collapses duplicates by image path (dict key), but
+the trainer iterates the raw list file.
+
+**Same mechanism caused a partial train↔eval leak:** sum of per-split
+unique frames (61 550 + 16 850 + 16 950 = 95 350) exceeds disk-unique
+(75 000) by ~20 K, meaning ~20 K frames appear in more than one split.
+Val / test F1 numbers are therefore optimistic by an unknown fraction.
+Fix without retraining: `awk '!seen[$0]++' list/<file>.txt` on each
+split, then rerun the eval script on the cleaned splits.
+
+Full training config, LR-schedule trajectory, and F1 / P / R progression
+in [`00_Lane_Assistant/02_UFLD_V2/DEBUG.md §3.3`](../../00_Lane_Assistant/02_UFLD_V2/DEBUG.md#33-retraining-on-75-k-frames-6-towns--2-weather).
+
+**Closed-loop A/B — pending.** Recommended workflow (record both runs
+via the new "Record rosbag" checkbox, play them back through the same
+route in Foxglove):
+
+1. Same spawn index + same weather + same route.
+2. LKAS: ON with `UFLD_F1=0.87.pth` → bag #1.
+3. LKAS: OFF, dropdown switch, LKAS: ON with `UFLD_F1=0.67.pth` → bag #2.
+4. Focus on Town01 (curbs) + rain — the scenes the new model was
+   trained *for* and the old one wasn't.
+

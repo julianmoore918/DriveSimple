@@ -57,12 +57,8 @@ CARLA_DIR     = Path('/home/sirius/CARLA_0.9.16')
 # path is used as-is. Add new trained checkpoints below as they become
 # available — no other UI code needs to change.
 LANE_MODELS: list[tuple[str, str]] = [
-    ('Current best (UFLD_best.pth)', 'UFLD_best.pth'),
-    # After the 20260701 retrain finishes, add e.g.:
-    # ('Retrained 20260701',
-    #  '/home/sirius/workspace/01_CV_Models/'
-    #  '01_Ultra_Fast_Lane_Detection_V2/logs/carla_res34/'
-    #  '20260701_092451_lr_1e-02_b_16carla_finetune/model_best.pth'),
+    ('Current best (UFLD_F1=0.87.pth)', 'UFLD_F1=0.87.pth'),
+    ('Retrained (UFLD_F1=0.67.pth)', 'UFLD_F1=0.67.pth'),
 ]
 
 # Same pattern as LANE_MODELS but for the YOLO object detector consumed
