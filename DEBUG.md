@@ -1932,3 +1932,131 @@ route in Foxglove):
 4. Focus on Town01 (curbs) + rain — the scenes the new model was
    trained *for* and the old one wasn't.
 
+
+## 25. Per-lane confidence output for UFLD (YOLO-analogue) [DONE]
+
+**What was added.** `lane_detection_node` now emits a scalar confidence
+`∈ [0, 1]` per ego lane, published on two new topics and rendered as a
+colour-coded text overlay in the top-left of `/LKAS/perception/debug_image`.
+Analogous to YOLO's per-detection `objectness × class_prob` — but
+distilled from UFLD's own row-anchor logits so no extra head or
+retraining is required.
+
+New topics (both `std_msgs/Float32`):
+
+| Topic | Meaning |
+|-------|---------|
+| `/LKAS/ego_lane_left_conf`  | Confidence in the ego-left polyline for this frame |
+| `/LKAS/ego_lane_right_conf` | Confidence in the ego-right polyline for this frame |
+
+Published at the LKAS inference rate (~5 Hz, same as the polyline topics).
+During junctions the node publishes `0.0` on both — matches the
+already-existing `to_path([], header)` empty-Path behaviour, so
+downstream consumers can gate uniformly on either signal.
+
+**How the number is computed.** UFLD V2's decode does
+`loc_row.argmax(1)` and `exist_row.argmax(1)` for hard row-anchor
+predictions, throwing away the underlying soft distributions. The
+confidence output recovers them:
+
+```python
+# lane_detection_node.py — inside UFLDInference.__call__, after
+# pred = self.net(tensor)
+exist_soft = torch.softmax(exist_row, dim=1)[:, 1]   # (1, num_row, num_lanes) — P(lane present)
+loc_soft   = torch.softmax(loc_row,   dim=1)         # (1, 201, num_row, num_lanes)
+pos_peak   = loc_soft.max(dim=1).values              # (1, num_row, num_lanes) — sharpest cell probability
+
+def lane_conf(lane_idx):
+    mask = exist_soft[0, :, lane_idx] > 0.5          # anchors where lane is visible
+    if mask.sum() == 0: return 0.0
+    return float((exist_soft[0, mask, lane_idx]
+                  * pos_peak[0, mask, lane_idx]).mean())
+```
+
+- `exist_soft` is the "yes-there's-a-lane-at-this-anchor" side of the
+  binary softmax over the existence-branch logits (`exist_row` has
+  shape `(B, 2, num_row, num_lanes)`; the class=1 slice is
+  `P(lane exists)`).
+- `pos_peak` is the height of the tallest bin in the 201-bin softmax
+  over the position-branch logits (`loc_row` has shape
+  `(B, num_cell_row + 1, num_row, num_lanes)`; the argmax of dim=1
+  picks the winning cell, `.max` returns its probability).
+- The product is the per-anchor confidence: "there's a lane here **and**
+  we know precisely which cell it's in."
+- Averaging over anchors that pass the `exist > 0.5` mask gives one
+  scalar per lane. Anchors where the lane isn't even binary-visible
+  are excluded so the mean isn't diluted by masked positions.
+
+**Why multiply exist × pos_peak instead of using either alone.** A
+high `exist_prob` on its own means "I know a lane point is at this
+row" but says nothing about *where* — a flat position softmax spread
+across 5 neighbouring cells (`pos_peak ≈ 0.3`) still argmaxes cleanly
+but is spatially untrustworthy. A high `pos_peak` on its own says
+"*if* there were a lane it'd be in this cell" but the model may be
+99 % sure no lane exists there at all. The product suppresses both
+failure modes with one number.
+
+**Visualisation.** `lane_detection_node.annotate()` draws two lines of
+text in the top-left corner of the LKAS debug image:
+
+```
+L: 0.72        <- ego-left  (colour by tier)
+R: 0.85        <- ego-right (colour by tier)
+```
+
+Colour tiers:
+
+| Range | Colour | Interpretation |
+|-------|--------|----------------|
+| `≥ 0.70` | green  | model is confident — polyline safe to use as-is |
+| `0.30–0.70` | yellow | borderline — polyline present but position ambiguous |
+| `< 0.30` | red    | untrusted — polyline may still be non-empty but not to be believed |
+
+`0.00` during junctions.
+
+**Expected confidence bands with the current models.** Confidence is a
+function of both the *scene* and how well the *model* was trained for
+that scene. Rough guide:
+
+| Scene | `UFLD_F1=0.87.pth` (old, 15 K) | `UFLD_F1=0.67.pth` (new, 75 K) |
+|-------|--------------------------------|--------------------------------|
+| Town04 clear straight | 0.45 – 0.55 | expected 0.70 – 0.85 |
+| Town03 gentle bend | 0.30 – 0.45 | 0.55 – 0.75 |
+| Town01 clear (curbs) | ~0.15 – 0.30 (never trained on) | 0.45 – 0.65 |
+| Town01 rain | ~0.10 – 0.20 (never trained on) | 0.35 – 0.55 |
+| Inside a junction | 0.00 (explicit) | 0.00 (explicit) |
+
+So-so on absolute values; the useful signal is **relative behaviour** —
+the number should *fall* as UFLD gets less certain (edge cases, weather
+transitions, tight bends) and *rise* on clean straights. That gradient
+is real regardless of which model is loaded.
+
+**Downstream integration (not yet wired).** The topics exist and the
+overlay renders — but no controller / gate currently consumes them.
+Two natural extensions if we want lane confidence to affect behaviour
+rather than just informing the operator:
+
+- **`perception_node` centerline gate.** Currently gates on "polyline
+  has ≥ 2 points". Could additionally require `conf > THRESHOLD` on
+  both lanes for the centerline to be considered trustworthy. Low
+  confidence → treat as if the polyline were empty → fall back to
+  centre-strip (or drop, depending on junction state — see §16).
+- **Stanley controller.** When either confidence drops below threshold,
+  hand control to the bridge's pure-pursuit fallback the same way an
+  empty-polyline `HOLD` already does. Softer, more graduated handover
+  than the current binary "polyline present / absent" check.
+
+Both would be small changes; deferred until the retrained checkpoint's
+absolute confidence values are validated in closed-loop and a stable
+threshold is picked.
+
+**Files touched.**
+
+- `src/perception/perception/lane_detection_node.py` — soft-logit
+  extraction after `pred = self.net(tensor)`, two new `Float32`
+  publishers, `annotate()` overlay, junction-branch `0.0` publish.
+- No other node needs to change to *see* the topics; anything
+  currently subscribed to `/LKAS/ego_lane_*` can add a matching
+  `_conf` subscription with the standard `rclpy.create_subscription`
+  pattern.
+
