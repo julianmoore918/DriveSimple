@@ -578,6 +578,47 @@ class ADASUI:
                                          foreground='#888888', width=12)
         self.acc_status_lbl.grid(row=1, column=1, sticky='w', padx=(6, 0))
 
+
+        # ── Kalman lane smoothing toggle, above Lane model ───────────
+        # Passed to lane_detection_node as -p enable_kalman:=<bool>.
+        # Toggling mid-run requires LKAS: OFF → change → LKAS: ON.
+        self.kalman_enable_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(feats, text='Kalman lane smoothing',
+                        variable=self.kalman_enable_var).grid(
+            row=2, column=0, columnspan=2, sticky='w', pady=(4, 0))
+
+        # ── KF process-noise PSDs (tuning knobs) ─────────────────────
+        # q_a curvature, q_b heading, q_c lateral offset. Passed to
+        # lane_detection_node as -p kf_q_a:=... at LKAS: ON. Default
+        # values match the node's own defaults; empty box = "use node
+        # default" (skipped when building the launch args).
+        kf_row = ttk.Frame(feats)
+        kf_row.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(2, 0))
+        ttk.Label(kf_row, text='KF q_a').grid(row=0, column=0, sticky='w')
+        # Bumped 10× (was 5e-3): the χ² gate was rejecting genuine
+        # turn-in frames because the prior covariance was too tight.
+        # Wider process-noise PSD → wider innovation → more measurements
+        # pass the 95% gate.
+        self.kf_qa_var = tk.StringVar(value='5e-2')
+        ttk.Entry(kf_row, textvariable=self.kf_qa_var, width=7).grid(
+            row=0, column=1, sticky='w', padx=(2, 8))
+        ttk.Label(kf_row, text='q_b').grid(row=0, column=2, sticky='w')
+        # Bumped 5× (was 1e-1) for the heading-rate — same reasoning.
+        self.kf_qb_var = tk.StringVar(value='5e-1')
+        ttk.Entry(kf_row, textvariable=self.kf_qb_var, width=7).grid(
+            row=0, column=3, sticky='w', padx=(2, 8))
+        ttk.Label(kf_row, text='q_c').grid(row=0, column=4, sticky='w')
+        # Bumped 5× (was 1.0) for the lateral-offset state.
+        self.kf_qc_var = tk.StringVar(value='5.0')
+        ttk.Entry(kf_row, textvariable=self.kf_qc_var, width=7).grid(
+            row=0, column=5, sticky='w', padx=(2, 8))
+        # Live-push q_a/q_b/q_c to a running lane_detection_node via
+        # `ros2 param set`. Needs the perception node to have registered
+        # a SetParametersCallback that rebuilds the KF Q matrix.
+        ttk.Button(kf_row, text='Apply KF',
+                   command=self._apply_kf_params).grid(
+            row=0, column=6, sticky='w')
+
         # ── Lane-detection (UFLD) model selector, above LKAS ─────────
         # See LANE_MODELS at the top. Passed to lane_detection_node as
         # -p model_filename:=<ref> at LKAS: ON. No filesystem scan at
@@ -585,7 +626,7 @@ class ADASUI:
         # existed).
         self.lane_model_var = tk.StringVar(value=LANE_MODELS[0][0])
         model_row = ttk.Frame(feats)
-        model_row.grid(row=2, column=0, columnspan=2, sticky='ew',
+        model_row.grid(row=4, column=0, columnspan=2, sticky='ew',
                        pady=(4, 2))
         model_row.columnconfigure(1, weight=1)
         ttk.Label(model_row, text='Lane model:').grid(
@@ -595,11 +636,11 @@ class ADASUI:
                      state='readonly', width=32).grid(
             row=0, column=1, sticky='ew', padx=(4, 0))
         self.lkas_btn = ttk.Button(feats, text='LKAS: OFF', command=self.toggle_lkas)
-        self.lkas_btn.grid(row=3, column=0, sticky='ew', pady=2)
+        self.lkas_btn.grid(row=5, column=0, sticky='ew', pady=2)
         self.lkas_status_var = tk.StringVar(value='○ idle')
         self.lkas_status_lbl = ttk.Label(feats, textvariable=self.lkas_status_var,
                                           foreground='#888888', width=12)
-        self.lkas_status_lbl.grid(row=3, column=1, sticky='w', padx=(6, 0))
+        self.lkas_status_lbl.grid(row=5, column=1, sticky='w', padx=(6, 0))
 
         # Recorder. Writes whatever the camera widget is currently showing
         # (active source, decoded once per render tick) to a timestamped
@@ -1173,11 +1214,25 @@ class ADASUI:
         # start_acc.sh sources ROS itself.
         self.stack_proc = self._popen(cmd, cwd=str(ADAS_WK),
                                        source_ros=False, prefix='adas')
-        # All four nodes are now alive — reflect that in the toggle state.
+        # start_acc.sh spawns lane_detection_node + stanley_node with
+        # ZERO ros params, so lane_detection_node loads its default
+        # model filename (UFLD_best.pth, which doesn't exist) and the
+        # KF PSDs from the UI are ignored. Kill the shell's LKAS pair
+        # after a short delay and respawn via the shared helper so the
+        # UI-selected model + q values actually take effect.
+        self.root.after(1500, self._restart_lkas_with_ui_params)
         self.acc_on = True
         self.lkas_on = True
         self._refresh_toggle_labels()
         self.status_var.set('ADAS stack running (start_acc.sh)')
+
+    def _restart_lkas_with_ui_params(self):
+        """Called ~1.5 s after start_acc.sh: replace the shell-spawned
+        LKAS pair (which used defaults) with UI-parameterised ones."""
+        self._pkill(['lane_detection_node', 'stanley_node'])
+        # Give the OS a beat to actually reap them so we don't race
+        # our own spawn against a duplicate ros2 run.
+        self.root.after(400, self._start_lkas_procs)
 
     def stop_stack(self):
         self._terminate(self.stack_proc, 'start_acc.sh')
@@ -1242,29 +1297,84 @@ class ADASUI:
             self.lkas_on = False
             self._log('[ui] LKAS OFF')
         else:
-            # Look up the selected model in LANE_MODELS and pass it
-            # to lane_detection_node. If the entry is missing (dropdown
-            # value doesn't match any option — shouldn't happen since
-            # it's readonly), we omit the flag and the node falls back
-            # to its own default.
-            perc_cmd = ['ros2', 'run', 'perception', 'lane_detection_node']
-            model_ref = next((ref for name, ref in LANE_MODELS
-                              if name == self.lane_model_var.get()), None)
-            if model_ref:
-                perc_cmd += ['--ros-args', '-p',
-                             f'model_filename:={model_ref}']
-                self._log(f'[ui] LKAS model: {self.lane_model_var.get()}')
-            self.lkas_procs.append(self._popen(
-                perc_cmd, cwd=str(ADAS_WK),
-                source_ros=True, source_workspace=True,
-                prefix='lkas-perc'))
-            self.lkas_procs.append(self._popen(
-                ['ros2', 'run', 'controller', 'stanley_node'],
-                cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
-                prefix='lkas-ctrl'))
+            self._start_lkas_procs()
             self.lkas_on = True
             self._log('[ui] LKAS ON')
         self._refresh_toggle_labels()
+
+    def _start_lkas_procs(self):
+        """Spawn lane_detection_node + stanley_node with the UI-selected
+        model, Kalman toggle, and KF process-noise PSDs. Shared between
+        toggle_lkas (button click) and run_start_acc (Start ADAS), so
+        the Start button honours UI selections without needing an
+        OFF/ON cycle to apply them. Does NOT toggle self.lkas_on —
+        the caller owns that state and its label refresh."""
+        perc_cmd = ['ros2', 'run', 'perception', 'lane_detection_node']
+        # Build ONE list of ros params, then attach a single
+        # `--ros-args` block. `ros2 run` silently drops params when
+        # `--ros-args` appears more than once without a `--` fence,
+        # which is why splitting them per-group caused the node to
+        # fall back to its default model filename and crash.
+        ros_params: list[str] = []
+        model_ref = next((ref for name, ref in LANE_MODELS
+                          if name == self.lane_model_var.get()), None)
+        if model_ref:
+            ros_params += ['-p', f'model_filename:={model_ref}']
+            self._log(f'[ui] LKAS model: {self.lane_model_var.get()}')
+        if not self.kalman_enable_var.get():
+            ros_params += ['-p', 'enable_kalman:=false']
+            self._log('[ui] LKAS Kalman: OFF')
+        else:
+            self._log('[ui] LKAS Kalman: ON')
+            for pname, var in (('kf_q_a', self.kf_qa_var),
+                               ('kf_q_b', self.kf_qb_var),
+                               ('kf_q_c', self.kf_qc_var)):
+                raw = var.get().strip()
+                if not raw:
+                    continue
+                try:
+                    val = float(raw)
+                except ValueError:
+                    self._log(f'[ui] LKAS bad {pname}={raw!r}, using node default')
+                    continue
+                ros_params += ['-p', f'{pname}:={val}']
+            self._log(f'[ui] LKAS q=({self.kf_qa_var.get()}, '
+                      f'{self.kf_qb_var.get()}, {self.kf_qc_var.get()})')
+        if ros_params:
+            perc_cmd += ['--ros-args'] + ros_params
+        self.lkas_procs.append(self._popen(
+            perc_cmd, cwd=str(ADAS_WK),
+            source_ros=True, source_workspace=True,
+            prefix='lkas-perc'))
+        self.lkas_procs.append(self._popen(
+            ['ros2', 'run', 'controller', 'stanley_node'],
+            cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
+            prefix='lkas-ctrl'))
+
+    def _apply_kf_params(self):
+        """Push the current KF entry-box values to a running
+        lane_detection_node via `ros2 param set`. Perception must
+        have a SetParametersCallback that rebuilds Q on change."""
+        pairs = (('kf_q_a', self.kf_qa_var),
+                 ('kf_q_b', self.kf_qb_var),
+                 ('kf_q_c', self.kf_qc_var))
+        for pname, var in pairs:
+            raw = var.get().strip()
+            if not raw:
+                continue
+            try:
+                val = float(raw)
+            except ValueError:
+                self._log(f'[ui] bad {pname}={raw!r}, skipped')
+                continue
+            self._popen(
+                ['ros2', 'param', 'set',
+                 '/lane_detection_node', pname, str(val)],
+                cwd=str(ADAS_WK),
+                source_ros=True, source_workspace=True,
+                prefix='kf-set')
+        self._log(f'[ui] KF applied q=({self.kf_qa_var.get()}, '
+                  f'{self.kf_qb_var.get()}, {self.kf_qc_var.get()})')
 
 
 def main():
