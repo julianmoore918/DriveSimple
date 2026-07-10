@@ -290,6 +290,12 @@ class LaneDetectionNode(Node):
         self.right_pub = self.create_publisher(Path, 'ego_lane_right', 10)
         self.debug_pub = self.create_publisher(CompressedImage,
                                                'perception/debug_image', 10)
+        # KF-only debug view: just the smoothed cyan side polylines +
+        # red centerline, no raw UFLD dots and no confidence text. The
+        # fusion node overlays the ACC (YOLO) boxes on top of this to
+        # produce the "ADAS (YOLO+KF)" source in the UI dropdown.
+        self.debug_kf_pub = self.create_publisher(CompressedImage,
+                                                   'perception/debug_image_kf', 10)
         # NEW — per-lane soft confidence (YOLO-analogue). Range [0, 1].
         # 0.0 during junctions and when the lane isn't detected.
         self.left_conf_pub  = self.create_publisher(Float32, 'ego_lane_left_conf',  10)
@@ -494,25 +500,22 @@ class LaneDetectionNode(Node):
         out = bgr.copy()
 
         # Raw UFLD row-anchor points — small dots so they're readable
-        # against the KF polylines drawn on top.
+        # against the KF polylines drawn on top. Both sides drawn green
+        # so the raw layer reads as a single "detector output" colour
+        # while the KF polylines (blue) sit visibly on top.
         for u, v in left_px:
-            cv2.circle(out, (u, v), 4, (255, 80, 80), -1)   # blue
+            cv2.circle(out, (u, v), 4, (80, 255, 80), -1)   # green
         for u, v in right_px:
             cv2.circle(out, (u, v), 4, (80, 255, 80), -1)   # green
 
-        # KF-smoothed polylines projected back to image space.
-        # Bright cyan so they stand out over both blue and green raw dots.
-        def _draw_line(polyline, colour, thickness):
-            if not polyline or len(polyline) < 2:
-                return
-            for i in range(len(polyline) - 1):
-                cv2.line(out, polyline[i], polyline[i + 1],
-                         colour, thickness, cv2.LINE_AA)
-
-        _draw_line(left_smooth_px,  (255, 200,   0), 3)   # bright cyan
-        _draw_line(right_smooth_px, (255, 200,   0), 3)   # bright cyan
-        # Interpolated centerline (midpoint of KF-smoothed left+right).
-        _draw_line(center_px,       (  0,   0, 255), 2)   # red
+        # NOTE: the KF-smoothed polylines and centerline are intentionally
+        # NOT drawn here — this is the UFLD-only debug view (feeds
+        # /LKAS/perception/debug_image and the "ADAS (YOLO+UFLD)" fused
+        # source). The KF variant is drawn by annotate_kf_only() and
+        # published on /LKAS/perception/debug_image_kf → "ADAS (YOLO+KF)".
+        # Signature keeps the smooth_px / center_px kwargs so callers
+        # don't have to branch; they're just ignored on this path.
+        _ = (left_smooth_px, right_smooth_px, center_px)
 
         # Confidence overlay — top-left corner. Colour tiered so a glance
         # tells you if the lane is trusted: green ≥ 0.7, yellow 0.3-0.7,
@@ -527,6 +530,28 @@ class LaneDetectionNode(Node):
         cv2.putText(out, f'R: {right_conf:.2f}', (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                     _conf_colour(right_conf), 2, cv2.LINE_AA)
+        return out
+
+    def annotate_kf_only(self, bgr,
+                         left_smooth_px=None, right_smooth_px=None,
+                         center_px=None):
+        """Same as annotate() but WITHOUT the raw UFLD row-anchor dots or
+        the confidence numbers. Used for the KF-only debug channel so the
+        operator sees just the smoothed cyan side polylines + red
+        centerline over the camera feed. Combined with the YOLO ACC
+        overlay at the fusion node."""
+        out = bgr.copy()
+        def _draw_line(polyline, colour, thickness):
+            if not polyline or len(polyline) < 2:
+                return
+            for i in range(len(polyline) - 1):
+                cv2.line(out, polyline[i], polyline[i + 1],
+                         colour, thickness, cv2.LINE_AA)
+        # Same BEV blue as annotate() so the KF-only view is
+        # visually consistent with the fused ADAS view.
+        _draw_line(left_smooth_px,  (255,  80,  80), 3)
+        _draw_line(right_smooth_px, (255,  80,  80), 3)
+        _draw_line(center_px,       (  0,   0, 255), 2)
         return out
 
     # ─────────────────────────────────────────────────────────────────────
@@ -577,6 +602,10 @@ class LaneDetectionNode(Node):
             dbg.format = 'jpeg'
             dbg.data = buf.tobytes()
             self.debug_pub.publish(dbg)
+            # Mirror the same JUNCTION-labelled frame onto the KF-only
+            # channel so the "ADAS (YOLO+KF)" source doesn't freeze on
+            # its last non-junction image.
+            self.debug_kf_pub.publish(dbg)
             return
 
         left_px, right_px, left_conf, right_conf = self.infer(bgr, img_w, img_h)
@@ -657,6 +686,20 @@ class LaneDetectionNode(Node):
         dbg.format = 'jpeg'
         dbg.data = buf.tobytes()
         self.debug_pub.publish(dbg)
+
+        # KF-only channel: skip raw UFLD dots and the confidence text
+        # so the operator sees just the smoothed cyan lines + red
+        # centerline. Fusion node composes this with the ACC YOLO
+        # overlay to build the "ADAS (YOLO+KF)" UI source.
+        annotated_kf = self.annotate_kf_only(
+            bgr, left_smooth_px, right_smooth_px, center_px)
+        _, buf_kf = cv2.imencode('.jpg', annotated_kf,
+                                 [cv2.IMWRITE_JPEG_QUALITY, 85])
+        dbg_kf = CompressedImage()
+        dbg_kf.header = msg.header
+        dbg_kf.format = 'jpeg'
+        dbg_kf.data = buf_kf.tobytes()
+        self.debug_kf_pub.publish(dbg_kf)
 
 
 def main(args=None):

@@ -82,6 +82,11 @@ CAMERA_TOPIC       = '/Car_1/camera/front/compressed'
 ACC_DEBUG_TOPIC    = '/ACC/perception/debug_image'
 LKAS_DEBUG_TOPIC   = '/LKAS/perception/debug_image'
 FUSED_DEBUG_TOPIC  = '/ADAS/perception/debug_image'
+# KF-only variant: raw + YOLO boxes + KF-smoothed cyan/centerline only
+# (no raw UFLD row dots, no conf text). Published by
+# debug_image_fusion_node when lane_detection_node is running with
+# Kalman ON. See lane_detection_node.annotate_kf_only().
+KF_DEBUG_TOPIC     = '/ADAS/perception/debug_image_kf'
 IPM_DEBUG_TOPIC    = '/ADAS/ipm/debug_image'
 CMD_VEL_TOPIC      = '/Car_1/cmd_vel'
 CMD_STEER_TOPIC    = '/Car_1/cmd_steer'
@@ -97,6 +102,7 @@ CAMERA_SOURCES = {
     'ACC (YOLO)':       ACC_DEBUG_TOPIC,
     'LKAS (UFLD)':      LKAS_DEBUG_TOPIC,
     'ADAS (YOLO+UFLD)': FUSED_DEBUG_TOPIC,
+    'ADAS (YOLO+KF)':   KF_DEBUG_TOPIC  
 }
 
 # BEV display widget — native IPM image is 320×480 (see ipm_view_node).
@@ -595,16 +601,16 @@ class ADASUI:
         kf_row = ttk.Frame(feats)
         kf_row.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(2, 0))
         ttk.Label(kf_row, text='KF q_a').grid(row=0, column=0, sticky='w')
-        # Bumped 10× (was 5e-3): the χ² gate was rejecting genuine
-        # turn-in frames because the prior covariance was too tight.
-        # Wider process-noise PSD → wider innovation → more measurements
-        # pass the 95% gate.
-        self.kf_qa_var = tk.StringVar(value='5e-2')
+        # 0.5 confirmed on Town10 right turns 2026-07-10 — earlier
+        # 5e-2 still lagged into curves; 10× that made the KF track
+        # curvature in real time without noticeable overshoot.
+        self.kf_qa_var = tk.StringVar(value='0.5')
         ttk.Entry(kf_row, textvariable=self.kf_qa_var, width=7).grid(
             row=0, column=1, sticky='w', padx=(2, 8))
         ttk.Label(kf_row, text='q_b').grid(row=0, column=2, sticky='w')
-        # Bumped 5× (was 1e-1) for the heading-rate — same reasoning.
-        self.kf_qb_var = tk.StringVar(value='5e-1')
+        # 5.0 confirmed on Town10 right turns 2026-07-10; heading state
+        # tracks lane-slope changes without visible lag on the BEV.
+        self.kf_qb_var = tk.StringVar(value='5.0')
         ttk.Entry(kf_row, textvariable=self.kf_qb_var, width=7).grid(
             row=0, column=3, sticky='w', padx=(2, 8))
         ttk.Label(kf_row, text='q_c').grid(row=0, column=4, sticky='w')

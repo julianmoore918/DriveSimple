@@ -301,10 +301,11 @@ class IPMViewNode(Node):
     def _render(self) -> np.ndarray:
         img = self._warp_camera()
         self._draw_distance_ticks(img)
-        # Match the LKAS perception-debug colour convention: left blue,
-        # right green.
+        # Both ego boundaries drawn in the same blue so they read as a
+        # single "our lane" pair in the BEV; the red centerline still
+        # distinguishes ego heading.
         self._draw_lane(img, self.left_veh,  (255, 80, 80))
-        self._draw_lane(img, self.right_veh, (80, 255, 80))
+        self._draw_lane(img, self.right_veh, (255, 80, 80))
         # Interpolated centerline — pure red (BGR) so it pops against
         # the blue/green lane lines. This is exactly what the in-lane
         # gate in perception_node uses to accept/reject detections.

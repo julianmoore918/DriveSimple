@@ -215,6 +215,49 @@ class YoloDetection(Node):
         y_right = self.cam_h_m * (u - cx) / dv
         return forward, -y_right   # flip to ROS / REP 103 (Y left positive)
 
+    def _vehicle_to_pixel(self, x_fwd: float, y_left: float,
+                          img_w: int, img_h: int):
+        """Analytic inverse of _pixel_to_vehicle for on-road points.
+        Used to project the KF-smoothed lane polylines back into image
+        space so the ACC ROI can follow the ego lane through curves
+        instead of the fixed image-space trapezoid. Returns (u, v) in
+        pixels or None if X_forward is behind the camera."""
+        dx = x_fwd - self.cam_x_off
+        if dx <= 1e-3:
+            return None
+        focal_px = img_w / (2.0 * math.tan(self.CAM_FOV_RAD / 2.0))
+        cx, cy = img_w / 2.0, img_h / 2.0
+        dv = self.cam_h_m * focal_px / dx
+        u = cx + (-y_left) * focal_px / dx
+        v = cy + dv
+        return int(round(u)), int(round(v))
+
+    def _lane_roi_polygon_px(self, img_w: int, img_h: int):
+        """Build an image-space polygon that encloses the ego lane by
+        projecting the KF-smoothed left/right polylines back through
+        the camera model. Vertices go left-forward-sweep, then
+        right-reverse-sweep so cv2 sees a well-formed polygon.
+
+        Returns a (N, 1, 2) int32 array (cv2 polygon format) or None
+        when either side is too short to be trustworthy — the caller
+        falls back to the static trapezoid in that case."""
+        if len(self.left_veh) < 2 or len(self.right_veh) < 2:
+            return None
+        left_px  = []
+        right_px = []
+        for x, y in self.left_veh:
+            uv = self._vehicle_to_pixel(x, y, img_w, img_h)
+            if uv is not None:
+                left_px.append(uv)
+        for x, y in self.right_veh:
+            uv = self._vehicle_to_pixel(x, y, img_w, img_h)
+            if uv is not None:
+                right_px.append(uv)
+        if len(left_px) < 2 or len(right_px) < 2:
+            return None
+        pts = np.array(left_px + list(reversed(right_px)), dtype=np.int32)
+        return pts.reshape(-1, 1, 2)
+
     @staticmethod
     def _interp_y_at_x(polyline: list[tuple[float, float]], x_target: float):
         """Linear-interpolate Y at X along a polyline that's sorted by X.
@@ -353,6 +396,12 @@ class YoloDetection(Node):
 
         h, w, _ = img.shape
         img_center_x = w / 2
+        # Build the dynamic ego-lane ROI polygon once per YOLO frame so
+        # every detection is tested against the same shape (and the
+        # debug overlay drawn later matches the gate). None when the
+        # KF-smoothed lanes aren't usable yet — the per-detection gate
+        # then falls back to the historical trapezoid.
+        lane_roi = self._lane_roi_polygon_px(w, h)
 
         for box, conf, cls in zip(boxes, confs, classes):
             x_min, y_min, x_max, y_max = box.astype(int)
@@ -382,18 +431,24 @@ class YoloDetection(Node):
             if clipped_left ^ clipped_right:
                 continue
 
-            # Lane-shape keep-zone trapezoid — TEMPORARILY DISABLED to
-            # test whether the BEV centerline-intersection gate alone
-            # is sufficient. If passing cars still trigger emergency
-            # brake with this commented out (and the fallback below
-            # also disabled), the false positives are coming from the
-            # BEV gate itself (UFLD drift / wide bboxes / lane-changers)
-            # not from the fallback. Re-enable by uncommenting.
+            # Ego-lane keep-zone gate. Prefer the dynamic KF-smoothed
+            # lane polygon so the ROI follows the road through curves;
+            # fall back to the historical trapezoid when the lane paths
+            # aren't yet usable (warm-up, junction, both filters
+            # coasting). Only points in the lower band (y > 0.55·h) are
+            # tested — objects near the horizon are too small to matter
+            # to ACC and would false-fail against the perspective-narrow
+            # polygon top.
             if y_max > h * 0.55:
-                 t = (y_max - h * 0.55) / (h - h * 0.55)   # 0 → 1
-                 keep_half_w = w * (0.05 + 0.18 * t)        # 0.07 → 0.23
-                 if abs(box_center_x - img_center_x) > keep_half_w:
-                     continue
+                bb_bottom_pt = (float(box_center_x), float(y_max))
+                if lane_roi is not None:
+                    if cv2.pointPolygonTest(lane_roi, bb_bottom_pt, False) < 0:
+                        continue
+                else:
+                    t = (y_max - h * 0.55) / (h - h * 0.55)   # 0 → 1
+                    keep_half_w = w * (0.05 + 0.18 * t)        # 0.07 → 0.23
+                    if abs(box_center_x - img_center_x) > keep_half_w:
+                        continue
 
             # IPM-project BOTH bb-bottom corners up front: they feed
             # the gate (centerline-intersects-bb-segment test) AND the
@@ -480,25 +535,30 @@ class YoloDetection(Node):
         # since the MultiThreadedExecutor alternative destabilised YOLO.
         self._publish_centerline_debug(header)
 
-        # ── DEBUG: keep-zone trapezoid preview (TEMP) ─────────
-        # Yellow outline of the lane-shape keep-zone — anything whose
-        # bbox-centre lies outside this trapezoid in the lower band is
-        # rejected before reaching the BEV gate. Same numbers as the
-        # gate above so the operator can verify alignment with the
-        # hand-drawn target. Remove once the geometry is confirmed.
-        y_top  = int(h * 0.55)
-        h_top  = int(w * 0.05)   # half-width at top of band
-        h_bot  = int(w * 0.23)   # half-width at image bottom
-        c_img  = w // 2
-        trap_pts = np.array([
-            (c_img - h_top, y_top),
-            (c_img + h_top, y_top),
-            (c_img + h_bot, h - 1),
-            (c_img - h_bot, h - 1),
-        ], dtype=np.int32)
-        cv2.polylines(img, [trap_pts], isClosed=True,
-                      color=(0, 255, 255), thickness=2,
-                      lineType=cv2.LINE_AA)
+        # ── DEBUG: ego-lane ROI overlay ────────────────────────
+        # Yellow outline of whatever region the per-detection gate
+        # above actually used: the dynamic KF-lane polygon when
+        # available, otherwise the fallback trapezoid. Same numbers
+        # as the gate so what the operator sees on the debug image
+        # is the same shape YOLO detections are being rejected by.
+        if lane_roi is not None:
+            cv2.polylines(img, [lane_roi], isClosed=True,
+                          color=(0, 255, 255), thickness=2,
+                          lineType=cv2.LINE_AA)
+        else:
+            y_top  = int(h * 0.55)
+            h_top  = int(w * 0.05)
+            h_bot  = int(w * 0.23)
+            c_img  = w // 2
+            trap_pts = np.array([
+                (c_img - h_top, y_top),
+                (c_img + h_top, y_top),
+                (c_img + h_bot, h - 1),
+                (c_img - h_bot, h - 1),
+            ], dtype=np.int32)
+            cv2.polylines(img, [trap_pts], isClosed=True,
+                          color=(0, 255, 255), thickness=2,
+                          lineType=cv2.LINE_AA)
 
         # ── Debug image → Foxglove ────────────────────────────
         _, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])

@@ -42,7 +42,11 @@ from sensor_msgs.msg import CompressedImage
 RAW_TOPIC      = '/Car_1/camera/front/compressed'
 ACC_TOPIC      = '/ACC/perception/debug_image'
 LKAS_TOPIC     = '/LKAS/perception/debug_image'
-COMBINED_TOPIC = '/ADAS/perception/debug_image'
+# KF-only variant of the LKAS overlay — same masking rules, different
+# source. See lane_detection_node.annotate_kf_only().
+LKAS_KF_TOPIC  = '/LKAS/perception/debug_image_kf'
+COMBINED_TOPIC     = '/ADAS/perception/debug_image'
+COMBINED_KF_TOPIC  = '/ADAS/perception/debug_image_kf'
 PUB_HZ         = 10
 JPEG_QUALITY   = 75
 # How many recent raw frames to keep for timestamp matching. At a 20 Hz
@@ -69,7 +73,12 @@ class DebugImageFusionNode(Node):
         # frame on every publish tick.
         self._acc_overlay: tuple[np.ndarray, np.ndarray] | None = None
         self._lkas_overlay: tuple[np.ndarray, np.ndarray] | None = None
+        # Second LKAS overlay slot for the KF-only channel. Same
+        # (mask, debug_bgr) shape as _lkas_overlay; distinct so we can
+        # publish two independent fused streams from the same tick.
+        self._lkas_kf_overlay: tuple[np.ndarray, np.ndarray] | None = None
         self._first_publish_logged = False
+        self._first_kf_publish_logged = False
 
         self.create_subscription(CompressedImage, RAW_TOPIC,
                                  self._on_raw, 10)
@@ -77,13 +86,18 @@ class DebugImageFusionNode(Node):
                                  self._on_acc, 10)
         self.create_subscription(CompressedImage, LKAS_TOPIC,
                                  self._on_lkas, 10)
+        self.create_subscription(CompressedImage, LKAS_KF_TOPIC,
+                                 self._on_lkas_kf, 10)
         self.pub = self.create_publisher(CompressedImage,
                                          COMBINED_TOPIC, 10)
+        self.kf_pub = self.create_publisher(CompressedImage,
+                                             COMBINED_KF_TOPIC, 10)
         self.create_timer(1.0 / PUB_HZ, self._publish)
         self.create_timer(5.0, self._heartbeat)
         self.get_logger().info(
             f"Debug-image fusion node started — masking {ACC_TOPIC} + "
-            f"{LKAS_TOPIC} against {RAW_TOPIC} → {COMBINED_TOPIC} @ {PUB_HZ} Hz")
+            f"{LKAS_TOPIC} against {RAW_TOPIC} → {COMBINED_TOPIC} @ {PUB_HZ} Hz; "
+            f"also {ACC_TOPIC} + {LKAS_KF_TOPIC} → {COMBINED_KF_TOPIC}")
 
     @staticmethod
     def _stamp_ns(msg: CompressedImage) -> int:
@@ -152,20 +166,29 @@ class DebugImageFusionNode(Node):
         if result is not None:
             self._lkas_overlay = result
 
-    def _publish(self):
-        if not self._raw_buffer:
-            return
-        _, latest_raw = self._raw_buffer[-1]
+    def _on_lkas_kf(self, msg: CompressedImage):
+        result = self._extract_overlay(msg)
+        if result is not None:
+            self._lkas_kf_overlay = result
+
+    def _fuse(self, latest_raw: np.ndarray,
+              lkas_overlay) -> np.ndarray:
+        """Overlay YOLO (ACC) + given LKAS overlay onto the latest raw
+        frame. Split out so both the UFLD and KF variants share the same
+        masking + shape-guard logic."""
         out_bgr = latest_raw.copy()
         if self._acc_overlay is not None:
             mask, src = self._acc_overlay
             if src.shape == out_bgr.shape:
                 out_bgr[mask] = src[mask]
-        if self._lkas_overlay is not None:
-            mask, src = self._lkas_overlay
+        if lkas_overlay is not None:
+            mask, src = lkas_overlay
             if src.shape == out_bgr.shape:
                 out_bgr[mask] = src[mask]
+        return out_bgr
 
+    def _encode_and_publish(self, out_bgr: np.ndarray,
+                            pub, topic: str, log_flag_attr: str) -> None:
         _, buf = cv2.imencode('.jpg', out_bgr,
                               [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         out = CompressedImage()
@@ -173,11 +196,24 @@ class DebugImageFusionNode(Node):
         out.header.frame_id = 'Car_1/camera/front'
         out.format = 'jpeg'
         out.data = buf.tobytes()
-        self.pub.publish(out)
-        if not self._first_publish_logged:
+        pub.publish(out)
+        if not getattr(self, log_flag_attr):
             self.get_logger().info(
-                f'First fused frame published on {COMBINED_TOPIC}.')
-            self._first_publish_logged = True
+                f'First fused frame published on {topic}.')
+            setattr(self, log_flag_attr, True)
+
+    def _publish(self):
+        if not self._raw_buffer:
+            return
+        _, latest_raw = self._raw_buffer[-1]
+        # UFLD-based fused stream (existing "ADAS (YOLO+UFLD)" source).
+        self._encode_and_publish(
+            self._fuse(latest_raw, self._lkas_overlay),
+            self.pub, COMBINED_TOPIC, '_first_publish_logged')
+        # KF-only fused stream (new "ADAS (YOLO+KF)" source).
+        self._encode_and_publish(
+            self._fuse(latest_raw, self._lkas_kf_overlay),
+            self.kf_pub, COMBINED_KF_TOPIC, '_first_kf_publish_logged')
 
 
 def main(args=None):
