@@ -395,6 +395,7 @@ class ADASUI:
         self.foxglove_proc: subprocess.Popen | None = None      # foxglove_bridge
         self.acc_procs: list[subprocess.Popen] = []             # when toggled independently
         self.lkas_procs: list[subprocess.Popen] = []
+        self.morai_bridge_procs: list[subprocess.Popen] = []    # state + control adapters
         # NPC spawner runs the long-lived TRAFFIC_SPAWN_SNIPPET. The
         # snippet stays alive in a heartbeat loop to keep its TM client
         # connected — without that, CARLA 0.9.16 drops per-vehicle
@@ -496,6 +497,18 @@ class ADASUI:
         procs.grid(row=7, column=0, columnspan=2, sticky='ew', pady=(8, 0))
         procs.columnconfigure(0, weight=1)
         procs.columnconfigure(1, weight=1)
+        # Simulator selector — gates every node-launch button below
+        # (Run start_acc.sh, ACC toggle, LKAS toggle): picks the
+        # `simulator:=carla|morai` ros param each node uses for its
+        # camera calibration and speed-message type. row=-1 renders
+        # above row 0 without renumbering the rest of this frame.
+        ttk.Label(procs, text='Simulator:').grid(
+            row=-1, column=0, sticky='w', pady=(0, 4))
+        self.simulator_var = tk.StringVar(value='carla')
+        ttk.Combobox(procs, textvariable=self.simulator_var,
+                     values=['carla', 'morai'],
+                     state='readonly', width=8).grid(
+            row=-1, column=1, sticky='w', pady=(0, 4))
         ttk.Button(procs, text='Start CARLA', command=self.start_carla).grid(
             row=0, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop CARLA', command=self.stop_carla).grid(
@@ -554,6 +567,17 @@ class ADASUI:
         ttk.Button(procs, text='Stop Foxglove',
                    command=self.stop_foxglove).grid(
             row=8, column=1, sticky='ew', pady=2, padx=(4, 0))
+        # MORAI adapter nodes (state_adapter_node + control_adapter_node,
+        # package morai_bridge) — translate MORAI's ROS2 Interface topics
+        # to/from this stack's /Car_1/* topics. No CARLA/bridge process
+        # involved; just plain `ros2 run` against this workspace, so
+        # MORAI's own simulator + ROS2 Interfaces must already be running.
+        ttk.Button(procs, text='Start MORAI Bridge',
+                   command=self.start_morai_bridge).grid(
+            row=9, column=0, sticky='ew', pady=2)
+        ttk.Button(procs, text='Stop MORAI Bridge',
+                   command=self.stop_morai_bridge).grid(
+            row=9, column=1, sticky='ew', pady=2, padx=(4, 0))
 
         # Feature toggles. Each row has a button (user intent — ON/OFF) and a
         # small status dot reflecting whether the backing nodes are actually
@@ -1187,6 +1211,32 @@ class ADASUI:
     def stop_bridge(self):
         self._terminate(self.bridge_proc, 'Bridge')
         self.bridge_proc = None
+
+    # --------------------------------------------------------------------
+    # MORAI bridge (morai_bridge: state_adapter_node + control_adapter_node)
+    # --------------------------------------------------------------------
+    def start_morai_bridge(self):
+        if any(p.poll() is None for p in self.morai_bridge_procs):
+            self._log('[ui] MORAI bridge already running')
+            return
+        self._log('[ui] starting MORAI bridge (state + control adapters)')
+        self.morai_bridge_procs = [
+            self._popen(
+                ['ros2', 'run', 'morai_bridge', 'state_adapter_node'],
+                cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
+                prefix='morai-state'),
+            self._popen(
+                ['ros2', 'run', 'morai_bridge', 'control_adapter_node'],
+                cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
+                prefix='morai-control'),
+        ]
+        self.status_var.set('MORAI bridge running (state + control adapters)')
+
+    def stop_morai_bridge(self):
+        for p in self.morai_bridge_procs:
+            self._terminate(p, 'MORAI bridge')
+        self.morai_bridge_procs = []
+        self.status_var.set('MORAI bridge stopped')
         self.status_var.set('Bridge stopped')
 
     # --------------------------------------------------------------------
@@ -1215,7 +1265,7 @@ class ADASUI:
         if self.stack_proc and self.stack_proc.poll() is None:
             self._log('[ui] start_acc.sh already running')
             return
-        cmd = ['./start_acc.sh', 'carla']
+        cmd = ['./start_acc.sh', self.simulator_var.get()]
         self._log(f'$ (cd {ADAS_WK} && {" ".join(cmd)})')
         # start_acc.sh sources ROS itself.
         self.stack_proc = self._popen(cmd, cwd=str(ADAS_WK),
@@ -1272,14 +1322,15 @@ class ADASUI:
             self.acc_on = False
             self._log('[ui] ACC OFF')
         else:
+            simulator = self.simulator_var.get()
             # Look up the selected YOLO checkpoint in OBJECT_MODELS and
             # pass it to perception_node as -p model_filename:=<ref>.
-            perc_cmd = ['ros2', 'run', 'perception', 'perception_node']
+            perc_cmd = ['ros2', 'run', 'perception', 'perception_node',
+                        '--ros-args', '-p', f'simulator:={simulator}']
             model_ref = next((ref for name, ref in OBJECT_MODELS
                               if name == self.object_model_var.get()), None)
             if model_ref:
-                perc_cmd += ['--ros-args', '-p',
-                             f'model_filename:={model_ref}']
+                perc_cmd += ['-p', f'model_filename:={model_ref}']
                 self._log(f'[ui] ACC model: {self.object_model_var.get()}')
             self.acc_procs.append(self._popen(
                 perc_cmd, cwd=str(ADAS_WK),
@@ -1287,7 +1338,7 @@ class ADASUI:
                 prefix='acc-perc'))
             self.acc_procs.append(self._popen(
                 ['ros2', 'run', 'controller', 'controller_node',
-                 '--ros-args', '-p', 'simulator:=carla'],
+                 '--ros-args', '-p', f'simulator:={simulator}'],
                 cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
                 prefix='acc-ctrl'))
             self.acc_on = True
@@ -1315,13 +1366,14 @@ class ADASUI:
         the Start button honours UI selections without needing an
         OFF/ON cycle to apply them. Does NOT toggle self.lkas_on —
         the caller owns that state and its label refresh."""
+        simulator = self.simulator_var.get()
         perc_cmd = ['ros2', 'run', 'perception', 'lane_detection_node']
         # Build ONE list of ros params, then attach a single
         # `--ros-args` block. `ros2 run` silently drops params when
         # `--ros-args` appears more than once without a `--` fence,
         # which is why splitting them per-group caused the node to
         # fall back to its default model filename and crash.
-        ros_params: list[str] = []
+        ros_params: list[str] = ['-p', f'simulator:={simulator}']
         model_ref = next((ref for name, ref in LANE_MODELS
                           if name == self.lane_model_var.get()), None)
         if model_ref:
@@ -1353,7 +1405,8 @@ class ADASUI:
             source_ros=True, source_workspace=True,
             prefix='lkas-perc'))
         self.lkas_procs.append(self._popen(
-            ['ros2', 'run', 'controller', 'stanley_node'],
+            ['ros2', 'run', 'controller', 'stanley_node',
+             '--ros-args', '-p', f'simulator:={simulator}'],
             cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
             prefix='lkas-ctrl'))
 

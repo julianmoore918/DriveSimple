@@ -18,7 +18,8 @@ sign (positive = right), so we negate on input.
 Subscribed topics:
     /LKAS/ego_lane_left   (nav_msgs/Path)
     /LKAS/ego_lane_right  (nav_msgs/Path)
-    /Car_1/vehicle/speed  (std_msgs/Float64)
+    /Car_1/vehicle/speed  (std_msgs/Float64, or example_interfaces/Float64
+                           when simulator:=morai)
 
 Published topics:
     /Car_1/cmd_steer      (std_msgs/Float32)  — normalised steer in [-1, 1].
@@ -33,7 +34,8 @@ import rclpy
 from rclpy.node import Node
 
 from nav_msgs.msg import Path
-from std_msgs.msg import Float32, Float32MultiArray, Float64
+from std_msgs.msg import Float32, Float32MultiArray, Float64 as StdFloat64
+from example_interfaces.msg import Float64 as ExFloat64
 
 
 # Stanley gains — matched to lkas_validate_0.9.16.py (the CARLA version this
@@ -137,6 +139,11 @@ class StanleyNode(Node):
         super().__init__('Stanley_Node', namespace='LKAS')
         self.get_logger().info("=== Stanley Node starting ===")
 
+        # simulator (carla | morai) picks the speed message type below —
+        # same parameter/pattern as controller_node.
+        self.declare_parameter('simulator', 'carla')
+        simulator = self.get_parameter('simulator').get_parameter_value().string_value
+
         self.declare_parameter('lookahead_m', LOOKAHEAD_M)
         self.declare_parameter('speed_topic', '/Car_1/vehicle/speed')
         self.declare_parameter('control_rate_hz', 20.0)
@@ -154,7 +161,8 @@ class StanleyNode(Node):
         # formula and the traditional Path-based Stanley.
         self.create_subscription(Float32MultiArray, 'ego_lane_coeffs',
                                  self.coeffs_callback, 10)
-        self.create_subscription(Float64, speed_topic,
+        SpeedMsg = ExFloat64 if simulator == 'morai' else StdFloat64
+        self.create_subscription(SpeedMsg, speed_topic,
                                  self.speed_callback, 20)
         # Absolute topic name — bypasses the LKAS namespace so steer lands on
         # the same /Car_1/* tree the bridge already owns.
@@ -192,7 +200,7 @@ class StanleyNode(Node):
     def right_callback(self, msg: Path):
         self.right_veh = self._path_to_veh(msg)
 
-    def speed_callback(self, msg: Float64):
+    def speed_callback(self, msg):
         self.speed = abs(msg.data)
 
     def coeffs_callback(self, msg: Float32MultiArray):

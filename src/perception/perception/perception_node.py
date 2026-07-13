@@ -75,6 +75,11 @@ class YoloDetection(Node):
         self.get_logger().info(f"    Min conf:   {MIN_CONFIDENCE}")
         self.get_logger().info(f"    Publish inf: {PUBLISH_INF}")
 
+        # simulator (carla | morai) picks the camera-rig defaults below;
+        # an explicit -p cam_height_m:=... always overrides it regardless.
+        self.declare_parameter('simulator', 'carla')
+        simulator = self.get_parameter('simulator').get_parameter_value().string_value
+
         # Subscribers — single-threaded executor (see main()). The
         # MultiThreadedExecutor + callback-group split was an attempt
         # to decouple the centerline timer from the slow YOLO callback,
@@ -158,12 +163,12 @@ class YoloDetection(Node):
         self.CAM_FOV_RAD = math.radians(
             self.get_parameter('camera_fov_deg').value)
         # Camera extrinsics — must match the rig spawned by the bridge
-        # and used by lane_detection_node's IPM (same 1.35 m / 0.6 m
-        # defaults). Used by _pixel_to_vehicle so the lane-ROI filter
-        # ground-projects detections into the same vehicle frame as
-        # UFLD's /LKAS/ego_lane_* Paths.
-        self.declare_parameter('cam_height_m', 1.35)
-        self.declare_parameter('cam_x_offset', 0.6)
+        # and used by lane_detection_node's IPM (same defaults, same
+        # simulator-keyed height/offset). Used by _pixel_to_vehicle so
+        # the lane-ROI filter ground-projects detections into the same
+        # vehicle frame as UFLD's /LKAS/ego_lane_* Paths.
+        self.declare_parameter('cam_height_m', 0.9 if simulator == 'morai' else 1.35)
+        self.declare_parameter('cam_x_offset', 0.75 if simulator == 'morai' else 0.6)
         self.cam_h_m   = self.get_parameter('cam_height_m').value
         self.cam_x_off = self.get_parameter('cam_x_offset').value
 

@@ -63,6 +63,11 @@ DEFAULT_CAM_FOV_DEG   = 90.0
 DEFAULT_CAM_HEIGHT_M  = 1.35
 DEFAULT_CAM_X_OFFSET  = 0.6   # camera mounted 0.6 m forward of vehicle origin
 
+# MORAI's Camera_1 rig — measured on the HD Ioniq5 windshield mount
+# (FOV matches the CARLA rig; height and forward offset differ). See DEBUG.md.
+DEFAULT_CAM_HEIGHT_M_MORAI   = 0.9
+DEFAULT_CAM_X_OFFSET_MORAI   = 0.75
+
 # UFLD prediction is trusted only if this fraction of row anchors is "valid".
 EXIST_MIN_RATIO = 0.25
 
@@ -174,17 +179,24 @@ class LaneDetectionNode(Node):
         super().__init__('Lane_Detection_Node', namespace='LKAS')
 
         # ── Parameters ───────────────────────────────────────────────────
+        # simulator (carla | morai) picks the camera-rig defaults below;
+        # an explicit -p cam_height_m:=... always overrides it regardless.
+        self.declare_parameter('simulator', 'carla')
+        simulator = self.get_parameter('simulator').get_parameter_value().string_value
+
         self.declare_parameter('ufld_repo',
-            '/home/sirius/workspace/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2')
+            '/home/moore/workspace/01_CV_Models/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2')
         self.declare_parameter('ufld_config_rel', 'configs/culane_res34.py')
-        self.declare_parameter('model_filename', 'UFLD_best.pth')
+        self.declare_parameter('model_filename', 'UFLD_F1=0.67.pth')
         self.declare_parameter('device', 'cuda')
         self.declare_parameter('camera_topic', '/Car_1/camera/front/compressed')
         self.declare_parameter('frame_id', 'base_link')
 
         self.declare_parameter('cam_fov_deg',  DEFAULT_CAM_FOV_DEG)
-        self.declare_parameter('cam_height_m', DEFAULT_CAM_HEIGHT_M)
-        self.declare_parameter('cam_x_offset', DEFAULT_CAM_X_OFFSET)
+        self.declare_parameter('cam_height_m',
+            DEFAULT_CAM_HEIGHT_M_MORAI if simulator == 'morai' else DEFAULT_CAM_HEIGHT_M)
+        self.declare_parameter('cam_x_offset',
+            DEFAULT_CAM_X_OFFSET_MORAI if simulator == 'morai' else DEFAULT_CAM_X_OFFSET)
 
         # Run UFLD on every Nth camera frame. Camera publishes at ~20 Hz;
         # N=4 gives ~5 Hz inference, which is plenty at the 20 km/h target.

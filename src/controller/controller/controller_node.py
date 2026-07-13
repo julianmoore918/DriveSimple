@@ -53,6 +53,10 @@ ENABLE_LOGGING = False  # set True to enable terminal output
 # (see carlaaccsim/pure_pursuit_controller.py:_make_ego_speed_policy)
 # — so PP during junctions also tracks this same target indirectly.
 CRUISE_SPEED_KMH = 20.0
+# MORAI's control-input calibration (steering scale, speed feedback) is
+# unvalidated -- start MORAI runs at a crawl until that's tuned. See
+# morai_bridge/control_adapter_node.py.
+CRUISE_SPEED_KMH_MORAI = 5.0
 
 
 class ACCNode(Node):
@@ -84,7 +88,8 @@ class ACCNode(Node):
         # 5 m gap at standstill (slightly more conservative than the
         # pre-IPM behaviour, which was ~3.25 m gap on a Model 3). See
         # DEBUG §22 for the semantics change.
-        self.target_speed      = CRUISE_SPEED_KMH / 3.6  # [m/s]
+        cruise_kmh = CRUISE_SPEED_KMH_MORAI if simulator == 'morai' else CRUISE_SPEED_KMH
+        self.target_speed      = cruise_kmh / 3.6  # [m/s]
         self.d0                = 3.0       # standstill bumper gap [m]
         # d_desired = d0 + T_gap * v_ego. T_gap=0.3 s → at 20 km/h cruise
         # (5.5 m/s), d_desired ≈ 6.65 m, settling to d0=5 m at rest.
