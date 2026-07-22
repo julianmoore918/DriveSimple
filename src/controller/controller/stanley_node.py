@@ -42,6 +42,22 @@ from example_interfaces.msg import Float64 as ExFloat64
 # ROS stack actually runs against). The 0.10.0 tuning (k=1.0, max=40°) is
 # sharper and oscillates on 0.9.16 physics.
 STANLEY_K     = 0.5
+# MORAI reports the car as "not reactive enough" even with the adapter's
+# output scale/rate already tuned -- that's a downstream multiplier, not
+# Stanley's own cross-track gain, which had no MORAI override until now.
+# Was 1.5 (3x CARLA) -- still not reactive enough, bumped another 10x.
+# At 30x CARLA's tuned gain, watch for oscillation/overshoot as the new
+# failure mode instead of sluggishness; override live with
+# `-p stanley_k:=X` rather than rebuilding to iterate further.
+STANLEY_K_MORAI = 15.0
+# Heading error (psi / e_head) has ALWAYS had a fixed, unscaled weight of
+# 1.0 in both formulas below -- only the cross-track term gets STANLEY_K.
+# Bumping STANLEY_K alone does nothing for heading responsiveness. Add a
+# separate gain so heading correction can be tuned independently; 1.0
+# preserves CARLA's exact existing behaviour (canonical Stanley, no
+# heading scaling).
+STANLEY_HEADING_GAIN       = 1.0
+STANLEY_HEADING_GAIN_MORAI = 3.0
 STANLEY_EPS   = 0.5
 MAX_STEER_RAD = math.radians(70)
 LOOKAHEAD_M   = 5.0
@@ -59,7 +75,8 @@ KF_COEFF_STALE_S = 0.3
 
 def stanley_steer(e_lat: float, e_head: float, speed_mps: float) -> float:
     """Returns a normalised steer ∈ [-1, 1]. Positive = right."""
-    delta = e_head + math.atan2(STANLEY_K * e_lat, speed_mps + STANLEY_EPS)
+    delta = (STANLEY_HEADING_GAIN * e_head
+             + math.atan2(STANLEY_K * e_lat, speed_mps + STANLEY_EPS))
     return max(-1.0, min(1.0, delta / MAX_STEER_RAD))
 
 
@@ -91,7 +108,7 @@ def stanley_steer_from_coeffs(a: float, b: float, c: float,
     kappa = 2.0 * a / (1.0 + b * b) ** 1.5
     psi   = math.atan(b)                              # heading error
     e_lat = c                                         # cross-track
-    delta_left = (psi
+    delta_left = (STANLEY_HEADING_GAIN * psi
                   + math.atan2(STANLEY_K * e_lat,
                                speed_mps + STANLEY_EPS)   # feedback
                   + math.atan(kappa * WHEELBASE_M))       # feed-forward
@@ -136,6 +153,10 @@ def lane_center_at_lookahead(left_veh, right_veh, lookahead_m: float):
 
 class StanleyNode(Node):
     def __init__(self):
+        # Module-level constants, read as defaults below and then
+        # overridden from ROS params -- must be declared global before
+        # any reference to the names within this function.
+        global STANLEY_K, STANLEY_HEADING_GAIN
         super().__init__('Stanley_Node', namespace='LKAS')
         self.get_logger().info("=== Stanley Node starting ===")
 
@@ -143,10 +164,26 @@ class StanleyNode(Node):
         # same parameter/pattern as controller_node.
         self.declare_parameter('simulator', 'carla')
         simulator = self.get_parameter('simulator').get_parameter_value().string_value
+        self.simulator = simulator
 
         self.declare_parameter('lookahead_m', LOOKAHEAD_M)
         self.declare_parameter('speed_topic', '/Car_1/vehicle/speed')
-        self.declare_parameter('control_rate_hz', 20.0)
+        # Doubled for MORAI: steer corrections were arriving/settling too
+        # slowly relative to how fast the car drifted off-lane. CARLA's
+        # 20 Hz is unchanged (already validated there).
+        self.declare_parameter('control_rate_hz', 40.0 if simulator == 'morai' else 20.0)
+        # Stanley's own cross-track gain -- previously a hardcoded module
+        # constant with no way to tune MORAI independently of CARLA. Both
+        # stanley_steer() and stanley_steer_from_coeffs() read the module
+        # global directly, so override it here rather than threading a
+        # new argument through both call sites.
+        self.declare_parameter('stanley_k', STANLEY_K_MORAI if simulator == 'morai' else STANLEY_K)
+        STANLEY_K = float(self.get_parameter('stanley_k').value)
+        # Separate heading-error gain -- see module-level comment. 1.0
+        # for CARLA (unscaled, matches the original canonical formula).
+        self.declare_parameter('stanley_heading_gain',
+            STANLEY_HEADING_GAIN_MORAI if simulator == 'morai' else STANLEY_HEADING_GAIN)
+        STANLEY_HEADING_GAIN = float(self.get_parameter('stanley_heading_gain').value)
         self.lookahead = self.get_parameter('lookahead_m').value
         speed_topic    = self.get_parameter('speed_topic').value
         rate           = self.get_parameter('control_rate_hz').value
@@ -185,7 +222,8 @@ class StanleyNode(Node):
         self.create_timer(1.0 / rate, self.control_loop)
         self.get_logger().info(
             f"Stanley initialised | lookahead={self.lookahead} m | "
-            f"rate={rate} Hz | speed_topic={speed_topic}"
+            f"rate={rate} Hz | speed_topic={speed_topic} | "
+            f"stanley_k={STANLEY_K} | stanley_heading_gain={STANLEY_HEADING_GAIN}"
         )
 
     # ── Convert nav_msgs/Path (REP 103, Y LEFT) → list of (X_fwd, Y_right) ─
@@ -254,12 +292,28 @@ class StanleyNode(Node):
         if lookahead is None:
             # HOLD: UFLD couldn't recover a lane centre at the lookahead
             # distance — typically inside a junction or where the polylines
-            # are too short. We deliberately DO NOT publish /Car_1/cmd_steer
-            # here: the bridge's `is_steer_fresh()` then goes False and the
-            # pure-pursuit fallback (carlaaccsim/carlaAccSimTown.py) takes
-            # over for the junction. Stanley resumes the moment UFLD locks
-            # the ego-lane back up on the far side.
-            steer = float('nan')
+            # are too short. For CARLA we deliberately DO NOT publish
+            # /Car_1/cmd_steer here: the bridge's `is_steer_fresh()` then
+            # goes False and the pure-pursuit fallback
+            # (carlaaccsim/carlaAccSimTown.py) takes over. Stanley resumes
+            # the moment UFLD locks the ego-lane back up on the far side.
+            #
+            # MORAI has no such fallback controller -- nothing else steers
+            # while Stanley is silent, so control_adapter_node just keeps
+            # re-sending whatever steer value it last received, frozen,
+            # for as long as HOLD lasts. With UFLD's lane lock flickering
+            # on MORAI (frequent LOW/FEW/REJ churn), that produced "steers
+            # slightly, then holds a stale angle" instead of a real
+            # fallback. Publish 0.0 (wheel straight) for MORAI instead of
+            # going silent -- not correct if genuinely mid-turn, but far
+            # safer than perpetuating an arbitrary stale nonzero angle
+            # indefinitely.
+            if self.simulator == 'morai':
+                steer = 0.0
+                out = Float32(); out.data = steer
+                self.steer_pub.publish(out)
+            else:
+                steer = float('nan')
             mode = 'HOLD'
             e_lat = e_head = float('nan')
         else:

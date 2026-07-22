@@ -35,7 +35,7 @@ car coasts.
 ## Workspace Structure
 
     ROS_ADAS_Stack/
-     ├── start_acc.sh               ← simulator startup script (launches all five nodes)
+     ├── start_adas.sh               ← simulator startup script (launches all five nodes)
      └── src/
          ├── perception/
          │   ├── perception_node.py             (ACC — YOLO)
@@ -72,13 +72,13 @@ The startup script in the workspace root launches all four nodes (ACC + LKAS).
 It sources ROS 2 and the workspace automatically and accepts a simulator argument:
 
     cd ~/workspace/03_ADAS_WK/ROS_ADAS_Stack
-    ./start_acc.sh carla       # for CARLA simulator
-    ./start_acc.sh morai       # for MORAI simulator  (LKAS not validated for morai)
+    ./start_adas.sh carla       # for CARLA simulator
+    ./start_adas.sh morai       # for MORAI simulator  (LKAS not validated for morai)
 
 Press **Ctrl+C** to shut down all nodes cleanly at the same time.
 
 **Prerequisite:** the CARLA server and the CARLA↔ROS bridge must already be
-running before `start_acc.sh` is launched. The script only orchestrates the ADAS
+running before `start_adas.sh` is launched. The script only orchestrates the ADAS
 nodes; it does not start the simulator or the bridge.
 
 To run nodes manually in separate terminals:

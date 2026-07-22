@@ -198,9 +198,13 @@ class LaneDetectionNode(Node):
         self.declare_parameter('cam_x_offset',
             DEFAULT_CAM_X_OFFSET_MORAI if simulator == 'morai' else DEFAULT_CAM_X_OFFSET)
 
-        # Run UFLD on every Nth camera frame. Camera publishes at ~20 Hz;
-        # N=4 gives ~5 Hz inference, which is plenty at the 20 km/h target.
-        self.declare_parameter('inference_skip_n', 4)
+        # Run UFLD on every Nth camera frame. CARLA publishes at ~20 Hz;
+        # N=4 gives ~5 Hz inference, plenty at the 20 km/h target. MORAI's
+        # camera rate has been inconsistent and often well under 20 Hz in
+        # testing, so skipping 3/4 frames on top of an already-sparse feed
+        # starves UFLD further -- process every frame instead. GPU headroom
+        # isn't the bottleneck at these input rates.
+        self.declare_parameter('inference_skip_n', 1 if simulator == 'morai' else 4)
         self.declare_parameter('enable_kalman', True)
 
         ufld_repo   = self.get_parameter('ufld_repo').value

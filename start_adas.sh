@@ -1,5 +1,5 @@
 #!/bin/bash
-# start_acc.sh — launches the ADAS stack (ACC + LKAS).
+# start_adas.sh — launches the ADAS stack (ACC + LKAS).
 #
 # Assumes:
 #   1. CARLA server is already running (./CarlaUE4.sh or 0.10 launcher)
@@ -13,7 +13,7 @@
 
 # ── Check argument ──────────────────────────────────────
 if [ "$1" != "carla" ] && [ "$1" != "morai" ]; then
-    echo "Usage: ./start_acc.sh [carla|morai]"
+    echo "Usage: ./start_adas.sh [carla|morai]"
     echo "  Note: LKAS nodes are CARLA-tuned. In morai mode they still launch"
     echo "        but lane detection / Stanley behaviour has not been validated."
     exit 1
@@ -40,7 +40,7 @@ ros2 run perception lane_detection_node --ros-args -p simulator:=$SIMULATOR &
 LANE_DETECTION_PID=$!
 echo "[INFO] LKAS lane_detection_node started (PID $LANE_DETECTION_PID)"
 
-ros2 run controller stanley_node &
+ros2 run controller stanley_node --ros-args -p simulator:=$SIMULATOR &
 STANLEY_PID=$!
 echo "[INFO] LKAS stanley_node started (PID $STANLEY_PID)"
 

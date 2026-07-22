@@ -87,6 +87,9 @@ thesis Objective / Methods / Results structure:
 - [§18](#18-foxglove-studio-integration-done) Foxglove Studio integration
 - [§19](#19-ipm-birds-eye-view--ipm_view_node-done) IPM bird's-eye view (`ipm_view_node`)
 
+### Chapter 6 — MORAI simulator integration
+- [§26](#26-morai-simulator-integration-ongoing) Full port to a second simulator: environment setup, MORAI's ROS2 Interface, the `morai_bridge` adapter package, camera/control calibration, and open issues
+
 ---
 
 ## 1. NPC traffic does not follow the road — drives straight and crashes [FIXED]
@@ -2060,3 +2063,362 @@ threshold is picked.
   `_conf` subscription with the standard `rclpy.create_subscription`
   pattern.
 
+## 26. MORAI simulator integration [ONGOING]
+
+**Objective.** Port this stack — previously CARLA-only — to also drive an
+ego vehicle in MORAI SIM: Drive / MORAI World: Automotive (Scenario
+Studio, ROS2 Interface panel), on a freshly cloned machine. Everything
+below happened in one long session; recorded here as the memory of what
+was actually done and why, since a lot of it was empirical/iterative.
+
+### 26a. New-machine environment setup [DONE]
+
+Fresh clone had none of the runtime installed. Fixed, in order:
+
+- ROS 2 Humble (desktop) + colcon + rosdep via the standard `ros2-apt-source`
+  install flow. `python3-tk`, `python3-pip` also missing (needed for
+  `UI.py` and pip respectively).
+- PyTorch: the RTX 5080 is Blackwell (`sm_120`) — needed the `cu128` wheel
+  index (`pip install torch torchvision --index-url
+  .../whl/cu128`), not a bare `pip install torch`. Verified with a real
+  on-GPU matmul, not just `torch.cuda.is_available()`.
+- `ultralytics`, `opencv-python`, `numpy<2` per README, plus **undocumented
+  transitive deps of the external UFLD-V2 repo** (`addict`, `tqdm`,
+  `tensorboard`, `scikit-learn`, `pathspec`, `imagesize`, `ujson` — from
+  that repo's own `requirements.txt`, not this one).
+- Two more external, hard dependencies not in this git clone at all,
+  found by grepping for the old machine's `/home/sirius/...` paths still
+  hardcoded in source:
+  - `Ultra-Fast-Lane-Detection-V2` — `lane_detection_node.py`'s
+    `ufld_repo` param does `sys.path.insert` + `importlib.import_module`
+    into it directly. Found a real clone of it already on this machine
+    at a different path; updated the default.
+  - `carlaaccsim` (the custom CARLA↔ROS bridge, referenced from `UI.py`'s
+    `BRIDGE_DIR`) — genuinely absent, out of scope since this session is
+    MORAI-only. `UI.py`'s CARLA-only buttons (Start CARLA/Bridge, etc.)
+    remain unusable here as a result; not fixed, not needed.
+- Two pre-existing bugs surfaced by trying a truly fresh run, unrelated
+  to the machine move: `controller/package.xml` never declared
+  `example_interfaces` despite the code importing it; `lane_detection_node`'s
+  `model_filename` default (`UFLD_best.pth`) never matched either real
+  checkpoint on disk (`UFLD_F1=0.67.pth` / `UFLD_F1=0.87.pth`).
+
+### 26b. MORAI's ROS2 Interface — architecture is different from CARLA's, in a good way [DONE]
+
+CARLA has no native ROS2 publishing, hence `carlaaccsim` had to be a full
+bridge (spawn actors, grab frames, encode, publish). **MORAI SIM natively
+publishes/subscribes ROS2 topics** via a GUI "Network Interface" panel
+(Layer/Interface tabs in the Scenario view) using pre-built Message
+Templates bound to sensor/vehicle entities. No bridge process needed for
+sensors — only a translator for the couple of places MORAI's message
+shapes don't match ours.
+
+Two categories of template, easy to conflate:
+- **Non-`ROS2`-prefixed templates** (`Camera RGB`, `Vehicle Manual Control`,
+  `TransformControl`, ...) are MORAI's native/UDP protocol — not used here.
+- **`ROS2 ...`-prefixed templates** map to real ROS2 types. Some are
+  fully standard (`ROS2_CompressedImage` → `sensor_msgs/msg/CompressedImage`,
+  `ROS2_Odometry` → `nav_msgs/msg/Odometry`, `ROS2_Imu`, `ROS2_NavSatFix`)
+  — decodable immediately, no extra package needed. **`ROS2 VehicleInfo`
+  and `ROS2 Vehicle Manual Control` are not standard** — both serialize
+  as `morai_v2_1_ros2_msgs/msg/...`, a custom package MORAI does not
+  publish the source for on this product line (only compiled Windows
+  `rosidl` typesupport `.dll`s ship with the simulator — useless for a
+  Linux build). Confirmed this isn't the same as the public
+  `MORAI-Autonomous/MORAI-ROS2_morai_msgs` GitHub repo either (different
+  message set entirely, e.g. no `VehicleInfo`/`VehicleManualControl` in
+  that repo's list) — this one seems to be gated behind a MORAI account
+  SDK download we didn't chase down.
+
+**Consequence for design:** avoid the custom-message templates wherever
+a standard one covers the same data.
+- **Vehicle speed**: skipped `ROS2 VehicleInfo` (custom message) entirely.
+  Used `ROS2_Odometry` (standard `nav_msgs/Odometry`) instead, bound to
+  an **IMU sensor entity** (`IMUEntity`, not the vehicle entity directly
+  — confirmed via MORAI's own "Sensor Data Transmission" doc page, which
+  is sensors-only and doesn't cover control at all). `twist.twist.linear`
+  gives velocity directly.
+- **Control**: no standard-message alternative exists for
+  throttle/brake/steer — `ROS2 Vehicle Manual Control` (custom message)
+  was unavoidable here. Got its field layout from MORAI's own Message
+  Template editor UI (not docs): `throttle`, `brake`,
+  `steering_wheel_angle`, all `float64`. Hand-authored a matching
+  `.msg` in a local `morai_v2_1_ros2_msgs` package (see §26c) — a
+  legitimate technique when the source isn't available, since ROS2/DDS
+  message compatibility is structural (package + message name + field
+  layout), not centrally registered.
+
+### 26c. New packages: `morai_v2_1_ros2_msgs` + `morai_bridge` [DONE]
+
+- **`morai_v2_1_ros2_msgs`** (`ament_cmake`, message-only) —
+  `msg/VehicleManualControl.msg`:
+  ```
+  float64 throttle
+  float64 brake
+  float64 steering_wheel_angle
+  ```
+  Reconstructed from MORAI's Interface editor field table, not from any
+  published source (see §26b). If MORAI ever publishes the real package,
+  replace this with it.
+- **`morai_bridge`** (`ament_python`) — two adapter nodes, translating
+  between MORAI's topics and this stack's existing simulator-agnostic
+  `/Car_1/*` topics:
+  - `state_adapter_node`: subscribes `<odom_topic>` (default
+    `/Car_1/odometry`, `nav_msgs/Odometry`), publishes
+    `speed = sqrt(vx²+vy²+vz²)` as `example_interfaces/msg/Float64` on
+    `/Car_1/vehicle/speed` — the exact type `controller_node`/
+    `stanley_node` already expected in `simulator:=morai` mode (that
+    branch pre-dated this session; only the publisher side was missing).
+    For this to be the true vehicle-origin speed (no `ω × r` lever-arm
+    skew from yaw/pitch/roll rate), the IMU sensor entity must sit at
+    the vehicle's own local origin: **Position (0,0,0), Orientation
+    (0,0,0)** — the asset-library default position was *behind the rear
+    bumper*, outside the car body entirely; had to be corrected.
+  - `control_adapter_node`: subscribes `/Car_1/cmd_vel` (Twist:
+    `linear.x`=throttle, `linear.y`=brake) + `/Car_1/cmd_steer`
+    (Float32, normalised steer), publishes
+    `morai_v2_1_ros2_msgs/VehicleManualControl` on `/Car_1/control`.
+    Exposes `throttle_scale`/`brake_scale`/`steer_to_wheel_angle_deg`/
+    `steer_sign` as ROS params specifically because none of MORAI's
+    exact units/ranges/sign convention for this message were documented
+    anywhere — see §26f for the empirical calibration history.
+- `start_adas.sh` (renamed from `start_acc.sh`, see §26i) launches both
+  automatically when `$SIMULATOR = morai`; `UI.py` also got matching
+  "Start/Stop MORAI Bridge" buttons.
+
+### 26d. Camera calibration [DONE]
+
+`perception_node`/`lane_detection_node`'s IPM math hard-assumes a pinhole
+model with **zero pitch/roll** (image vertical centre = the horizon,
+exactly) and `focal_px = width / (2·tan(FOV/2))`, i.e. **`focal = width/2`
+at 90° FOV** for any resolution — this is CARLA's own convention too, so
+no code changes were needed for MORAI, only getting the physical/MORAI
+side to match:
+
+- Camera resolution is a free choice — the nodes compute focal
+  dynamically per incoming frame width, nothing hardcoded. Started at
+  1080×720 (focal 540), later changed to 1280×720 (focal 640) — both
+  valid, since `640 = 1280/2` and `540 = 1080/2` both satisfy the 90°
+  rule. (Worth flagging: 1280×720/focal=640 is *not* actually "the CARLA
+  setting" as believed when made — that pairing is CARLA's old,
+  superseded default from before `§10`'s bump to 1920×1080/focal≈960;
+  it just happens to be internally self-consistent for our formula
+  regardless, so the change was harmless.)
+- Physical placement: `cam_x_offset` and `cam_height_m` got MORAI-specific
+  defaults (`0.75 m` / `0.9 m`, vs. CARLA's `0.6 m` / `1.35 m`) via a
+  `simulator` ROS param already threaded through `perception_node` and
+  `lane_detection_node` — set by directly measuring where the user
+  placed `Camera_1` in MORAI, then validated by capturing a live frame
+  and checking the horizon sits at the image's vertical centre (it did,
+  within ~1% of frame height).
+- MORAI's Camera_1 "Focal Length" field is the actual tunable parameter;
+  "Horizontal/Vertical FOV" are read-only, computed from it. Initially
+  left at an asset-library default (320 px at 1080 width → 118.7° FOV,
+  not 90°) — silently wrong until corrected to 540.
+
+### 26e. Vehicle state feedback — recurring root cause of `v=0.00 m/s` [FIXED, multiple rounds]
+
+`stanley_node`/`controller_node` showed `v=0.00 m/s` persistently across
+several test rounds, each with a different cause:
+1. **Message-type mismatch.** `controller_node.py` already branched
+   `example_interfaces/Float64` vs `std_msgs/Float64` on a `simulator`
+   param that pre-dated this session — but **`stanley_node.py` had no
+   such branch at all**, and always subscribed `std_msgs/Float64`,
+   which can never match our `example_interfaces/Float64` publisher.
+   Added the same `simulator` branch to `stanley_node`.
+2. **UI dropdown defaulting to `carla`.** Even after fixing (1), the
+   UI's Simulator selector defaulted to `'carla'`, so `Run start_adas.sh`
+   / ACC / LKAS toggles kept launching nodes in CARLA mode regardless of
+   what MORAI was actually doing. Flipped the UI default to `'morai'`
+   and added a loud `### LAUNCHING WITH SIMULATOR = X ###` log line at
+   all three launch points so this is never silently wrong again.
+3. **`start_adas.sh` itself never passed `-p simulator:=$SIMULATOR` to
+   `stanley_node`** (see §26i) — every other node in the script got it;
+   this one was missed when the flag was originally added. This alone
+   meant `stanley_node` ran fully CARLA-tuned (`stanley_k=0.5`,
+   `heading_gain=1.0`, `rate=20Hz`, old HOLD behaviour) every single time
+   the stack was launched via the script or the "Run start_adas.sh"
+   button, regardless of the script's own `morai` argument — likely
+   responsible for a good fraction of the steering behaviour that got
+   mis-diagnosed as a gain-tuning problem in §26f/§26g before this was
+   found.
+4. **UI's own internal speed display** (`TelemetryView`, powers the
+   "Speed:" label) had *yet another* independent hardcoded
+   `std_msgs/Float64` subscription, never touched by any of the above
+   fixes since it's a separate node from `controller_node`/`stanley_node`.
+   Attempted a "subscribe with both types" fix first — **ROS2 rejects
+   two different message types on the same topic name within one node**
+   (`rcl` raises "invalid allocator", not a graceful error) — reverted to
+   picking one type at construction time, read from the dropdown's value
+   at UI startup (a real remaining limitation: if you flip the dropdown
+   *after* `UI.py` has already started, this one display won't pick up
+   the change without a restart; the actual control nodes aren't
+   affected, they read the dropdown fresh at their own launch time).
+
+Given how many independent causes produced the identical `v=0.00`
+symptom, treat that specific log line with suspicion in future — check
+`ros2 param get <node> simulator` directly rather than inferring from
+behaviour.
+
+### 26f. Control calibration — throttle [FIXED] and steering [ONGOING]
+
+**Throttle.** `cruise_control()`'s gain/cap needed MORAI-specific values
+distinct from CARLA's, added as `ACC_GAIN_SCALE_MORAI` (10x softer
+`k_p`/`k_d`) and a separate `cruise_throttle_cap`. Iteration history:
+- First MORAI runs: throttle pinned at 1.0 constantly. Root cause (see
+  §26e #2/#3) was CARLA-strength gains + broken speed feedback, not
+  MORAI needing gentler tuning per se — but genuinely-softer gains were
+  still wanted regardless once feedback was fixed.
+- `cruise_gain` (the cruise-mode P-gain) at CARLA's `0.3` scaled down
+  10x to `0.03` alongside `k_p`/`k_d` — too weak, `throttle ≈ 0.042` at
+  the typical ~1.4 m/s standstill error, not enough to move the car.
+  Reverted `cruise_gain` to full CARLA strength (`0.3`) — safe because
+  `cruise_throttle_cap` (started `0.2`, later raised to `0.8` on request)
+  is the actual ceiling now, letting errors *reach* the cap instead of
+  topping out at a fraction of it, while still tapering smoothly as
+  `v_ego → target`.
+- Confirmed working: steady, bounded throttle instead of saturating.
+
+**Steering — still not converged, several rounds of tuning:**
+- `steer_to_wheel_angle_deg` (the adapter's output scale): `450° → 60° →
+  6° → 0.6° → 0.1°`, each step still "too sharp" until suddenly, at
+  0.1°, the opposite complaint: barely any physical effect, "just
+  steers slightly then holds."
+- `steer_sign`: confirmed empirically the car turned *left* on a
+  positive `steer_norm`, contradicting the "positive = right"
+  convention everywhere else in this stack. Flipped to `-1.0`.
+- **Stanley's own gain had no MORAI override at all** until this
+  session — `STANLEY_K` (cross-track) and a *newly split-out*
+  `STANLEY_HEADING_GAIN` (heading error had *always* had a fixed,
+  unscaled weight of `1.0` in both formulas — only cross-track ever got
+  a tunable gain). Both converted from hardcoded module constants to
+  real ROS params (`stanley_k`, `stanley_heading_gain`) with
+  simulator-conditional defaults, specifically so future tuning doesn't
+  need a rebuild. Current MORAI values: `stanley_k=15.0` (30x CARLA),
+  `stanley_heading_gain=3.0` (CARLA stays `1.0`, unscaled/canonical).
+- **Open theory, not yet confirmed or refuted**: MORAI's
+  `steering_wheel_angle` field may not be an absolute target angle at
+  all — evidence (MORAI's own HUD showing `107.76°` against a commanded
+  `0.239`, wildly mismatched) suggests it could be a per-tick
+  increment/rate that accumulates. Proposed test, not yet run: publish
+  a constant nonzero value for several seconds and watch whether the
+  HUD angle settles (absolute) or keeps climbing (incremental). This
+  would mean everything scale/gain-related above is fighting the wrong
+  variable, and a closed-loop rate controller (using MORAI's own
+  steering feedback, which would require the `VehicleInfo` custom
+  message after all) might be the real fix.
+- Given how many knobs are now in play simultaneously (`stanley_k`,
+  `stanley_heading_gain`, `steer_to_wheel_angle_deg`, `control_rate_hz`),
+  and that §26e #3 means much of the earlier tuning happened against a
+  half-broken launch path, recommend re-baselining from the current
+  values as a set rather than continuing to adjust one at a time.
+
+### 26g. HOLD mode has no MORAI fallback — "steers slightly, then holds a stale angle" [FIXED]
+
+Root cause turned out to be architectural, not a gain problem, despite
+initially looking identical to the steering-sensitivity issue above.
+`stanley_node.control_loop()` deliberately **does not publish**
+`/Car_1/cmd_steer` while in HOLD (UFLD lost the lane) — by design, for
+CARLA, because the separate `carlaaccsim` bridge has its own
+pure-pursuit fallback that takes over the instant Stanley goes silent.
+**MORAI has no equivalent fallback.** So whenever UFLD's lane lock
+flickered (frequent on MORAI's imagery — lots of `LOW ↔ FEW ↔ REJ`
+churn in the Kalman-filter log), Stanley would go quiet and
+`control_adapter_node` would just keep re-publishing whatever steer
+value it last received, frozen, for as long as HOLD lasted — the car
+appeared to "steer slightly, then hold," actually driving in circles on
+a stale angle rather than continuing to correct.
+
+**Fix.** MORAI now publishes `0.0` (wheel straight) during HOLD instead
+of going silent (`if self.simulator == 'morai': publish 0.0`). Not
+"correct" if genuinely mid-turn when HOLD triggers, but far safer than
+perpetuating an arbitrary frozen nonzero angle indefinitely. CARLA's
+original silent behaviour is completely unchanged. Verified live both
+ways (continuous `0.0` stream for MORAI with no lane data; genuinely
+zero messages for CARLA in the same test).
+
+**Diagnostic takeaway**: "which ROS values to check" for this class of
+symptom is `/LKAS/ego_lane_left` / `/LKAS/ego_lane_right` (empty/short
+whenever HOLD triggers) and the Kalman filter state-transition log, not
+a control gain.
+
+### 26h. `UI.py` changes [DONE]
+
+- **Simulator selector** (`carla`/`morai` dropdown, defaults `morai`)
+  added to the Processes panel, threaded through all three launch paths
+  (`run_start_adas`, ACC toggle, LKAS toggle) plus a loud log line at
+  each. See §26e #2.
+- **Start/Stop MORAI Bridge** buttons — launch/stop
+  `state_adapter_node` + `control_adapter_node` independently of the
+  rest of the stack, for iterating on calibration without a full
+  restart.
+- **Empty-`CompressedImage` crash** — `cv2.imdecode` raises a hard C++
+  assertion (not a graceful `None`) on a zero-length buffer, unlike a
+  merely-malformed-but-nonempty one. Some debug topic sent one at least
+  once, and since `_render_tick` only reschedules itself via
+  `root.after()` at the very end of the function, this **permanently
+  froze the entire camera view** for the rest of the session on one bad
+  frame. Fixed with a truthiness guard (`if jpeg and ...`) at both
+  decode sites (main camera view + BEV panel). Reproduced the exact
+  crash and confirmed the fix survives it, then confirmed it still
+  renders a real subsequent frame correctly (not just "doesn't crash").
+- **Internal speed-display type mismatch** — see §26e #4.
+
+### 26i. `start_adas.sh` — renamed from `start_acc.sh`, and a real bug found while renaming [DONE]
+
+Renamed via `git mv` (all references updated: `UI.py`'s `START_ADAS_SH`
+constant, `run_start_adas` method name, button label, log strings;
+`README.md`; `DEBUG.md`'s own historical entries left as-is —
+they're a record of what was called at the time). While doing the
+rename and re-auditing the file end-to-end, found and fixed the
+`stanley_node` missing `-p simulator:=$SIMULATOR` bug described in
+§26e #3 — a good example of why a "just rename it" task is worth
+actually reading the file being renamed.
+
+### 26j. WSLg blank-window rendering bug [ENVIRONMENT, not this codebase]
+
+Recurring, not a one-off: `python3 UI.py` (and even a bare
+three-line Tk test window) sometimes renders as a blank window — taskbar
+icon present, no pixel content. `/mnt/wslg/stderr.log` shows
+`Xwayland glamor: GBM Wayland interfaces not available / Failed to
+initialize glamor, falling back to sw` at Xwayland startup each time.
+Confirmed NOT a UI.py/Tkinter bug (the minimal test window fails
+identically). `wsl --update` and the NVIDIA driver were both already
+current when this recurred, ruling those out as the fix. Leading
+open theory: **GPU contention at Xwayland's one-time startup
+negotiation** — MORAI's `MoraiSimulator-Win64-Shipping.exe` was measured
+at 79-99% GPU utilization on the Windows host when this happened, and
+Xwayland's glamor init needs a GPU handshake even before falling back
+to software. `wsl --shutdown` (full VM restart) reliably clears it,
+but the *why it fails on a fresh boot sometimes and not others* isn't
+fully confirmed. Proposed, not yet validated: launch `UI.py` **before**
+starting MORAI's scenario, so Xwayland's one-time init happens while
+the GPU is idle. Does not block ADAS/MORAI work either way — everything
+runs fine from the command line, and Foxglove Studio (browser-based,
+doesn't go through WSLg's compositor) covers visualization in the
+meantime.
+
+### Open issues / next steps
+
+- Steering calibration unconverged (§26f) — re-baseline against the
+  now-fixed launch path (§26e #3) before further tuning; the
+  rate-vs-absolute-angle test is the single highest-value next
+  experiment.
+- UFLD lane-lock stability on MORAI's imagery is poor enough to trigger
+  HOLD often (§26g) — may need its own Kalman/confidence-threshold pass
+  once steering is stable, independent of the MORAI port itself.
+- Camera publish rate inconsistent (measured anywhere 3-60 Hz against a
+  60 Hz then 20 Hz MORAI-side config) — RTF was confirmed fine (~1.0)
+  when checked, so it's not a global sim-speed problem; likely the
+  camera sensor's own capture/encode pipeline specifically. "Record
+  data" toggle and resolution were flagged as untried cheap experiments.
+- `Start MORAI Bridge` can spin up duplicate `state_adapter_node`/
+  `control_adapter_node` instances if clicked again without "Stop"
+  first (happened 3+ times this session) — `start_morai_bridge()` only
+  checks its own in-memory tracking, not actual OS processes. Not yet
+  hardened.
+- `carlaaccsim` and its `UI.py` integration (Start CARLA/Bridge buttons,
+  `CARLA_DIR`/`CARLA_PYTHON`/`BRIDGE_DIR` paths) remain untouched,
+  still pointing at the old machine's `/home/sirius/...` paths —
+  out of scope while MORAI-only, but will need fixing if CARLA testing
+  resumes on this machine.

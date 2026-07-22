@@ -44,19 +44,34 @@ class MoraiControlAdapter(Node):
         self.declare_parameter('cmd_steer_topic', '/Car_1/cmd_steer')
         self.declare_parameter('control_topic', '/Car_1/control')
         # NEEDS CALIBRATION -- see module docstring. Was 450.0 (a
-        # plausible full-lock steering-wheel angle) but that turned tiny
-        # lane-keeping corrections (e.g. steer=-0.305 from a mere 0.24 m
-        # lateral error) into a 137 deg wheel command -- wildly
-        # oversized. Dropped to a much gentler starting point pending
-        # real calibration against observed front-wheel response.
-        self.declare_parameter('steer_to_wheel_angle_deg', 60.0)
-        self.declare_parameter('steer_sign', 1.0)
+        # plausible full-lock steering-wheel angle), then 60.0, then 6.0,
+        # then 0.6 -- still too sharp/prone to circling at each step. If
+        # it's still wrong at 0.1, that's a strong signal this isn't a
+        # scale problem at all -- see the rate-vs-absolute-angle note
+        # below (still unconfirmed; a faster update rate makes tracking
+        # *better* if MORAI treats this as an absolute angle, but makes
+        # accumulated drift *worse* if it's actually a per-tick increment).
+        self.declare_parameter('steer_to_wheel_angle_deg', 0.1)
+        # Confirmed empirically: positive steer_norm made the car turn
+        # left in MORAI, not right (README/Stanley convention: positive =
+        # right). Flipped.
+        self.declare_parameter('steer_sign', -1.0)
+        # NEEDS CALIBRATION. Our throttle/brake are 0..1 (matching CARLA's
+        # convention); MORAI's VehicleManualControl.throttle/brake range is
+        # undocumented -- could be 0..1 or 0..100. Default 1.0 = pass
+        # through unscaled; try `-p throttle_scale:=100.0` (and/or
+        # brake_scale) live to test the 0..100 hypothesis without a
+        # rebuild.
+        self.declare_parameter('throttle_scale', 1.0)
+        self.declare_parameter('brake_scale', 1.0)
 
         cmd_vel_topic   = self.get_parameter('cmd_vel_topic').value
         cmd_steer_topic = self.get_parameter('cmd_steer_topic').value
         control_topic   = self.get_parameter('control_topic').value
         self.steer_scale = float(self.get_parameter('steer_to_wheel_angle_deg').value)
         self.steer_sign  = float(self.get_parameter('steer_sign').value)
+        self.throttle_scale = float(self.get_parameter('throttle_scale').value)
+        self.brake_scale    = float(self.get_parameter('brake_scale').value)
 
         self._throttle = 0.0
         self._brake = 0.0
@@ -73,7 +88,9 @@ class MoraiControlAdapter(Node):
             f'    cmd_steer in:  {cmd_steer_topic}\n'
             f'    control out:   {control_topic}\n'
             f'    steer_scale:   {self.steer_scale} deg (UNCALIBRATED)\n'
-            f'    steer_sign:    {self.steer_sign}')
+            f'    steer_sign:    {self.steer_sign}\n'
+            f'    throttle_scale: {self.throttle_scale} (UNCALIBRATED)\n'
+            f'    brake_scale:    {self.brake_scale} (UNCALIBRATED)')
 
     def _on_cmd_vel(self, msg: Twist):
         self._throttle = msg.linear.x
@@ -86,8 +103,8 @@ class MoraiControlAdapter(Node):
 
     def _publish(self):
         out = VehicleManualControl()
-        out.throttle = float(self._throttle)
-        out.brake = float(self._brake)
+        out.throttle = float(self._throttle) * self.throttle_scale
+        out.brake = float(self._brake) * self.brake_scale
         out.steering_wheel_angle = self.steer_sign * self._steer * self.steer_scale
         self.control_pub.publish(out)
 

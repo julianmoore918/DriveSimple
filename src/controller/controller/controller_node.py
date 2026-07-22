@@ -57,6 +57,12 @@ CRUISE_SPEED_KMH = 20.0
 # unvalidated -- start MORAI runs at a crawl until that's tuned. See
 # morai_bridge/control_adapter_node.py.
 CRUISE_SPEED_KMH_MORAI = 5.0
+# ACC's gains (k_p, k_d, cruise-mode throttle/brake gain) were tuned
+# against CARLA's vehicle dynamics. First live MORAI runs saturated
+# throttle to 100% immediately, so MORAI gets its own 10x-softer gain
+# set here -- CARLA's values (k_p=1.2, k_d=0.8, cruise gain=0.3) are
+# untouched. Revisit once MORAI's actual vehicle response is validated.
+ACC_GAIN_SCALE_MORAI = 0.1
 
 
 class ACCNode(Node):
@@ -96,9 +102,25 @@ class ACCNode(Node):
         # That matches the "follow at roughly 5 m gap" mental model and
         # gives the controller enough headroom that closing-rate dominates
         # the PD response on a lead deceleration event.
+        gain_scale = ACC_GAIN_SCALE_MORAI if simulator == 'morai' else 1.0
         self.T_gap             = 0.3
-        self.k_p               = 1.2       # proportional gain
-        self.k_d               = 0.8       # derivative gain
+        self.k_p               = 1.2 * gain_scale       # proportional gain
+        self.k_d               = 0.8 * gain_scale       # derivative gain
+        # Cruise-mode's own P-gain (see cruise_control()). Unlike k_p/k_d,
+        # this is NOT 10x-softened for MORAI: at gain_scale=0.1 the actual
+        # throttle command (~0.042 at the typical ~1.4 m/s standstill
+        # error) was too weak to move the car at all. Full CARLA-strength
+        # gain here is safe because `cruise_throttle_cap` below is the
+        # real MORAI safety ceiling -- this just lets errors reach it
+        # instead of topping out at a fraction of it, and still tapers
+        # off smoothly as v_ego approaches target.
+        self.cruise_gain       = 0.3
+        # Even at gain_scale=0.1, cruise throttle still hit 1.0 on first
+        # MORAI runs (speed feedback was/may still be unreliable enough
+        # that speed_error stays large). Hard-cap MORAI's cruise throttle
+        # well below full send regardless of what the gain computes;
+        # CARLA keeps its original 1.0 ceiling.
+        self.cruise_throttle_cap = 0.8 if simulator == 'morai' else 1.0
         self.a_max             = 3.0       # [m/s²]
         self.a_min             = -6.0      # [m/s²]
         # Emergency threshold is now a bumper gap, not a camera distance.
@@ -253,13 +275,13 @@ class ACCNode(Node):
         speed_error = self.target_speed - self.v_ego  # +ve = need to speed up
 
         if speed_error > 0.5:
-            throttle = min(speed_error * 0.3, 1.0)
+            throttle = min(speed_error * self.cruise_gain, self.cruise_throttle_cap)
             brake    = 0.0
         elif speed_error < -0.5:
-            # Same 0.3 gain shape on the brake side, capped a touch
+            # Same gain shape on the brake side, capped a touch
             # higher (0.6) so we can actually arrest a large overshoot.
             throttle = 0.0
-            brake    = min(-speed_error * 0.3, 0.6)
+            brake    = min(-speed_error * self.cruise_gain, 0.6)
         else:
             throttle = 0.0
             brake    = 0.0

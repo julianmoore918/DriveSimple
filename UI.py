@@ -7,8 +7,8 @@ Buttons:
   * Start / Stop Bridge          — carlaaccsim/carlaAccSimTown.py
                                    (publishes /Car_1/camera/front/compressed,
                                     /Car_1/vehicle/speed, subscribes /Car_1/cmd_vel)
-  * Run start_acc.sh             — launches all four ADAS nodes via the script
-  * Stop ADAS Stack              — kills start_acc.sh + any orphan ADAS nodes
+  * Run start_adas.sh             — launches all four ADAS nodes via the script
+  * Stop ADAS Stack              — kills start_adas.sh + any orphan ADAS nodes
   * ACC: ON/OFF                  — toggles perception_node + controller_node
   * LKAS: ON/OFF                 — toggles lane_detection_node + stanley_node
 
@@ -36,7 +36,8 @@ try:
     from rclpy.node import Node
     from sensor_msgs.msg import CompressedImage
     from geometry_msgs.msg import Twist
-    from std_msgs.msg import Float32, Float64
+    from std_msgs.msg import Float32, Float64 as StdFloat64
+    from example_interfaces.msg import Float64 as ExFloat64
     CAMERA_AVAILABLE = True
     _camera_err = None
 except ImportError as e:
@@ -75,7 +76,7 @@ CARLA_INI     = Path('/home/sirius/CARLA_0.9.16/CarlaUE4/Config/DefaultEngine.in
 CARLA_PYTHON  = Path('/home/sirius/CARLA_0.9.16/carla-env/bin/python3')
 BRIDGE_DIR    = Path('/home/sirius/workspace/carlaaccsim')
 BRIDGE_SCRIPT = BRIDGE_DIR / 'carlaAccSimTown.py'
-START_ACC_SH  = ADAS_WK / 'start_acc.sh'
+START_ADAS_SH  = ADAS_WK / 'start_adas.sh'
 ROS_SETUP     = '/opt/ros/humble/setup.bash'
 
 CAMERA_TOPIC       = '/Car_1/camera/front/compressed'
@@ -332,7 +333,7 @@ class TelemetryView(Node):
     ACC / LKAS alive indicators.
     """
 
-    def __init__(self):
+    def __init__(self, simulator: str = 'carla'):
         super().__init__('adas_ui_telemetry')
         self.latest_jpegs = {t: None for t in CAMERA_SOURCES.values()}
         # IPM lives outside CAMERA_SOURCES (separate widget, not source-
@@ -355,8 +356,16 @@ class TelemetryView(Node):
         self.create_subscription(
             Float32, CMD_STEER_TOPIC,
             lambda _msg: self._touch(CMD_STEER_TOPIC), 10)
+        # ROS2 rejects two different message types on the same topic name
+        # within one node (rcl raises "invalid allocator") -- must pick a
+        # single type. Uses whatever the Simulator dropdown reads at UI
+        # startup; if you flip the dropdown afterward, restart the UI for
+        # this speed display to pick up the new type (controller_node /
+        # stanley_node aren't affected -- they read the dropdown fresh at
+        # their own launch time, which is always after you've set it).
+        SpeedMsg = ExFloat64 if simulator == 'morai' else StdFloat64
         self.create_subscription(
-            Float64, SPEED_TOPIC, self._on_speed, 10)
+            SpeedMsg, SPEED_TOPIC, self._on_speed, 10)
 
     def _on_speed(self, msg):
         self.speed_mps = float(msg.data)
@@ -391,7 +400,7 @@ class ADASUI:
         # Long-lived child processes.
         self.carla_proc: subprocess.Popen | None = None
         self.bridge_proc: subprocess.Popen | None = None
-        self.stack_proc: subprocess.Popen | None = None         # start_acc.sh
+        self.stack_proc: subprocess.Popen | None = None         # start_adas.sh
         self.foxglove_proc: subprocess.Popen | None = None      # foxglove_bridge
         self.acc_procs: list[subprocess.Popen] = []             # when toggled independently
         self.lkas_procs: list[subprocess.Popen] = []
@@ -498,27 +507,30 @@ class ADASUI:
         procs.columnconfigure(0, weight=1)
         procs.columnconfigure(1, weight=1)
         # Simulator selector — gates every node-launch button below
-        # (Run start_acc.sh, ACC toggle, LKAS toggle): picks the
+        # (Run start_adas.sh, ACC toggle, LKAS toggle): picks the
         # `simulator:=carla|morai` ros param each node uses for its
-        # camera calibration and speed-message type. row=-1 renders
-        # above row 0 without renumbering the rest of this frame.
+        # camera calibration and speed-message type.
         ttk.Label(procs, text='Simulator:').grid(
-            row=-1, column=0, sticky='w', pady=(0, 4))
-        self.simulator_var = tk.StringVar(value='carla')
+            row=0, column=0, sticky='w', pady=(0, 4))
+        # Defaults to morai: this dropdown landing on the wrong value
+        # (silently keeping CARLA's full-strength gains/speed-message-type)
+        # has been the root cause of "throttle pinned at 1" and "v=0" more
+        # than once. Flip back to 'carla' explicitly when testing CARLA.
+        self.simulator_var = tk.StringVar(value='morai')
         ttk.Combobox(procs, textvariable=self.simulator_var,
                      values=['carla', 'morai'],
                      state='readonly', width=8).grid(
-            row=-1, column=1, sticky='w', pady=(0, 4))
+            row=0, column=1, sticky='w', pady=(0, 4))
         ttk.Button(procs, text='Start CARLA', command=self.start_carla).grid(
-            row=0, column=0, sticky='ew', pady=2)
+            row=1, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop CARLA', command=self.stop_carla).grid(
-            row=0, column=1, sticky='ew', pady=2, padx=(4, 0))
+            row=1, column=1, sticky='ew', pady=2, padx=(4, 0))
         ttk.Button(procs, text='Restart CARLA', command=self.restart_carla).grid(
-            row=1, column=0, columnspan=2, sticky='ew', pady=2)
+            row=2, column=0, columnspan=2, sticky='ew', pady=2)
         ttk.Button(procs, text='Start Bridge', command=self.start_bridge).grid(
-            row=2, column=0, sticky='ew', pady=2)
+            row=3, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop Bridge', command=self.stop_bridge).grid(
-            row=2, column=1, sticky='ew', pady=2, padx=(4, 0))
+            row=3, column=1, sticky='ew', pady=2, padx=(4, 0))
         # Spawn index — passed as --spawn-index to the bridge at Start
         # Bridge. Index into the current town's spawn_points list; the
         # ego appears there and the lead `--lead-gap-m` ahead. Takes
@@ -526,9 +538,9 @@ class ADASUI:
         # spawn point (index, x, y, z, yaw) into the log so the user
         # can pick one — CARLA must be running.
         ttk.Label(procs, text='Spawn index:').grid(
-            row=3, column=0, sticky='w', pady=(0, 4))
+            row=4, column=0, sticky='w', pady=(0, 4))
         spawn_frame = ttk.Frame(procs)
-        spawn_frame.grid(row=3, column=1, sticky='w', pady=(0, 4))
+        spawn_frame.grid(row=4, column=1, sticky='w', pady=(0, 4))
         self.spawn_index_var = tk.StringVar(value='0')
         ttk.Spinbox(spawn_frame, from_=0, to=999, width=6,
                     textvariable=self.spawn_index_var).pack(side='left')
@@ -539,12 +551,12 @@ class ADASUI:
         # Start Bridge. Switching mid-run has no effect; restart the bridge.
         # See DEBUG.md §13.
         ttk.Label(procs, text='Junction policy:').grid(
-            row=4, column=0, sticky='w', pady=(0, 4))
+            row=5, column=0, sticky='w', pady=(0, 4))
         self.junction_policy_var = tk.StringVar(value='Pure pursuit')
         ttk.Combobox(procs, textvariable=self.junction_policy_var,
                      values=list(JUNCTION_POLICIES.keys()),
                      state='readonly', width=14).grid(
-            row=4, column=1, sticky='w', pady=(0, 4))
+            row=5, column=1, sticky='w', pady=(0, 4))
         # Rosbag recording toggle — passed as --record to the bridge at
         # Start Bridge. Off by default (bridge used to leave a GB/min
         # rosbag on disk every run whether the operator wanted it or
@@ -552,21 +564,21 @@ class ADASUI:
         self.rosbag_record_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(procs, text='Record rosbag',
                         variable=self.rosbag_record_var).grid(
-            row=5, column=0, columnspan=2, sticky='w', pady=(0, 4))
-        ttk.Button(procs, text='Run start_acc.sh', command=self.run_start_acc).grid(
-            row=6, column=0, columnspan=2, sticky='ew', pady=2)
-        ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
+            row=6, column=0, columnspan=2, sticky='w', pady=(0, 4))
+        ttk.Button(procs, text='Run start_adas.sh', command=self.run_start_adas).grid(
             row=7, column=0, columnspan=2, sticky='ew', pady=2)
+        ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
+            row=8, column=0, columnspan=2, sticky='ew', pady=2)
         # Foxglove bridge — independent visualisation tool. Opens
         # ws://localhost:8765 for Foxglove Studio (desktop or web).
         # Lives outside the ADAS/CARLA lifecycle so layouts can also be
         # used for rosbag playback after the stack is stopped.
         ttk.Button(procs, text='Start Foxglove',
                    command=self.start_foxglove).grid(
-            row=8, column=0, sticky='ew', pady=2)
+            row=9, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop Foxglove',
                    command=self.stop_foxglove).grid(
-            row=8, column=1, sticky='ew', pady=2, padx=(4, 0))
+            row=9, column=1, sticky='ew', pady=2, padx=(4, 0))
         # MORAI adapter nodes (state_adapter_node + control_adapter_node,
         # package morai_bridge) — translate MORAI's ROS2 Interface topics
         # to/from this stack's /Car_1/* topics. No CARLA/bridge process
@@ -574,10 +586,10 @@ class ADASUI:
         # MORAI's own simulator + ROS2 Interfaces must already be running.
         ttk.Button(procs, text='Start MORAI Bridge',
                    command=self.start_morai_bridge).grid(
-            row=9, column=0, sticky='ew', pady=2)
+            row=10, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop MORAI Bridge',
                    command=self.stop_morai_bridge).grid(
-            row=9, column=1, sticky='ew', pady=2, padx=(4, 0))
+            row=10, column=1, sticky='ew', pady=2, padx=(4, 0))
 
         # Feature toggles. Each row has a button (user intent — ON/OFF) and a
         # small status dot reflecting whether the backing nodes are actually
@@ -792,7 +804,7 @@ class ADASUI:
         except RuntimeError:
             # Already initialised somewhere in this process.
             pass
-        self.ros_node = TelemetryView()
+        self.ros_node = TelemetryView(self.simulator_var.get())
         self.ros_thread = threading.Thread(
             target=lambda: rclpy.spin(self.ros_node), daemon=True)
         self.ros_thread.start()
@@ -817,24 +829,31 @@ class ADASUI:
     def _render_tick(self):
         if self.ros_node is not None:
             jpeg = self.ros_node.latest_jpegs.get(self._active_camera_topic())
-            if jpeg is not None and jpeg is not self._last_rendered_jpeg:
+            # cv2.imdecode raises a hard C++ assertion (not a graceful None)
+            # on an empty buffer, unlike a merely-malformed-but-nonempty one.
+            # A publisher sending a zero-byte CompressedImage (e.g. a debug
+            # topic with nothing to draw yet) used to crash this callback
+            # permanently -- `_render_tick` only reschedules itself via
+            # `after()` at the very end, so one bad frame froze the camera
+            # view for the rest of the session. Guard both decode sites.
+            if jpeg and jpeg is not self._last_rendered_jpeg:
                 arr = np.frombuffer(jpeg, dtype=np.uint8)
                 bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if bgr is not None:
                     self._last_bgr = bgr
                     self._render_frame(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-                    self._last_rendered_jpeg = jpeg
+                self._last_rendered_jpeg = jpeg
             if self._video_writer is not None and self._last_bgr is not None:
                 self._record_frame(self._last_bgr)
             # BEV panel — independent of the source-selector camera. Same
             # decode-only-if-new pattern.
             bev_jpeg = self.ros_node.latest_bev_jpeg
-            if bev_jpeg is not None and bev_jpeg is not self._last_rendered_bev_jpeg:
+            if bev_jpeg and bev_jpeg is not self._last_rendered_bev_jpeg:
                 arr = np.frombuffer(bev_jpeg, dtype=np.uint8)
                 bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if bgr is not None:
                     self._render_bev_frame(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-                    self._last_rendered_bev_jpeg = bev_jpeg
+                self._last_rendered_bev_jpeg = bev_jpeg
             self._refresh_status_dots()
             self._refresh_speed_label()
         self.root.after(int(1000 / CAMERA_UI_HZ), self._render_tick)
@@ -1259,18 +1278,20 @@ class ADASUI:
         self.status_var.set('Foxglove bridge stopped')
 
     # --------------------------------------------------------------------
-    # start_acc.sh — launches all four ADAS nodes
+    # start_adas.sh — launches all four ADAS nodes
     # --------------------------------------------------------------------
-    def run_start_acc(self):
+    def run_start_adas(self):
         if self.stack_proc and self.stack_proc.poll() is None:
-            self._log('[ui] start_acc.sh already running')
+            self._log('[ui] start_adas.sh already running')
             return
-        cmd = ['./start_acc.sh', self.simulator_var.get()]
+        cmd = ['./start_adas.sh', self.simulator_var.get()]
+        self._log(f'[ui] ### LAUNCHING WITH SIMULATOR = {self.simulator_var.get().upper()} ### '
+                   '(check the dropdown if this is wrong)')
         self._log(f'$ (cd {ADAS_WK} && {" ".join(cmd)})')
-        # start_acc.sh sources ROS itself.
+        # start_adas.sh sources ROS itself.
         self.stack_proc = self._popen(cmd, cwd=str(ADAS_WK),
                                        source_ros=False, prefix='adas')
-        # start_acc.sh spawns lane_detection_node + stanley_node with
+        # start_adas.sh spawns lane_detection_node + stanley_node with
         # ZERO ros params, so lane_detection_node loads its default
         # model filename (UFLD_best.pth, which doesn't exist) and the
         # KF PSDs from the UI are ignored. Kill the shell's LKAS pair
@@ -1280,10 +1301,10 @@ class ADASUI:
         self.acc_on = True
         self.lkas_on = True
         self._refresh_toggle_labels()
-        self.status_var.set('ADAS stack running (start_acc.sh)')
+        self.status_var.set('ADAS stack running (start_adas.sh)')
 
     def _restart_lkas_with_ui_params(self):
-        """Called ~1.5 s after start_acc.sh: replace the shell-spawned
+        """Called ~1.5 s after start_adas.sh: replace the shell-spawned
         LKAS pair (which used defaults) with UI-parameterised ones."""
         self._pkill(['lane_detection_node', 'stanley_node'])
         # Give the OS a beat to actually reap them so we don't race
@@ -1291,9 +1312,9 @@ class ADASUI:
         self.root.after(400, self._start_lkas_procs)
 
     def stop_stack(self):
-        self._terminate(self.stack_proc, 'start_acc.sh')
+        self._terminate(self.stack_proc, 'start_adas.sh')
         self.stack_proc = None
-        # start_acc.sh's children were spawned via `ros2 run` and don't share
+        # start_adas.sh's children were spawned via `ros2 run` and don't share
         # our process group; sweep them up explicitly.
         self._pkill(['perception_node', 'controller_node',
                      'lane_detection_node', 'stanley_node'])
@@ -1323,6 +1344,8 @@ class ADASUI:
             self._log('[ui] ACC OFF')
         else:
             simulator = self.simulator_var.get()
+            self._log(f'[ui] ### LAUNCHING WITH SIMULATOR = {simulator.upper()} ### '
+                       '(check the dropdown if this is wrong)')
             # Look up the selected YOLO checkpoint in OBJECT_MODELS and
             # pass it to perception_node as -p model_filename:=<ref>.
             perc_cmd = ['ros2', 'run', 'perception', 'perception_node',
@@ -1362,11 +1385,13 @@ class ADASUI:
     def _start_lkas_procs(self):
         """Spawn lane_detection_node + stanley_node with the UI-selected
         model, Kalman toggle, and KF process-noise PSDs. Shared between
-        toggle_lkas (button click) and run_start_acc (Start ADAS), so
+        toggle_lkas (button click) and run_start_adas (Start ADAS), so
         the Start button honours UI selections without needing an
         OFF/ON cycle to apply them. Does NOT toggle self.lkas_on —
         the caller owns that state and its label refresh."""
         simulator = self.simulator_var.get()
+        self._log(f'[ui] ### LAUNCHING WITH SIMULATOR = {simulator.upper()} ### '
+                   '(check the dropdown if this is wrong)')
         perc_cmd = ['ros2', 'run', 'perception', 'lane_detection_node']
         # Build ONE list of ros params, then attach a single
         # `--ros-args` block. `ros2 run` silently drops params when
