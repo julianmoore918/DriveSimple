@@ -15,6 +15,7 @@ torch.set_num_interop_threads(2)
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import Float32, Bool
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
@@ -79,6 +80,7 @@ class YoloDetection(Node):
         # an explicit -p cam_height_m:=... always overrides it regardless.
         self.declare_parameter('simulator', 'carla')
         simulator = self.get_parameter('simulator').get_parameter_value().string_value
+        self.simulator = simulator
 
         # Subscribers — single-threaded executor (see main()). The
         # MultiThreadedExecutor + callback-group split was an attempt
@@ -131,6 +133,14 @@ class YoloDetection(Node):
         # polylines (single source of truth so the BEV overlay matches
         # the corridor the gate uses). Consumed by ipm_view_node.
         self.centerline_pub = self.create_publisher(Path,        '/LKAS/centerline_debug',       10)
+        # Model-ready handshake for controller_node's throttle gate (see
+        # DEBUG.md) — TRANSIENT_LOCAL so a controller_node that starts
+        # (or restarts) after this publish still gets it, instead of
+        # depending on subscribe/publish ordering.
+        ready_qos = QoSProfile(depth=1,
+                                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                reliability=ReliabilityPolicy.RELIABLE)
+        self.ready_pub = self.create_publisher(Bool, '/ACC/perception/model_ready', ready_qos)
 
         # Centerline is published from inside estimateLeadDist (per
         # YOLO frame). The independent 10 Hz timer attempt required
@@ -150,6 +160,8 @@ class YoloDetection(Node):
             model_path = os.path.join(pkg_share, 'models', model_name)
         self.model = YOLO(model_path)
         self.get_logger().info(f"YOLO model loaded from {model_path}")
+        self.ready_pub.publish(Bool(data=True))
+        self.get_logger().info("YOLO ready — /ACC/perception/model_ready = True")
 
         self.last_log_time = 0.0
 
@@ -470,11 +482,11 @@ class YoloDetection(Node):
                 in_lane = self._bb_intersects_centerline(left_g, right_g)
                 if in_lane is False:
                     continue
-                if in_lane is None:
-                    # FALLBACK DISABLED for the diagnostic test. The
-                    # gate is now strictly BEV-centerline-intersects-
-                    # bb-ground: anything we can't evaluate (no
-                    # centerline at this X) is dropped. If passing
+                if in_lane is None and self.simulator != 'morai':
+                    # FALLBACK DISABLED for the diagnostic test (CARLA
+                    # only). The gate is strictly BEV-centerline-
+                    # intersects-bb-ground: anything we can't evaluate
+                    # (no centerline at this X) is dropped. If passing
                     # cars still trigger emergency brake under this,
                     # the BEV test itself is the source of false
                     # positives (not the fallback). Original branch:
@@ -482,6 +494,13 @@ class YoloDetection(Node):
                     #   if abs(box_center_x - img_center_x) > w * 0.05:
                     #       continue
                     continue
+                # MORAI: UFLD frequently has one polyline rejected
+                # (e.g. unmarked shoulder), leaving no centerline
+                # overlap even with a real lead dead ahead. Rather than
+                # blindly dropping every detection in that case, fall
+                # through to the already-applied keep-zone gate above
+                # (lines ~450-467) instead of requiring the centerline
+                # too — still rejects a definite in_lane=False.
             elif abs(box_center_x - img_center_x) > w * 0.2:
                 continue
 

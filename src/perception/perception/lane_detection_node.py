@@ -45,6 +45,7 @@ cv2.setNumThreads(2)
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
@@ -185,7 +186,7 @@ class LaneDetectionNode(Node):
         simulator = self.get_parameter('simulator').get_parameter_value().string_value
 
         self.declare_parameter('ufld_repo',
-            '/home/moore/workspace/01_CV_Models/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2')
+            '/home/sirius/workspace/01_CV_Models/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2')
         self.declare_parameter('ufld_config_rel', 'configs/culane_res34.py')
         self.declare_parameter('model_filename', 'UFLD_F1=0.67.pth')
         self.declare_parameter('device', 'cuda')
@@ -290,9 +291,21 @@ class LaneDetectionNode(Node):
         self.get_logger().info(f"    Device:      {device}")
         self.get_logger().info(f"    Camera:      {cam_topic}")
 
+        # Model-ready handshake for controller_node's throttle gate (see
+        # DEBUG.md) — TRANSIENT_LOCAL so a controller_node that starts
+        # (or restarts) after this publish still gets it, instead of
+        # depending on subscribe/publish ordering. Created before the
+        # slow load below so the publisher exists the instant it's needed.
+        ready_qos = QoSProfile(depth=1,
+                                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                reliability=ReliabilityPolicy.RELIABLE)
+        self.ready_pub = self.create_publisher(Bool, 'perception/model_ready', ready_qos)
+
         self.get_logger().info("Loading UFLD V2 (this can take ~10-30s for the 1.7 GB state dict)…")
         self.infer = UFLDInference(cfg_path, model_path, ufld_repo, device)
         self.get_logger().info("UFLD loaded — waiting for first camera frame")
+        self.ready_pub.publish(Bool(data=True))
+        self.get_logger().info("UFLD ready — /LKAS/perception/model_ready = True")
 
         # ── I/O ──────────────────────────────────────────────────────────
         self.create_subscription(CompressedImage, cam_topic,

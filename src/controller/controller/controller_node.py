@@ -36,8 +36,9 @@ Published topics:
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 
-from std_msgs.msg import Float32, Float64 as StdFloat64
+from std_msgs.msg import Float32, Bool, Float64 as StdFloat64
 from example_interfaces.msg import Float64 as ExFloat64
 from geometry_msgs.msg import Twist
 
@@ -74,6 +75,7 @@ class ACCNode(Node):
         # ── Simulator parameter (carla | morai) ──────────────────────────
         self.declare_parameter('simulator', 'carla')
         simulator = self.get_parameter('simulator').get_parameter_value().string_value
+        self.simulator = simulator
         self.get_logger().info(f"[INFO] Simulator: {simulator}")
 
         # ── Subscriptions ────────────────────────────────────────────────
@@ -81,6 +83,26 @@ class ACCNode(Node):
         self.create_subscription(SpeedMsg, '/Car_1/vehicle/speed', self.ego_velocity_callback, 20)
         self.create_subscription(Float32, '/ACC/lead_vehicle_distance', self.lead_distance_callback, 20)
         self.create_subscription(Float32, '/ACC/target_speed', self.target_speed_callback, 10)
+
+        # ── Model-ready gate ─────────────────────────────────────────────
+        # Hold throttle at 0 until both YOLO (ACC) and UFLD (LKAS) have
+        # finished loading — see DEBUG.md. Data-driven via a TRANSIENT_LOCAL
+        # "ready" flag from each perception node rather than a fixed sleep
+        # in start_adas.sh, so it self-adjusts to however long the models
+        # actually take on a given machine/GPU, and doesn't care what
+        # order the nodes were started in (matches the QoS the publishers
+        # use, which is what makes a late subscriber here still receive
+        # a flag that was published before this node even started).
+        ready_qos = QoSProfile(depth=1,
+                                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                                reliability=ReliabilityPolicy.RELIABLE)
+        self.yolo_ready = False
+        self.ufld_ready = False
+        self._models_ready_logged = False
+        self.create_subscription(Bool, '/ACC/perception/model_ready',
+                                  self._on_yolo_ready, ready_qos)
+        self.create_subscription(Bool, '/LKAS/perception/model_ready',
+                                  self._on_ufld_ready, ready_qos)
 
         # ── Publisher ────────────────────────────────────────────────────
         # Twist: linear.x = throttle, linear.y = brake  [0.0 … 1.0]
@@ -197,6 +219,16 @@ class ACCNode(Node):
         self.target_speed = msg.data / 3.6
         self.get_logger().info(f"Target speed updated: {self.target_speed:.1f} m/s")
 
+    def _on_yolo_ready(self, msg: Bool):
+        if msg.data and not self.yolo_ready:
+            self.yolo_ready = True
+            self.get_logger().info("[gate] YOLO model ready")
+
+    def _on_ufld_ready(self, msg: Bool):
+        if msg.data and not self.ufld_ready:
+            self.ufld_ready = True
+            self.get_logger().info("[gate] UFLD model ready")
+
     # ====================================================================
     # ACC CONTROL LAW
     # ====================================================================
@@ -278,10 +310,20 @@ class ACCNode(Node):
             throttle = min(speed_error * self.cruise_gain, self.cruise_throttle_cap)
             brake    = 0.0
         elif speed_error < -0.5:
-            # Same gain shape on the brake side, capped a touch
-            # higher (0.6) so we can actually arrest a large overshoot.
-            throttle = 0.0
-            brake    = min(-speed_error * self.cruise_gain, 0.6)
+            if self.simulator == 'morai':
+                # MORAI's brake appears to leave the vehicle stuck/
+                # unresponsive rather than just decelerating smoothly
+                # (unlike CARLA's, which this branch was originally
+                # tuned against) -- see DEBUG.md. Coast instead of
+                # actively braking to bleed off overshoot for MORAI;
+                # CARLA keeps the original proportional-brake behaviour.
+                throttle = 0.0
+                brake    = 0.0
+            else:
+                # Same gain shape on the brake side, capped a touch
+                # higher (0.6) so we can actually arrest a large overshoot.
+                throttle = 0.0
+                brake    = min(-speed_error * self.cruise_gain, 0.6)
         else:
             throttle = 0.0
             brake    = 0.0
@@ -303,6 +345,28 @@ class ACCNode(Node):
         4. Lead vehicle in range → ACC mode (PD distance control)
         """
         control_msg = Twist()
+
+        # ---- MODE 0: MODEL-LOAD GATE ----
+        # Refuse to command any throttle until both perception models
+        # (YOLO for ACC, UFLD for LKAS) have confirmed they're loaded.
+        # Brake stays at 0 too — nothing has moved yet at this point in
+        # startup, so there's nothing to arrest; forcing brake=1 here
+        # would just fight the sim's own rest state for no reason.
+        if not (self.yolo_ready and self.ufld_ready):
+            self.control_pub.publish(control_msg)  # throttle=0, brake=0
+            self.prev_throttle = 0.0
+            waiting_on = []
+            if not self.yolo_ready:
+                waiting_on.append('YOLO')
+            if not self.ufld_ready:
+                waiting_on.append('UFLD')
+            self.get_logger().info(
+                f"[gate] holding throttle at 0 — waiting on: {', '.join(waiting_on)}",
+                throttle_duration_sec=2.0)
+            return
+        elif not self._models_ready_logged:
+            self._models_ready_logged = True
+            self.get_logger().info("[gate] YOLO + UFLD both ready — throttle unlocked")
 
         # ---- MODE 1: STANDSTILL HOLD ----
         # Suppress control when stopped and within acceptable distance range.

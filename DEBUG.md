@@ -53,6 +53,8 @@ thesis Objective / Methods / Results structure:
 ## Thematic index
 
 ### Chapter 1 — System infrastructure & bridge
+- [§31](#31-duplicate-morai-bridge-adapter-processes--real-os-process-guard-added-fixed) Duplicate MORAI bridge adapter processes — real OS-process guard added
+- [§27](#27-second-new-machine-move--cuda-13-default-wheel--colconsetuptoolspackaging-conflict-fixed) Second new-machine move — CUDA-13 default wheel + colcon/setuptools/packaging conflict
 - [§10](#10-bridge-hard-coded-for-one-scenario--now-fully-argparse-driven-fixed) Bridge — argparse-driven scenario configuration
 - [§4](#4-carla-graphics-flicker--ego-bonnet--npc-lods-unstable-partial--sync-mode-regressed-motion-now-opt-in) CARLA graphics flicker — sync vs. async investigation
 - [§12](#12-ego-still-stalls-at-full-acc-throttle--bridge-jpeg-encoder-starves-the-ros-executor-at-1920×1080-fixed-with-caveat) JPEG encoder starves the ROS executor at 1920×1080
@@ -71,6 +73,8 @@ thesis Objective / Methods / Results structure:
 - [§23](#23-anchor-based-loop-route-for-lead--pp-fallback-done) Anchor-based loop route for lead + PP fallback
 
 ### Chapter 3 — Control
+- [§30](#30-morai-brake-leaves-the-vehicle-stuck--cruise-mode-coasts-instead-of-braking-on-morai-fixed) MORAI brake leaves the vehicle stuck — cruise mode coasts instead of braking
+- [§28](#28-startup-safety-gate--throttle-held-at-0-until-yolo--ufld-are-loaded-done) Startup safety gate — throttle held at 0 until YOLO + UFLD are loaded
 - [§1](#1-npc-traffic-does-not-follow-the-road--drives-straight-and-crashes-fixed) NPC traffic via TrafficManager autopilot
 - [§3](#3-fallback-behaviour-when-acc-or-lkas-is-off-decided) Fallback behaviour when ACC or LKAS is off
 - [§11](#11-ego-stalls-at-full-acc-throttle--pp--bridge-race-on-apply_control-fixed) PP / bridge `apply_control` race
@@ -89,6 +93,9 @@ thesis Objective / Methods / Results structure:
 
 ### Chapter 6 — MORAI simulator integration
 - [§26](#26-morai-simulator-integration-ongoing) Full port to a second simulator: environment setup, MORAI's ROS2 Interface, the `morai_bridge` adapter package, camera/control calibration, and open issues
+- [§27](#27-second-new-machine-move--cuda-13-default-wheel--colconsetuptoolspackaging-conflict-fixed) Second new-machine move (dependency setup gotchas)
+- [§29](#29-morais-imu-never-populates-linear-velocity--switched-speed-source-to-groundtruth-vehicleinfo-fixed) MORAI's IMU never populates linear velocity — switched to GroundTruth VehicleInfo
+- [§32](#32-morais-groundtruth-vehicleinfo-local_velocity-is-frozen-not-live--29s-caveat-confirmed-known-unresolved) MORAI's GroundTruth VehicleInfo local_velocity is frozen, not live
 
 ---
 
@@ -2422,3 +2429,344 @@ meantime.
   still pointing at the old machine's `/home/sirius/...` paths —
   out of scope while MORAI-only, but will need fixing if CARLA testing
   resumes on this machine.
+
+## 27. Second new-machine move — CUDA-13 default wheel + colcon/setuptools/packaging conflict [FIXED]
+
+**Objective.** Same class of problem as §26a (`sirius@PC-ACM-01`, RTX
+4090, driver 560.94 / CUDA 12.6), but on yet another fresh Ubuntu 22.04
+box with *nothing* installed — no ROS 2, no pip, no rosdep. Two new
+gotchas surfaced that weren't hit last time, both worth remembering
+since neither produces an obviously-related error message.
+
+**1. `pip install torch` silently grabs a CUDA build newer than the
+driver supports.** Unlike the Blackwell 5080 case in §26a (which
+needed a *special* `cu128` index to get a working build), this time
+the *default* PyPI wheel was the problem: a bare `pip install torch
+torchvision torchaudio` resolved to **torch 2.13.0+cu130** (CUDA 13
+runtime bundled). `torch.cuda.is_available()` returned `False`, and
+the real error only appears if you actually try a GPU op:
+`RuntimeError: The NVIDIA driver on your system is too old (found
+version 12060)` — i.e. the driver reports CUDA 12.6 as its ceiling,
+and CUDA-13 wheels refuse to run on it. `is_available()` alone hides
+this behind a plain `False`; the fix is to always follow §26a's
+practice of testing with a real `torch.randn(...).cuda()` matmul, not
+just the boolean check. **Fix:** uninstall the `+cu130` torch/
+torchvision/torchaudio and every `nvidia-*-cu13`/`cuda-*` package pip
+pulled alongside them, then reinstall pinned to the matching index:
+`pip install --index-url https://download.pytorch.org/whl/cu126 torch
+torchvision torchaudio`. Verified with a real 4096×4096 matmul on
+`cuda:0` afterward. **Takeaway for future machines:** check
+`nvidia-smi`'s reported "CUDA Version" ceiling *first*, then pick the
+matching `/whl/cuXXX` index explicitly — never trust the bare
+`pip install torch` default to match the installed driver.
+
+**2. `colcon build` breaks after installing PyTorch, with an error
+that looks nothing like a PyTorch problem.** Symptom: every
+`ament_python` package failed identically —
+`TypeError: canonicalize_version() got an unexpected keyword argument
+'strip_trailing_zero'`, thrown from deep inside `setuptools`'
+`_core_metadata.py` during `egg_info`. Root cause: `torch`'s own
+install pulled `setuptools` up to `83.0.0` as a transitive dependency
+(pip warned about this at install time: `colcon-core 0.21.0 requires
+setuptools<80,>=30.3.0, but you have setuptools 83.0.0` — easy to miss
+among normal install-log noise). Downgrading `setuptools` to satisfy
+that constraint (`pip install "setuptools<80,>=30.3.0"`) fixed the
+version bound but **not** the actual crash — the real second half of
+the problem was that this machine's only importable `packaging` module
+was the apt-installed system one (`python3-packaging` 21.3, pulled in
+as a `colcon-core`/`catkin-pkg` dependency, living in
+`/usr/lib/python3/dist-packages`), and even `setuptools` 79.x's
+`_core_metadata.py` calls `packaging.utils.canonicalize_version()` with
+a `strip_trailing_zero` kwarg that doesn't exist until `packaging`
+≥24.1. **Fix:** `pip install --upgrade packaging` (user site-packages
+takes priority over the apt one on `sys.path`, so this alone was
+enough — no need to remove the apt package). After both fixes,
+`colcon build` succeeded cleanly across all four packages
+(`morai_v2_1_ros2_msgs`, `controller`, `perception`, `morai_bridge`).
+**Takeaway:** any `pip install` that touches `setuptools` on a machine
+that also runs `colcon` is a latent build breaker — worth a quick
+`colcon build` smoke test immediately after big Python dependency
+installs, not just at the end of setup.
+
+**3. Stale absolute path for the UFLD-V2 repo.**
+`lane_detection_node.py`'s `ufld_repo` parameter default still pointed
+at the *previous* new-machine's fix from §26a
+(`/home/moore/workspace/01_CV_Models/...`) — itself already a
+one-machine-old patch. Updated the default to this machine's path,
+`/home/sirius/workspace/01_CV_Models/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2`,
+once the user copied that folder over. **Takeaway, now twice-confirmed:**
+this hardcoded default will need updating on every future machine move
+until it's made relative/configurable — worth doing before the third
+occurrence.
+
+**4. `RLD_best.pth` — a second, unwired model.** The user also copied
+in `src/perception/models/RLD_best.pth` alongside a source repo,
+`01_CV_Models/02_RLD/Robust-Lane-Detection` — "RLD" = **Robust Lane
+Detection from Continuous Driving Scenes** (Zou et al., TVT 2019;
+SegNet/UNet-ConvLSTM). Confirmed via grep that **no node in this
+codebase currently loads it** — `README.md` lists the filename under
+`models/` but nothing does `importlib`/`torch.load` on it. Its own
+`README.md` requires **PyTorch 0.4.0, Python 3.6, CUDA 8.0** — a
+completely different, incompatible stack from the PyTorch 2.13/cu126
+environment set up here for UFLD-V2 and YOLO. Left untouched at the
+user's direction ("focus on UFLD and YOLO"); if RLD is ever wired in,
+it'll need its own isolated environment (venv/conda), not a shared
+install.
+
+**Environment snapshot for reference:** Ubuntu 22.04.5 (WSL2 kernel
+`6.18.33.2-microsoft-standard-WSL2`), RTX 4090, driver 560.94 (CUDA
+12.6 ceiling), Python 3.10.12, ROS 2 Humble via the `ros2-apt-source`
+flow, torch 2.13.0+cu126.
+
+## 28. Startup safety gate — throttle held at 0 until YOLO + UFLD are loaded [DONE]
+
+**Objective.** First live MORAI run on the new machine (see §27) raised
+a separate concern independent of the `v=0.00` speed-feedback bug being
+chased in parallel: `controller_node` starts commanding cruise throttle
+immediately on launch, with no awareness of whether `perception_node`
+(YOLO) or `lane_detection_node` (UFLD) have actually finished loading
+their models yet — UFLD in particular can take 10-30s to load its 1.7 GB
+state dict (see its own startup log line). Requested: the car should not
+move at all until both perception models are confirmed ready.
+
+**Design choice.** Considered and rejected a fixed `sleep N` in
+`start_adas.sh` before allowing the stack to move — model load time
+varies by machine/GPU (see §27's own environment differences across
+two machines already), so any fixed delay is either too short
+(race) or wastefully long. Implemented instead as a data-driven ROS
+handshake:
+- `perception_node` and `lane_detection_node` each publish a `Bool` on
+  `/ACC/perception/model_ready` / `/LKAS/perception/model_ready` the
+  instant their model load call returns — `TRANSIENT_LOCAL` durability
+  (QoS depth 1, `RELIABLE`) so a `controller_node` that starts (or is
+  restarted) *after* that publish still receives it, instead of
+  depending on subscribe-before-publish ordering.
+- `controller_node` subscribes to both with matching QoS, tracks
+  `yolo_ready`/`ufld_ready`, and added a new MODE 0 at the very top of
+  `control_loop()`: while either is `False`, publish `throttle=0,
+  brake=0` and return, before any of the existing CRUISE/ACC/EMERGENCY
+  logic runs. Logs which model(s) it's still waiting on (throttled to
+  once per 2 s) and a one-time "throttle unlocked" line on the
+  transition.
+
+**Verified**, standalone (without the GPU-heavy perception nodes
+running, using `ros2 topic pub` to simulate them):
+1. `controller_node` alone, before any ready flags: `/Car_1/cmd_vel`
+   confirmed `{throttle: 0, brake: 0}`.
+2. Publishing both ready flags mid-run: throttle immediately unlocked
+   to real cruise output (`0.417`, matching the MORAI cruise-gain math
+   for the standstill speed error) within the next control tick.
+3. **Late-subscriber case** (the actual point of `TRANSIENT_LOCAL`):
+   started two latching publishers first, waited 2 s, *then* started
+   `controller_node` — it picked up both flags within ~15 ms of
+   starting, proving the gate is robust regardless of node launch
+   order (script vs. UI toggles vs. manual `ros2 run`, any order).
+
+**Scope note.** Only throttle is gated, matching what was asked for.
+Steering (`stanley_node`) doesn't need the same treatment — it already
+degrades safely on its own (`HOLD`/no lane data) whenever UFLD hasn't
+published a lane yet, gate or no gate.
+
+## 29. MORAI's IMU never populates linear velocity — switched speed source to GroundTruth VehicleInfo [FIXED]
+
+**Objective.** `/Car_1/vehicle/speed` read a constant `0.0` on every
+live MORAI run, even with the car visibly moving (§27's `v=0.00`
+symptom, revisited here with the actual root cause).
+
+**Root cause, confirmed live via Foxglove.** `/Car_1/odometry`'s
+`pose.orientation` was genuinely live and updating every tick (proving
+the topic itself wasn't dead), but `pose.position` was bit-for-bit
+frozen at `(1.5, 0, 0.5)` and `twist.linear` frozen at exactly
+`(0,0,0)` — across multiple separate sim sessions, regardless of real
+vehicle motion, while `twist.angular` showed real noise-level values.
+MORAI's `IMU_1` entity ("MA IMU" sensor model) computes orientation
+(gyro integration) but never computes translational position/velocity
+at all — not a ROS binding issue, a sensor-model limitation. Physically
+sensible too: a raw IMU only measures angular rate + linear
+acceleration; velocity requires integration, which this sensor model
+apparently doesn't do.
+
+**Fix.** Replaced `IMU_1` with a `GroundTruth` entity (`MA GT`,
+`GroundTruth_1`, `Position (0,0,0)`), which reports the simulator's own
+exact internal vehicle state directly rather than reconstructing it
+from an incomplete sensor. Bound to MORAI's `ROS2 VehicleInfo`
+template — a **second** custom message (like `VehicleManualControl` in
+§26c), field layout captured directly from MORAI's Message Template
+editor (21 fields: int32/uint32 timestamp, string `id`, then float32
+triples for location/rotation/local_velocity/local_acceleration/
+angular_velocity, then float32 throttle/brake/steer_angle telemetry).
+Added `morai_v2_1_ros2_msgs/msg/VehicleInfo.msg` matching that exact
+order/types (same structural-compatibility technique as §26b: package
++ message name + field layout, no central registry). Topic: MORAI's
+`GT` interface publishes `/Car_1/vehicleinfo` at 20 Hz.
+`state_adapter_node` now subscribes to that instead of `Odometry`.
+
+**A second, independent bug surfaced once real data was flowing**:
+live capture showed `local_velocity_y` coming through as garbage
+(`~3.7e19`) while `local_velocity_x` (forward) and `_z` decoded as sane
+numbers — some corruption specific to that one axis in MORAI's own
+serialization, not something traced further. Sidestepped rather than
+chased: `state_adapter_node` now publishes `speed = |local_velocity_x|`
+(the vehicle-frame forward component only), not the 3-axis vector
+norm the original Odometry-based code used. This is also more
+*correct*, not just a workaround — a real speedometer reads
+longitudinal speed, not full 3D velocity magnitude, so lateral/vertical
+components shouldn't have been part of "speed" regardless of the
+corruption.
+
+**Verified**: live Foxglove capture after the fix showed
+`/Car_1/vehicle/speed.data = 2.944537401199341`, matching
+`local_velocity_x` exactly, tracking real vehicle motion for the first
+time in the MORAI port.
+
+**Caveat**: the bit-for-bit-frozen-across-88-samples pattern that
+tipped us off to the IMU bug was seen once on `VehicleInfo` too, on a
+short steady-cruise window — not yet conclusively distinguished from
+"genuinely constant speed for a few seconds on a straight empty road."
+Worth actively varying speed/steering while watching
+`local_velocity_x` before fully trusting it under all conditions.
+
+## 30. MORAI brake leaves the vehicle stuck — cruise mode coasts instead of braking on MORAI [FIXED]
+
+**Objective.** Once §29 made real speed feedback available, ACC's
+cruise controller started doing real closed-loop work — and
+immediately revealed that whenever it commanded a nonzero brake on
+MORAI, the vehicle would not resume moving properly afterward,
+unlike CARLA where proportional braking behaves as expected. Testing
+`/ACC/target_speed` become unworkable: any speed_error negative enough
+to cross the `-0.5 m/s` deadband triggered brake, and the vehicle got
+stuck.
+
+**Fix.** `cruise_control()`'s over-target-speed branch now checks
+`self.simulator` (newly stored as `self.simulator` in `__init__`,
+previously only a local variable): for `morai`, sets
+`throttle=0, brake=0` (coast down naturally) instead of the
+proportional-brake formula; `carla` keeps the original behaviour
+unchanged. Deliberately scoped narrowly — EMERGENCY (collision-
+imminent full brake) and ACC's own lead-distance PD brake are
+untouched on both simulators, since those are safety-critical
+regardless of this MORAI-specific brake quirk. Only the
+"maintain/return to target cruise speed" case coasts instead of
+braking on MORAI.
+
+**Verified** standalone: publishing a fake `v_ego=3.0 m/s` against the
+default MORAI cruise target (`1.39 m/s`, well past the deadband)
+produced `throttle=0, brake=0` post-fix, versus the ~`0.47` the old
+formula gave for the same inputs.
+
+**Caveat / follow-up**: coasting-only means the ACC-mode "respect
+CRUISE_SPEED_KMH as an upper cap" logic (the `max(acc_brake,
+cruise_brake)` blend, see its own comment in the code) no longer
+actively brakes to enforce that cap on MORAI when following a distant
+lead — only ACC's own lead-distance brake still applies. Accepted
+tradeoff for now; the root MORAI brake behaviour itself
+(why does *any* brake leave the vehicle stuck?) hasn't been
+investigated — this works around it rather than fixing the underlying
+cause, which may need a MORAI-side (Vehicle Control Attribute /
+physics) explanation.
+
+## 31. Duplicate MORAI bridge adapter processes — real OS-process guard added [FIXED]
+
+**Objective.** `ros2 node list` repeatedly showed `Morai_State_Adapter`
+and `Morai_Control_Adapter` duplicated (2x, then observed as high as
+4x across this session) — multiple independent `state_adapter_node`/
+`control_adapter_node` processes simultaneously racing each other over
+`/Car_1/vehicle/speed` and `/Car_1/control`. This was a live,
+significant contributor to the session's erratic/inconsistent-seeming
+control behaviour — at times, two of the four running duplicates were
+confirmed to still be executing **stale, pre-fix code** from before
+the §29/§30 changes, alongside newer correctly-patched instances, all
+publishing to the same topics at once.
+
+**Root cause.** Two independent launch paths both start these same two
+nodes with zero awareness of each other or of processes outside their
+own tracking:
+- `start_adas.sh` launches them unconditionally whenever
+  `SIMULATOR=morai` (see §26c).
+- `UI.py`'s `start_morai_bridge()` (the "Start MORAI Bridge" button)
+  launches them separately, guarded only by
+  `self.morai_bridge_procs` — an **in-memory** Python list local to
+  that one `UI.py` process.
+
+Doing both (a completely natural sequence — e.g. clicking "Start MORAI
+Bridge" for telemetry, then also "Run start_adas.sh" for the rest of
+the stack, not realising the script *also* starts the bridge) produces
+2 duplicates in a single clean session — already flagged as an open
+issue in §26. Worse: `_popen()` uses `start_new_session=True`, so these
+child processes are **not** killed when `UI.py` itself is closed
+without clicking Stop first — they become orphans, invisible to a
+freshly-started `UI.py`'s empty `self.morai_bridge_procs`, explaining
+how this reached 4x duplicates (two separate UI sessions' worth of
+orphans, plus a fresh start on top).
+
+**Fix.** Replaced in-memory-only tracking with a real OS-process check
+in both launch paths:
+- `UI.py`: new `_morai_bridge_pids()` static method (`pgrep -f` against
+  each node name, catching both the `ros2 run` wrapper and the actual
+  entry-point process regardless of which path started it).
+  `start_morai_bridge()` checks this *and* refuses to launch if
+  anything matches. `stop_morai_bridge()` now also sweeps and kills any
+  untracked/orphaned matches via `_pkill`, not just this instance's own
+  tracked children — so Stop is effective regardless of how the
+  duplicates got there.
+- `start_adas.sh`: same `pgrep -f` guard before its own
+  `state_adapter_node`/`control_adapter_node` launch block, warns and
+  skips instead of double-launching on top of an already-running
+  bridge.
+
+**Verified**: functional test launched a real adapter pair, then ran
+the exact guard logic `start_adas.sh` now uses on top of it — correctly
+printed the warning and did not launch a duplicate. Both files pass a
+syntax check (`bash -n`, `ast.parse`).
+
+## 32. MORAI's GroundTruth VehicleInfo local_velocity is frozen, not live — §29's caveat confirmed [KNOWN, unresolved]
+
+**Objective.** §29 flagged an open caveat when switching to
+GroundTruth-sourced speed: `local_velocity` had been observed
+bit-identical across 88 samples, not yet distinguished from a
+genuinely-steady few seconds of real cruising. Now conclusively
+confirmed as a real bug, independent of every other issue chased this
+session (duplicate processes, target_speed never being received,
+`controller_node` not running, etc. — see the immediately preceding
+turns of debugging that each looked like they might explain a "stuck
+throttle/speed" symptom before this was isolated).
+
+**Confirmed live**, after clearing all duplicate processes (§31) so
+there was exactly one publisher in play: `ros2 topic echo
+/Car_1/vehicleinfo` over a clean 5 s window returned **89 samples, all
+89 bit-for-bit identical** (`local_velocity_x = 2.944537401199341`),
+from a single confirmed publisher (`morai_GT`, MORAI's own native
+node, not anything in this repo) using plain `VOLATILE` durability —
+which rules out a ROS-side retained/latched-message artifact as the
+explanation. MORAI's own HUD showed the vehicle stationary (`0 km/h`)
+during this same window. The `GT` entity's `VehicleInfo` publisher is
+therefore genuinely re-publishing a stale snapshot at its configured
+20 Hz, not recomputing it — a MORAI-side bug/limitation in this sensor
+template, not anything in `state_adapter_node` or the ROS graph.
+
+**Downstream effect**: `/Car_1/vehicle/speed` and `UI.py`'s own
+telemetry display both correctly relay whatever `local_velocity_x`
+says — so both show a stuck `2.94 m/s` / `10.6 km/h` even with the car
+provably stationary. Nothing to fix on the relay side; the bad data
+originates at MORAI's own publisher.
+
+**Leading theory, not yet tested**: `GroundTruth_1`'s own Configuration
+panel exposes a `Detect Radius (m)` field, observed set to `0.05` —
+suspiciously tiny. If this GT sensor type is fundamentally a
+*nearby-object* detector (common in driving-sim ground-truth tooling,
+for labelling surrounding objects) rather than a continuous
+ego-vehicle telemetry source, a near-zero detect radius could mean it
+detects itself/the ego exactly once at scenario start and then never
+re-triggers a refresh, explaining a frozen-after-first-value pattern
+without needing any ROS-side bug at all.
+
+**Next diagnostic step, not yet done**: compare against MORAI's own
+in-editor "Motion State" property panel (visible when selecting
+`Car_1`, showing live `Velocity x/y/z (m/s)` numbers directly from the
+sim) while the vehicle is actually moving — if that panel's numbers
+visibly change in real time while the ROS-published
+`local_velocity_x` stays frozen, that conclusively isolates the bug to
+the `VehicleInfo` ROS publish path specifically, and points at trying
+a much larger `Detect Radius` (or finding a different, dedicated
+vehicle-state output) rather than continuing to use `GroundTruth`'s
+`VehicleInfo` template as-is.

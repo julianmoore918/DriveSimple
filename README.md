@@ -115,11 +115,13 @@ ACC internal topics:
     /ACC/lead_vehicle_distance         std_msgs/msg/Float32    ← distance to lead vehicle [m]
     /ACC/lead_vehicle_confidence       std_msgs/msg/Float32    ← YOLO detection confidence [0–1]
     /ACC/target_speed                  std_msgs/msg/Float32    ← target speed [km/h]  (Foxglove slider)
+    /ACC/perception/model_ready        std_msgs/msg/Bool       ← latched True once YOLO finishes loading
 
 LKAS internal topics:
 
     /LKAS/ego_lane_left                nav_msgs/msg/Path           ← ego-left polyline (vehicle frame, REP 103: X fwd, Y left)
     /LKAS/ego_lane_right               nav_msgs/msg/Path           ← ego-right polyline
+    /LKAS/perception/model_ready       std_msgs/msg/Bool           ← latched True once UFLD finishes loading
 
 Debug / visualization:
 
@@ -143,6 +145,9 @@ Publishes:
     /ACC/lead_vehicle_distance         closest detected vehicle [m], inf when none
     /ACC/lead_vehicle_confidence       YOLO confidence of closest detection, 0.0 when none
     /ACC/perception/debug_image        annotated image for Foxglove visualization
+    /ACC/perception/model_ready        Bool, published once True right after the YOLO
+                                        checkpoint finishes loading (TRANSIENT_LOCAL, so a
+                                        controller_node started later still sees it)
 
 Function:
 
@@ -168,6 +173,8 @@ Subscribes:
     /Car_1/vehicle/speed               ego speed (type selected by simulator parameter)
     /ACC/lead_vehicle_distance         distance to lead vehicle
     /ACC/target_speed                  target cruising speed [km/h]
+    /ACC/perception/model_ready        YOLO ready flag (see perception_node above)
+    /LKAS/perception/model_ready       UFLD ready flag (see lane_detection_node below)
 
 Publishes:
 
@@ -177,9 +184,18 @@ Control modes:
 
 | Mode | Condition | Behaviour |
 |------|-----------|-----------|
+| GATE | YOLO and/or UFLD not yet loaded | Throttle and brake held at 0 |
 | CRUISE | No lead vehicle detected | Proportional speed controller toward target speed |
 | ACC | Lead vehicle in range | PD-based distance controller |
 | EMERGENCY | Lead vehicle < 3 m | Immediate full brake |
+
+Startup safety gate: `controller_node` will not command any throttle
+until **both** `/ACC/perception/model_ready` and
+`/LKAS/perception/model_ready` have gone `True` — i.e. until YOLO and
+UFLD have both finished loading — regardless of node launch order.
+This is enforced purely via topic data (not a fixed delay), so it
+self-adjusts to however long model loading actually takes on a given
+machine.
 
 Control law (ACC mode):
 
@@ -208,6 +224,8 @@ Publishes:
    /LKAS/ego_lane_left
    /LKAS/ego_lane_right
    /LKAS/perception/debug_image        annotated image for Foxglove visualization
+   /LKAS/perception/model_ready        Bool, published once True right after UFLD finishes
+                                        loading (TRANSIENT_LOCAL, see controller_node's gate)
 
 Function:
 - Calls trained UFLD V2 model for lane detection and outputs left and right lane as polylines.

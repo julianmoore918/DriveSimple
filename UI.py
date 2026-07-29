@@ -66,6 +66,7 @@ LANE_MODELS: list[tuple[str, str]] = [
 # by perception_node. Add newly-trained YOLO checkpoints below.
 OBJECT_MODELS: list[tuple[str, str]] = [
     ('Current best YOLO (best.pt)', 'best.pt'),
+    ('MORAI fine-tuned YOLO (best_MORAI.pt)', 'best_MORAI.pt'),
     # Example after a retrain:
     # ('Retrained YOLO 20260710',
     #  '/home/sirius/workspace/Trained_YOLO/runs/detect/train2/'
@@ -1234,9 +1235,38 @@ class ADASUI:
     # --------------------------------------------------------------------
     # MORAI bridge (morai_bridge: state_adapter_node + control_adapter_node)
     # --------------------------------------------------------------------
+    @staticmethod
+    def _morai_bridge_pids() -> list[str]:
+        """Real OS-process check for the adapter nodes, independent of
+        this UI.py instance's own in-memory tracking. Needed because
+        state_adapter_node/control_adapter_node can also be started by
+        start_adas.sh (whenever SIMULATOR=morai) as a completely
+        separate launch path, and _popen's start_new_session=True means
+        they survive this UI.py process closing -- either case leaves
+        self.morai_bridge_procs blind to processes that are genuinely
+        still running. Matching just the node name (not the full
+        'ros2 run morai_bridge <name>' invocation) so this also catches
+        the underlying entry-point process, not only the 'ros2 run'
+        wrapper. See DEBUG.md's duplicate-adapter-processes entry.
+        """
+        pids = []
+        for pattern in ('state_adapter_node', 'control_adapter_node'):
+            result = subprocess.run(['pgrep', '-f', pattern],
+                                     capture_output=True, text=True)
+            pids += [p for p in result.stdout.split() if p]
+        return pids
+
     def start_morai_bridge(self):
         if any(p.poll() is None for p in self.morai_bridge_procs):
             self._log('[ui] MORAI bridge already running')
+            return
+        existing = self._morai_bridge_pids()
+        if existing:
+            self._log(f'[ui] MORAI bridge already running as OS process(es) '
+                       f'{", ".join(existing)} (started outside this UI, e.g. '
+                       f'by start_adas.sh, or left over from a previous UI '
+                       f'session) — not starting a duplicate. Stop it first.')
+            self.status_var.set('MORAI bridge already running elsewhere')
             return
         self._log('[ui] starting MORAI bridge (state + control adapters)')
         self.morai_bridge_procs = [
@@ -1255,6 +1285,15 @@ class ADASUI:
         for p in self.morai_bridge_procs:
             self._terminate(p, 'MORAI bridge')
         self.morai_bridge_procs = []
+        # Also sweep for OS processes this instance isn't tracking (see
+        # _morai_bridge_pids) so Stop is effective even against
+        # duplicates/orphans from another launch path or a previous UI
+        # session, not just this instance's own children.
+        leftover = self._morai_bridge_pids()
+        if leftover:
+            self._log(f'[ui] clearing {len(leftover)} untracked MORAI bridge '
+                       f'process(es): {", ".join(leftover)}')
+            self._pkill(['state_adapter_node', 'control_adapter_node'])
         self.status_var.set('MORAI bridge stopped')
         self.status_var.set('Bridge stopped')
 
@@ -1291,13 +1330,17 @@ class ADASUI:
         # start_adas.sh sources ROS itself.
         self.stack_proc = self._popen(cmd, cwd=str(ADAS_WK),
                                        source_ros=False, prefix='adas')
-        # start_adas.sh spawns lane_detection_node + stanley_node with
-        # ZERO ros params, so lane_detection_node loads its default
-        # model filename (UFLD_best.pth, which doesn't exist) and the
-        # KF PSDs from the UI are ignored. Kill the shell's LKAS pair
-        # after a short delay and respawn via the shared helper so the
-        # UI-selected model + q values actually take effect.
+        # start_adas.sh spawns lane_detection_node + stanley_node (and
+        # perception_node + controller_node) with ZERO ros params, so
+        # lane_detection_node loads its default model filename
+        # (UFLD_best.pth, which doesn't exist) and perception_node
+        # loads its default YOLO checkpoint (best.pt) -- the UI's Lane
+        # model / Object model dropdowns and KF PSDs are all ignored.
+        # Kill the shell-spawned pairs after a short delay and respawn
+        # via the shared helpers so the UI selections actually take
+        # effect.
         self.root.after(1500, self._restart_lkas_with_ui_params)
+        self.root.after(1500, self._restart_acc_with_ui_params)
         self.acc_on = True
         self.lkas_on = True
         self._refresh_toggle_labels()
@@ -1310,6 +1353,15 @@ class ADASUI:
         # Give the OS a beat to actually reap them so we don't race
         # our own spawn against a duplicate ros2 run.
         self.root.after(400, self._start_lkas_procs)
+
+    def _restart_acc_with_ui_params(self):
+        """Called ~1.5 s after start_adas.sh: replace the shell-spawned
+        ACC pair (which used defaults) with UI-parameterised ones."""
+        self._pkill(['perception_node', 'controller_node'])
+        self.acc_procs.clear()
+        # Give the OS a beat to actually reap them so we don't race
+        # our own spawn against a duplicate ros2 run.
+        self.root.after(400, self._start_acc_procs)
 
     def stop_stack(self):
         self._terminate(self.stack_proc, 'start_adas.sh')
@@ -1343,30 +1395,39 @@ class ADASUI:
             self.acc_on = False
             self._log('[ui] ACC OFF')
         else:
-            simulator = self.simulator_var.get()
-            self._log(f'[ui] ### LAUNCHING WITH SIMULATOR = {simulator.upper()} ### '
-                       '(check the dropdown if this is wrong)')
-            # Look up the selected YOLO checkpoint in OBJECT_MODELS and
-            # pass it to perception_node as -p model_filename:=<ref>.
-            perc_cmd = ['ros2', 'run', 'perception', 'perception_node',
-                        '--ros-args', '-p', f'simulator:={simulator}']
-            model_ref = next((ref for name, ref in OBJECT_MODELS
-                              if name == self.object_model_var.get()), None)
-            if model_ref:
-                perc_cmd += ['-p', f'model_filename:={model_ref}']
-                self._log(f'[ui] ACC model: {self.object_model_var.get()}')
-            self.acc_procs.append(self._popen(
-                perc_cmd, cwd=str(ADAS_WK),
-                source_ros=True, source_workspace=True,
-                prefix='acc-perc'))
-            self.acc_procs.append(self._popen(
-                ['ros2', 'run', 'controller', 'controller_node',
-                 '--ros-args', '-p', f'simulator:={simulator}'],
-                cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
-                prefix='acc-ctrl'))
+            self._start_acc_procs()
             self.acc_on = True
             self._log('[ui] ACC ON')
         self._refresh_toggle_labels()
+
+    def _start_acc_procs(self):
+        """Spawn perception_node + controller_node with the UI-selected
+        YOLO checkpoint. Shared between toggle_acc (button click) and
+        run_start_adas (Start ADAS), so the Start button honours the
+        Object model dropdown without needing an OFF/ON cycle to apply
+        it. Does NOT toggle self.acc_on -- the caller owns that state
+        and its label refresh."""
+        simulator = self.simulator_var.get()
+        self._log(f'[ui] ### LAUNCHING WITH SIMULATOR = {simulator.upper()} ### '
+                   '(check the dropdown if this is wrong)')
+        # Look up the selected YOLO checkpoint in OBJECT_MODELS and
+        # pass it to perception_node as -p model_filename:=<ref>.
+        perc_cmd = ['ros2', 'run', 'perception', 'perception_node',
+                    '--ros-args', '-p', f'simulator:={simulator}']
+        model_ref = next((ref for name, ref in OBJECT_MODELS
+                          if name == self.object_model_var.get()), None)
+        if model_ref:
+            perc_cmd += ['-p', f'model_filename:={model_ref}']
+            self._log(f'[ui] ACC model: {self.object_model_var.get()}')
+        self.acc_procs.append(self._popen(
+            perc_cmd, cwd=str(ADAS_WK),
+            source_ros=True, source_workspace=True,
+            prefix='acc-perc'))
+        self.acc_procs.append(self._popen(
+            ['ros2', 'run', 'controller', 'controller_node',
+             '--ros-args', '-p', f'simulator:={simulator}'],
+            cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
+            prefix='acc-ctrl'))
 
     def toggle_lkas(self):
         if self.lkas_on:

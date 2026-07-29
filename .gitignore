@@ -6,6 +6,9 @@ log/
 # UI video recordings
 recordings/
 
+# YOLO fine-tuning working data (extracted frames, labels, exports)
+tools/yolo_finetune/dataset/
+
 # Python caches
 __pycache__/
 *.py[cod]

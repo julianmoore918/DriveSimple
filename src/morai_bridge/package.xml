@@ -6,16 +6,15 @@
   <description>
     Adapter nodes translating between MORAI SIM's ROS2 Interface topics
     and this stack's simulator-agnostic /Car_1/* topics. Only exists
-    because MORAI's message shapes (nav_msgs/Odometry for vehicle state,
-    morai_v2_1_ros2_msgs/VehicleManualControl for control) differ from
-    what perception/controller expect (a scalar speed, a Twist +
-    Float32 steer).
+    because MORAI's message shapes (morai_v2_1_ros2_msgs/VehicleInfo for
+    vehicle state, morai_v2_1_ros2_msgs/VehicleManualControl for
+    control) differ from what perception/controller expect (a scalar
+    speed, a Twist + Float32 steer).
   </description>
   <maintainer email="sirius@todo.todo">sirius</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>
-  <depend>nav_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
   <depend>example_interfaces</depend>

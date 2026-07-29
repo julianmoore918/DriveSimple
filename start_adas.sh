@@ -60,13 +60,26 @@ echo "[INFO] IPM view node started (PID $IPM_VIEW_PID)"
 # simulator-agnostic /Car_1/* topics. Not needed for CARLA, which has
 # its own custom bridge (carlaaccsim) doing this job already.
 if [ "$SIMULATOR" = "morai" ]; then
-    ros2 run morai_bridge state_adapter_node &
-    STATE_ADAPTER_PID=$!
-    echo "[INFO] MORAI state adapter started (PID $STATE_ADAPTER_PID)"
+    # Real OS-process check, not just "did this script start it" --
+    # state_adapter_node/control_adapter_node can also be launched
+    # independently via UI.py's "Start MORAI Bridge" button. Running
+    # both paths without this check spawns duplicate adapter pairs that
+    # silently race each other over /Car_1/vehicle/speed and
+    # /Car_1/control. See DEBUG.md.
+    if pgrep -f "state_adapter_node" > /dev/null || pgrep -f "control_adapter_node" > /dev/null; then
+        echo "[WARN] MORAI state/control adapter already running (started"
+        echo "       elsewhere, e.g. UI.py's Start MORAI Bridge) -- not"
+        echo "       launching a duplicate. Stop it first if you need a"
+        echo "       fresh instance."
+    else
+        ros2 run morai_bridge state_adapter_node &
+        STATE_ADAPTER_PID=$!
+        echo "[INFO] MORAI state adapter started (PID $STATE_ADAPTER_PID)"
 
-    ros2 run morai_bridge control_adapter_node &
-    CONTROL_ADAPTER_PID=$!
-    echo "[INFO] MORAI control adapter started (PID $CONTROL_ADAPTER_PID)"
+        ros2 run morai_bridge control_adapter_node &
+        CONTROL_ADAPTER_PID=$!
+        echo "[INFO] MORAI control adapter started (PID $CONTROL_ADAPTER_PID)"
+    fi
 fi
 
 # ── Shutdown handler ────────────────────────────────────
