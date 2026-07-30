@@ -25,7 +25,7 @@ declaration is in the thesis chapter of the same name.
 
 ## Demo
 
-
+![ADAS Stack](ADAS_Stack_CARLA_comp.gif)
 
 ## Prerequisites
 
