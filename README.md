@@ -1,286 +1,332 @@
-# ROS2 ADAS Stack (ACC + LKAS)
+# ROS 2 ADAS Stack — ACC + LKAS
 
-Minimal ROS 2 implementation of an ADAS system combining Adaptive Cruise
-Control (ACC) and Lane-Keeping Assist (LKAS).
+A ROS 2 Humble implementation of a two-function ADAS running against
+CARLA 0.9.16 (primary) and MORAI (secondary). The stack combines
+**Adaptive Cruise Control (ACC)** for longitudinal control and
+**Lane-Keeping Assist (LKAS)** for lateral control on the same ego
+vehicle, forming a **SAE Level 2** driver assistance system: the
+driver remains responsible for supervision at all times, but throttle,
+brake and steering are all automated within the declared operational
+envelope.
 
-The stack consists of four nodes split across two packages:
+Per UN Regulation No. 171 (Driver Control Assistance Systems), the two
+features implemented are:
 
-ACC:
+- **Positioning in the lane of travel** (R171 §5.3.7.1) — LKAS
+- **Headway assistance** (R171 §5.3.7.5) — ACC
 
-- **perception_node** – YOLO-based lead vehicle detection and distance estimation
-- **controller_node** – ACC controller publishing throttle / brake
+The declared System/Feature Designed Speed Range is **0–20 km/h**.
+The system is validated on CARLA's built-in weather presets covering
+**clear, cloudy and rainy conditions during daylight**; night, fog,
+snow and ice are outside the declared ODD. Roadway domain is R171
+**Non-Highway** (urban and suburban with signalised and unsignalised
+intersections, painted lane markings or kerbs required). Full ODD
+declaration is in the thesis chapter of the same name.
 
-LKAS:
+## Demo
 
-- **lane_detection_node** – UFLD V2 lane detection, publishes ego-left / ego-right polylines in the vehicle frame
-- **stanley_node** – Stanley lateral controller, publishes a normalised steer command
+_TODO: insert demo video showing ACC + LKAS driving Town10HD._
 
-Longitudinal and lateral control travel on **separate topics** to the CARLA
-bridge:
+<!-- placeholder — drop a link or embed here -->
 
-- ACC `controller_node` owns `/Car_1/cmd_vel` (`linear.x` = throttle,
-  `linear.y` = brake).
-- LKAS `stanley_node` owns `/Car_1/cmd_steer` (`Float32`, normalised steer
-  ∈ [-1, 1]).
+## Prerequisites
 
-The bridge subscribes to both and merges them into a single
-`carla.VehicleControl` per command callback. When LKAS isn't running — or
-when Stanley enters `HOLD` mode (typically inside a junction, where UFLD
-loses the lanes) — the bridge falls back to a CARLA-side pure-pursuit
-controller that follows the ego's starting lane along a precomputed
-forward route. Stanley resumes the moment UFLD reacquires the lane on the
-junction exit. When ACC isn't running, throttle/brake stay at 0 and the
-car coasts.
+- **OS.** Ubuntu 22.04.5 LTS.
+- **Simulator.** CARLA 0.9.16 (headless or windowed).
+- **Middleware.** ROS 2 Humble Hawksbill.
+- **GPU.** CUDA-capable for UFLD-V2 inference (tested on CUDA 11.8+).
+- **Python.** System Python 3.10 with:
 
-## Workspace Structure
+      python3 -m pip install ultralytics opencv-python "numpy<2"
 
-    ROS_ADAS_Stack/
-     ├── start_adas.sh               ← simulator startup script (launches all five nodes)
-     └── src/
-         ├── perception/
-         │   ├── perception_node.py             (ACC — YOLO)
-         │   ├── lane_detection_node.py         (LKAS — UFLD V2)
-         │   ├── debug_image_fusion_node.py     (combined YOLO + UFLD overlay)
-         │   └── models/                        (weights: best.pt, UFLD_best.pth, RLD_best.pth)
-         └── controller/
-             ├── controller_node.py        (ACC — throttle / brake)
-             └── stanley_node.py           (LKAS — Stanley lateral controller, publishes /Car_1/cmd_steer)
+- **External bridge.** `carlaAccSimTown.py` from the `carlaaccsim` repo
+  (spawns the ego, publishes camera + speed, subscribes to the ACC/LKAS
+  command topics).
+- **Perception weights.** In `src/perception/models/`:
+    - `best.pt` — YOLOv8 vehicle detector (ACC).
+    - `UFLD_F1=0.87.pth` — UFLD-V2 ResNet-34 lane detector (LKAS).
+- **UFLD source.** Ultra-Fast-Lane-Detection-V2 repository checked out
+  at
+  `/home/<user>/workspace/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2`
+  (path is a launch-time parameter).
 
-## Requirements
-
-- Ubuntu 22.04
-- ROS 2 Humble
-- Python 3
-- ultralytics
-- opencv-python
-- numpy < 2
-- cv_bridge
-
-Install Python dependencies:
-
-    python3 -m pip install ultralytics opencv-python "numpy<2"
-
-## Build
-
-    cd ~/acc_ws
-    colcon build
-    source install/setup.bash
-
-## Run
-
-The startup script in the workspace root launches all four nodes (ACC + LKAS).
-It sources ROS 2 and the workspace automatically and accepts a simulator argument:
+### Build
 
     cd ~/workspace/03_ADAS_WK/ROS_ADAS_Stack
-    ./start_adas.sh carla       # for CARLA simulator
-    ./start_adas.sh morai       # for MORAI simulator  (LKAS not validated for morai)
+    colcon build --packages-select perception controller
+    source install/setup.bash
 
-Press **Ctrl+C** to shut down all nodes cleanly at the same time.
+### Run
 
-**Prerequisite:** the CARLA server and the CARLA↔ROS bridge must already be
-running before `start_adas.sh` is launched. The script only orchestrates the ADAS
-nodes; it does not start the simulator or the bridge.
+    ./start_adas.sh carla
 
-To run nodes manually in separate terminals:
+Ctrl-C shuts everything down cleanly. The launcher accepts `morai`
+too, but LKAS is CARLA-tuned; the MORAI path is a work in progress
+(see `DEBUG.md` chapters 24–32).
 
-    # ACC
-    ros2 run perception perception_node
-    ros2 run controller controller_node --ros-args -p simulator:=carla
-    # LKAS
-    ros2 run perception lane_detection_node
-    ros2 run controller stanley_node
+The recommended way to drive the stack is through the Tk UI
+(`python3 UI.py`) — it launches CARLA, the bridge, and the ADAS stack
+in the right order with the right parameters and exposes the runtime
+knobs described below.
 
-## Simulator Parameter
+## ACC — Adaptive Cruise Control
 
-The controller node selects the correct message type for `/Car_1/vehicle/speed`
-based on the `simulator` parameter:
+**perception_node.py** runs YOLOv8 on the front camera at ~20 Hz, keeps
+detections of the classes `{car, truck, bus, motorcycle}` with
+`conf ≥ 0.80`, ground-projects their bounding boxes onto the road plane
+via the same IPM the LKAS lane detector uses, and filters detections
+whose ground-projected bounding box lies **inside the KF-smoothed ego
+lane polygon** (a dynamic ROI that follows the road through curves,
+with the historical static trapezoid as a warm-up fallback).
 
-| Simulator | Message type | Default |
-|-----------|-------------|---------|
-| `carla`   | `std_msgs/msg/Float64` | ✓ |
-| `morai`   | `example_interfaces/msg/Float64` | |
-
-## ROS Topics
-
-Simulator interface:
-
-    /Car_1/camera/front/compressed     sensor_msgs/msg/CompressedImage    ← camera input
-    /Car_1/vehicle/speed               Float64 (type depends on simulator) ← ego speed
-    /Car_1/cmd_vel                     geometry_msgs/msg/Twist             ← linear.x = throttle,
-                                                                             linear.y = brake
-    /Car_1/cmd_steer                   std_msgs/msg/Float32                ← normalised steer ∈ [-1, 1], positive = right
-
-ACC internal topics:
-
-    /ACC/lead_vehicle_distance         std_msgs/msg/Float32    ← distance to lead vehicle [m]
-    /ACC/lead_vehicle_confidence       std_msgs/msg/Float32    ← YOLO detection confidence [0–1]
-    /ACC/target_speed                  std_msgs/msg/Float32    ← target speed [km/h]  (Foxglove slider)
-    /ACC/perception/model_ready        std_msgs/msg/Bool       ← latched True once YOLO finishes loading
-
-LKAS internal topics:
-
-    /LKAS/ego_lane_left                nav_msgs/msg/Path           ← ego-left polyline (vehicle frame, REP 103: X fwd, Y left)
-    /LKAS/ego_lane_right               nav_msgs/msg/Path           ← ego-right polyline
-    /LKAS/perception/model_ready       std_msgs/msg/Bool           ← latched True once UFLD finishes loading
-
-Debug / visualization:
-
-    /ACC/perception/debug_image        sensor_msgs/msg/CompressedImage    ← annotated YOLO detections
-    /LKAS/perception/debug_image       sensor_msgs/msg/CompressedImage    ← annotated lane polylines
-    /ADAS/perception/debug_image       sensor_msgs/msg/CompressedImage    ← combined YOLO + UFLD overlay
-                                                                            (debug_image_fusion_node)
-
-## Node Overview
-
-### ACC
-
-#### Perception Node (`perception_node.py`)
-
-Subscribes:
-
-    /Car_1/camera/front/compressed
-
-Publishes:
-
-    /ACC/lead_vehicle_distance         closest detected vehicle [m], inf when none
-    /ACC/lead_vehicle_confidence       YOLO confidence of closest detection, 0.0 when none
-    /ACC/perception/debug_image        annotated image for Foxglove visualization
-    /ACC/perception/model_ready        Bool, published once True right after the YOLO
-                                        checkpoint finishes loading (TRANSIENT_LOCAL, so a
-                                        controller_node started later still sees it)
-
-Function:
-
-- YOLO vehicle detection (car, truck, bus, motorcycle)
-- Optional ROI mask (toggle `USE_ROI` flag at top of file, default: off)
-- Ego-lane filtering — only detects vehicles within ±20% of image centre
-- Bounding box height based distance estimation using focal length
-- Minimum confidence threshold (`MIN_CONFIDENCE = 0.5`)
-- Publishes `inf` / `0.0` when no vehicle is detected (`PUBLISH_INF` flag)
-- Single-line terminal status output (no scroll)
-- Debug image streamed to Foxglove via `/ACC/perception/debug_image`
-
-Config flags at the top of the file:
-
-    USE_ROI        = False   # enable/disable ROI mask
-    MIN_CONFIDENCE = 0.5     # detections below this are ignored
-    PUBLISH_INF    = True    # publish inf on no-detection (set False to suppress)
-
-#### Controller Node (`controller_node.py`)
-
-Subscribes:
-
-    /Car_1/vehicle/speed               ego speed (type selected by simulator parameter)
-    /ACC/lead_vehicle_distance         distance to lead vehicle
-    /ACC/target_speed                  target cruising speed [km/h]
-    /ACC/perception/model_ready        YOLO ready flag (see perception_node above)
-    /LKAS/perception/model_ready       UFLD ready flag (see lane_detection_node below)
-
-Publishes:
-
-    /Car_1/cmd_vel                     throttle (linear.x) and brake (linear.y)
-
-Control modes:
+**controller_node.py** runs three control modes on top of that
+distance-to-lead signal:
 
 | Mode | Condition | Behaviour |
-|------|-----------|-----------|
-| GATE | YOLO and/or UFLD not yet loaded | Throttle and brake held at 0 |
-| CRUISE | No lead vehicle detected | Proportional speed controller toward target speed |
-| ACC | Lead vehicle in range | PD-based distance controller |
-| EMERGENCY | Lead vehicle < 3 m | Immediate full brake |
+|---|---|---|
+| **GATE** | YOLO and/or UFLD not yet loaded | Throttle and brake held at 0 |
+| **CRUISE** | No lead vehicle detected | Proportional speed control toward target speed |
+| **ACC** | Lead vehicle in range | PD distance controller with time-headway gap |
+| **EMERGENCY** | Lead vehicle distance < 3 m | Immediate full brake |
 
-Startup safety gate: `controller_node` will not command any throttle
-until **both** `/ACC/perception/model_ready` and
-`/LKAS/perception/model_ready` have gone `True` — i.e. until YOLO and
-UFLD have both finished loading — regardless of node launch order.
-This is enforced purely via topic data (not a fixed delay), so it
-self-adjusts to however long model loading actually takes on a given
-machine.
+The gate is data-driven — `TRANSIENT_LOCAL` `Bool` publishers on
+`/ACC/perception/model_ready` and `/LKAS/perception/model_ready`, each
+republished at 1 Hz as a heartbeat so late-joining or UI-restarted
+perception processes still unlock the throttle (see DEBUG.md §33e).
 
-Control law (ACC mode):
+### ACC control laws
 
-    d_desired = d0 + T_gap * v_ego
-    a = k_p * (d_lead - d_desired) + k_d * closing_rate
+**CRUISE mode** — symmetric proportional law with a 0.5 m/s deadband:
 
-Default parameters:
+    e_v      = v_target − v_ego
+    throttle = min(k_cruise · e_v, cap)    if e_v > +0.5 m/s
+    brake    = min(k_cruise · |e_v|, 0.6)   if e_v < −0.5 m/s
+    else     throttle = brake = 0
 
-    target_speed       = 13.9 m/s  (≈ 50 km/h, overridable via /ACC/target_speed)
-    d0                 = 5.0 m     (standstill gap)
-    T_gap              = 1.5 s     (time gap)
-    k_p                = 1.2       (proportional gain)
-    k_d                = 0.8       (derivative gain)
-    emergency_distance = 3.0 m
+**ACC mode** — desired following distance and PD control on the gap:
 
-### LKAS
+    d_desired = d0 + T_gap · v_ego
+    a         = k_p · (d_lead − d_desired) + k_d · d(closing_rate)/dt
 
-#### Perception Node (`lane_detection_node.py`)
+### ACC tuned values
 
-Subscribes:
+| Symbol | Meaning | Value |
+|---|---|---|
+| `CRUISE_SPEED_KMH` | Setpoint (offset above declared 20 km/h to compensate for P-controller steady-state error, see DEBUG.md §33d) | **25 km/h** |
+| `d0` | Standstill gap | 5.0 m |
+| `T_gap` | Time headway | 1.5 s |
+| `k_p` | Distance gain | 1.2 |
+| `k_d` | Closing-rate gain | 0.8 |
+| `emergency_distance` | EMERGENCY-brake threshold | 3.0 m |
+| `MIN_CONFIDENCE` | YOLO detection confidence gate | 0.80 |
+| `MIN_PUBLISHED_GAP_M` | Lower clamp on published gap (IPM saturation) | 0.1 m |
 
-    /Car_1/camera/front/compressed
+Runtime override: publish `Float32` in km/h on `/ACC/target_speed` to
+change the cruise target on the fly.
 
-Publishes:
+## LKAS — Lane-Keeping Assist
 
-   /LKAS/ego_lane_left
-   /LKAS/ego_lane_right
-   /LKAS/perception/debug_image        annotated image for Foxglove visualization
-   /LKAS/perception/model_ready        Bool, published once True right after UFLD finishes
-                                        loading (TRANSIENT_LOCAL, see controller_node's gate)
+**lane_detection_node.py** runs UFLD-V2 inference on the same camera
+feed (at 5 Hz — every 4th camera frame, see DEBUG.md §33a), extracts
+per-row anchor points for the ego-left and ego-right lanes, projects
+them into the vehicle frame via IPM, fits a quadratic
+`y(x) = a x² + b x + c` per side, and feeds each frame's coefficients
+into a **6-state Kalman filter** that smooths `(a, b, c)` in
+coefficient space (see the KF section below).
 
-Function:
-- Calls trained UFLD V2 model for lane detection and outputs left and right lane as polylines.
+**stanley_node.py** consumes the KF's centreline coefficients directly
+from a side-channel topic `/LKAS/ego_lane_coeffs` when Kalman is
+active. When that channel is stale (Kalman OFF or filter uninitialised)
+it falls back to the classical Path-based Stanley that samples the
+polylines at a fixed lookahead.
 
-#### Controller Node (`stanley_node.py`)
+### Stanley control law — canonical + curvature feed-forward
 
-Subscribes:
+Per Hoffmann-Tomlin-Montemerlo-Thrun ACC 2007 and Snider
+CMU-RI-TR-09-08 §3.2 (2009), the Stanley formulation with a curvature
+feed-forward term is:
 
-    /Car_1/vehicle/speed               ego speed (type selected by simulator parameter)
-    /LKAS/ego_lane_left
-    /LKAS/ego_lane_right
+    ψ      = arctan(b̂)                            heading error at ego
+    e_ct   = ĉ                                     cross-track at ego
+    κ      = 2·â / (1 + b̂²)^(3/2)                 road curvature at ego
+    δ      = ψ + arctan(k · e_ct / (v + v_ε)) + arctan(κ · L)
 
-Publishes:
+Term 1 zeros heading error. Term 2 is the classic Stanley cross-track
+law — proven asymptotically stable for fixed scalar gain `k`
+(Hoffmann 2007). Term 3 is a curvature feed-forward that anticipates
+the turn using the vehicle wheelbase `L`. All computed in the vehicle
+Y-LEFT (REP 103) frame; the final δ is negated for CARLA's
+positive-right steering convention.
 
-   /Car_1/cmd_steer
+### LKAS tuned values
 
-Function:
+| Symbol | Meaning | Value |
+|---|---|---|
+| `STANLEY_K` | Cross-track feedback gain | 0.5 |
+| `STANLEY_HEADING_GAIN` | Heading-error gain | 1.0 |
+| `STANLEY_EPS` | Speed regulariser `v_ε` | 0.5 m/s |
+| `MAX_STEER_RAD` | Steering scale for normalisation | 70° |
+| `LOOKAHEAD_M` | Path-mode Stanley lookahead | 5.0 m |
+| `WHEELBASE_M` | CARLA `vehicle.dodge.charger_2020` wheelbase (`L`) | 3.048 m |
+| `KF_COEFF_STALE_S` | Freshness window for KF-STAN mode | 0.3 s |
 
-```
-delta = e_head + atan2(k * e_lat, v + eps)
-steer = clamp(delta / max_steer_angle, -1.0, 1.0)
-```
+## UFLD-V2 — trained lane detector
 
-| Symbol | Meaning | 0.9.16 | 0.10.0 |
-|--------|---------|--------|--------|
-| `k` | cross-track gain | `0.5` | **`1.0`** (UE5.5 vehicles feel sluggish at 0.5) |
-| `v` | current vehicle speed (m/s) | runtime | runtime |
-| `eps` | speed regulariser to avoid division by zero | `0.5` | `0.5` |
-| `max_steer_angle` | normalising scale for steer output (rad) | `≈ 1.22` (70°) | **`≈ 0.70`** (40° — tighter scale → more direct feel) |
+- **Architecture.** Ultra-Fast-Lane-Detection-V2 with ResNet-34
+  backbone (`configs/culane_res34.py`).
+- **Weights.** `src/perception/models/UFLD_F1=0.87.pth`. This is a
+  custom retrain of the CULane checkpoint on ~60 000 CARLA frames
+  collected from `carlaaccsim`'s dataset collector, evaluated at
+  F1 = 0.87 on a held-out CARLA validation set. See
+  `02_UFLD_V2/DEBUG.md` §3.3 for the training recipe.
+- **Runtime.** 288 × 800 input resolution; row+column hybrid anchors;
+  ~20–30 ms per forward pass on CUDA. Inference is throttled to
+  every 4th camera frame (5 Hz) to leave CPU headroom for the rest of
+  the stack.
+- **Confidence.** Per-lane soft confidence
+  `exist_prob × pos_peak_prob` (mean across valid rows) is used by
+  the KF's acceptance gate.
 
-> Note: `stanley_node.py` in this ROS stack uses the **0.9.16** column values
-> (`STANLEY_K = 0.5`, `MAX_STEER_RAD = math.radians(70)`), matching the CARLA
-> version the bridge talks to. The 0.10.0 column is the tuning used in the
-> standalone `lkas_validate_0.10.0.py` script in `02_UFLD_V2/`.
+## Kalman filter — coefficient-space smoothing
 
+A discrete-time Kalman filter smooths the UFLD polynomial coefficients
+`(a, b, c)` before they reach the Stanley controller. The state is
+6-dimensional — the three coefficients and their first time
+derivatives — with a nearly-constant-velocity motion model per
+coefficient and a continuous-white-noise-acceleration process noise
+block (Bar-Shalom 2001).
 
-## Setting Target Speed via Foxglove
+Per-frame, R is populated directly from the `np.polyfit(cov=True)`
+coefficient covariance — so noisy fits (near-degenerate rows, clipped
+detections) automatically get down-weighted without a heuristic.
+Innovations are validated against a χ²(3, 0.95) = 7.815 gate; outliers
+are rejected without updating the state. Covariance updates use the
+Joseph form for symmetric-PD stability at the tuned q values.
 
-A Variable Slider panel in Foxglove can adjust the target speed at runtime:
+![KF flowchart](docs/kf_flowchart.png)
 
-1. Add a **Variable Slider** panel — variable name: `target_speed`, min: `0`, max: `130`, step: `1`
-2. Add a **Publish** panel — topic: `/ACC/target_speed`, datatype: `std_msgs/Float32`, message: `{ "data": "$target_speed" }`
+_TODO: insert `docs/kf_flowchart.png` (KF flowchart used in the
+thesis)._
 
-The controller converts the incoming km/h value to m/s internally.
+### KF tuned values
 
-## Foxglove Visualization
+| Symbol | Meaning | Value |
+|---|---|---|
+| `q_a`, `q_b`, `q_c` | CWNA process-noise PSDs (curvature, heading, offset) | 0.5, 5.0, 5.0 |
+| `KF_CONF_THRESHOLD` | Minimum UFLD per-lane confidence to enter update | 0.15 |
+| `KF_MAX_COAST_TICKS` | Coast ticks before RST (≈ 4 s at 5 Hz) | 20 |
+| `γ` | χ²(3, 0.95) validation gate | 7.815 |
+| `KF_LOG_EVERY` | Steady-state log heartbeat cadence | 40 frames |
 
-Connect Foxglove to `ws://localhost:8765` (foxglove-bridge).
-Recommended panels:
+## ROS graph
 
-| Panel | Topic | Notes |
-|-------|-------|-------|
-| Image | `/ACC/perception/debug_image` | Annotated YOLO detections with distance labels |
-| Image | `/Car_1/camera/front/compressed` | Raw camera feed |
-| Plot  | `/ACC/lead_vehicle_distance` | Distance over time |
-| Plot  | `/ACC/lead_vehicle_confidence` | Detection confidence over time |
-| Plot  | `/Car_1/vehicle/speed` | Ego speed over time |
-| Variable Slider + Publish | `/ACC/target_speed` | Set target speed at runtime |
+The stack consists of five nodes across two packages, plus the CARLA
+bridge and two debug/BEV visualisation nodes.
+
+![ROS 2 node graph](docs/rosgraph.png)
+
+_TODO: insert `docs/rosgraph.png` (output of
+`ros2 run rqt_graph rqt_graph` on a running stack)._
+
+### Command topics (bridge boundary)
+
+    /Car_1/camera/front/compressed     sensor_msgs/CompressedImage    ← camera in
+    /Car_1/vehicle/speed               std_msgs/Float64                ← speed in (CARLA)
+                                        example_interfaces/Float64      ← speed in (MORAI)
+    /Car_1/cmd_vel                     geometry_msgs/Twist             → throttle (linear.x)
+                                                                          + brake (linear.y)
+    /Car_1/cmd_steer                   std_msgs/Float32                → normalised steer ∈ [−1, 1]
+    /Car_1/in_junction                 std_msgs/Bool                   ← junction-zone flag
+
+### ACC internal topics
+
+    /ACC/lead_vehicle_distance         std_msgs/Float32                ← lead distance [m]
+    /ACC/target_speed                  std_msgs/Float32                ← target [km/h] slider
+    /ACC/perception/model_ready        std_msgs/Bool                    ← latched + 1 Hz heartbeat
+
+### LKAS internal topics
+
+    /LKAS/ego_lane_left                nav_msgs/Path                    ← left polyline, vehicle frame
+    /LKAS/ego_lane_right               nav_msgs/Path                    ← right polyline, vehicle frame
+    /LKAS/ego_lane_coeffs              std_msgs/Float32MultiArray       ← KF-smoothed [â, b̂, ĉ], KF-only side channel
+    /LKAS/perception/model_ready       std_msgs/Bool                    ← latched + 1 Hz heartbeat
+
+### Debug + telemetry topics
+
+    /ACC/perception/debug_image        sensor_msgs/CompressedImage      ← YOLO overlay
+    /LKAS/perception/debug_image       sensor_msgs/CompressedImage      ← raw UFLD dots
+    /LKAS/perception/debug_image_kf    sensor_msgs/CompressedImage      ← KF cyan lines + red centreline
+    /ADAS/perception/debug_image       sensor_msgs/CompressedImage      ← YOLO + UFLD fused (raw)
+    /ADAS/perception/debug_image_kf    sensor_msgs/CompressedImage      ← YOLO + KF fused
+    /ADAS/ipm/debug_image              sensor_msgs/CompressedImage      ← BEV overlay
+    /ADAS/telemetry/speed_mps          std_msgs/Float32                 ← Stanley speed rebroadcast for UI
+
+## UI — orchestration and telemetry
+
+The Tk-based UI (`UI.py`) is the recommended entry point for driving
+the stack — it handles the launch order and parameter passing that
+otherwise has to be done by hand.
+
+![UI running on CARLA](docs/ui_carla.png)
+
+_TODO: insert `docs/ui_carla.png` (screenshot of UI driving CARLA)._
+
+![UI running on MORAI](docs/ui_morai.png)
+
+_TODO: insert `docs/ui_morai.png` (screenshot of UI driving MORAI)._
+
+### What the UI does
+
+- **Simulator processes.** Start/Stop CARLA (with quality preset and
+  map selection); Start/Stop Bridge (`carlaAccSimTown.py`); Run
+  `start_adas.sh`; Stop ADAS Stack; Start/Stop Foxglove; and, for
+  MORAI, Start/Stop MORAI Bridge.
+- **World controls.** Weather preset dropdown + Apply, Traffic count
+  spinner + Spawn/Clear, RPC-port and Town selectors.
+- **Ego spawn.** Spawn index selector (with a "List" button that
+  enumerates the valid spawn indices on the current map).
+- **Junction policy.** Dropdown for `pure-pursuit` vs `hold-straight`
+  fallback while inside a junction.
+- **ACC + LKAS toggles.** ACC ON/OFF (spawns YOLO + controller);
+  LKAS ON/OFF (spawns UFLD + Stanley). Both show live "active" /
+  "partial" indicators driven by the model-ready heartbeats.
+- **KF tuning knobs.** `q_a`, `q_b`, `q_c` entry boxes + **Apply KF**
+  button that pushes the values live via `ros2 param set` — no
+  restart needed, backed by perception_node's
+  `add_on_set_parameters_callback`.
+- **Camera + BEV view.** Selectable source among Raw, ACC (YOLO),
+  LKAS (UFLD), ADAS (YOLO+UFLD), ADAS (YOLO+KF), rendered next to the
+  always-on BEV panel. Uses `qos_profile_sensor_data` on all image
+  subscriptions so switching sources shows the newest frame, not the
+  head of a stale queue (see DEBUG.md §33b).
+- **Speed telemetry.** Speed reading in km/h at the top of the camera
+  panel, fed by Stanley's rebroadcast on `/ADAS/telemetry/speed_mps`
+  so it's immune to the CARLA-vs-MORAI Float64 message-type mismatch
+  (see DEBUG.md §33g).
+- **Rosbag recording.** Optional `--record` toggle passed through to
+  the bridge.
+
+## Runtime overrides
+
+- `-p simulator:=<carla|morai>` on all ROS 2 nodes — picks the right
+  speed-message type, camera extrinsics, Stanley gains, and cruise
+  target.
+- `-p model_filename:=<file>` on `perception_node` /
+  `lane_detection_node` — resolves relative to
+  `share/perception/models/` if not absolute.
+- `-p enable_kalman:=<true|false>` on `lane_detection_node` — turns
+  the KF and the coeff channel off, forcing Stanley into its
+  path-based fallback for A/B comparison.
+- `-p kf_q_a:=`, `-p kf_q_b:=`, `-p kf_q_c:=` — live-tunable KF PSDs
+  via the perception node's `SetParametersCallback`.
+- `-p inference_skip_n:=<n>` on `lane_detection_node` — every Nth
+  camera frame gets an UFLD pass. Default 4 (5 Hz).
+
+## Further reading
+
+- **DEBUG.md** — chronological log of every non-obvious bug and
+  design decision, including this session's CARLA hardening work in
+  §33.
+- **`02_UFLD_V2/DEBUG.md`** — UFLD training recipe and F1 evolution.
+- **Thesis** — ODD declaration (R171-structured), KF derivation with
+  citations, Stanley formulation, sensitivity study.
