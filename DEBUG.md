@@ -2770,3 +2770,198 @@ the `VehicleInfo` ROS publish path specifically, and points at trying
 a much larger `Detect Radius` (or finding a different, dedicated
 vehicle-state output) rather than continuing to use `GroundTruth`'s
 `VehicleInfo` template as-is.
+
+
+## 33. CARLA-side hardening session (2026-07-21) [DONE]
+
+Series of small fixes that made the CARLA path robust to the way the
+UI now orchestrates start-up. Grouped here so the individual entries
+below are easier to cross-reference; each subsection can stand alone.
+
+### 33a. `inference_skip_n` sweep 5 Hz → 20 Hz → 5 Hz [KEPT AT 5 Hz]
+
+The KF-STAN control channel benefits from higher UFLD rates (more
+measurements per second → tighter χ² gate innovations, faster
+convergence after RST), so I raised `inference_skip_n` from `4`
+(5 Hz) to `1` (20 Hz) with `KF_MAX_COAST_TICKS` scaled from `20` to
+`80` to preserve the ~4 s wall-clock coast window. This worked
+functionally but pinned one CPU core on the host running the whole
+stack (CARLA server + bridge + ROS nodes + Tk UI). A second attempt
+at `2` (10 Hz) also saturated CPU. Reverted both to the original
+values (`inference_skip_n=4`, `KF_MAX_COAST_TICKS=20`) — that's the
+regime the KF q defaults and χ² threshold were tuned against, so
+behaviour returns to its validated configuration.
+
+**Takeaway.** Higher UFLD rates are strictly better for the control
+loop; the constraint is CPU headroom, not algorithm correctness. If
+the host CPU ever gets more headroom (dedicated GPU box, off-loading
+CARLA server to a second machine), bump `inference_skip_n` back down
+and scale `KF_MAX_COAST_TICKS` proportionally.
+
+### 33b. UI camera QoS — `qos_profile_sensor_data` [FIXED]
+
+The UI subscribed to all five camera sources
+(`/Car_1/camera/front/compressed`, `/ACC/perception/debug_image`,
+`/LKAS/perception/debug_image`, `/ADAS/perception/debug_image`,
+`/ADAS/perception/debug_image_kf`) and the BEV `/ADAS/ipm/debug_image`
+with the default reliable + keep-last-10 QoS profile. Because the
+12 Hz Tk render tick can't drain a callback queue as fast as a 20 Hz
+publisher fills it, up to 10 old JPEGs would pile up per topic;
+switching the Source dropdown then exposed those stale frames as
+per-source lag — a source that looked "delayed" was actually just
+serving from the middle of its own backlog.
+
+**Fix.** Import `qos_profile_sensor_data` from `rclpy.qos` and pass
+it in place of the depth-`10` int on every image subscription
+(camera sources + BEV). Best-effort + keep-last-1 → older frames are
+dropped in the middleware before they reach the callback, so
+`latest_jpegs[topic]` always holds the newest received frame.
+
+There is a residual per-source latency floor set by each publisher's
+own rate (LKAS at 5 Hz means the newest LKAS frame is up to 200 ms
+behind the newest Raw), but that's architectural and unrelated.
+
+### 33c. `BRIDGE_SYNC_MODE=1` — introduced, then reverted [REGRESSED, DO NOT REAPPLY]
+
+After the QoS + inference-rate work freed CPU headroom, CARLA
+started running above real-time in async mode — Stanley couldn't
+correct fast enough because the vehicle covered more ground per
+control tick than in the CPU-pinned baseline. I set
+`BRIDGE_SYNC_MODE=1` (via `extra_env` in `UI.start_bridge`) so
+`carlaAccSimTown.py` would enable CARLA `synchronous_mode` and
+`fixed_delta_seconds = 0.05`.
+
+**What broke.** Under sync mode the bridge process spends
+essentially all its CPU inside its tick loop. The bridge's own ROS
+`_cmd_vel_cb` (in `custom_ROS_pub_sub.py`) then stops firing between
+ticks, so CARLA advances physics forever with the last stored (zero)
+throttle. Symptom: ACC controller publishing `cmd_vel.linear.x = 1.0`
+into a running bridge, `/Car_1/vehicle/speed = 0.0` at 20 Hz forever,
+`pgrep` showing the bridge process at 99 % CPU. `in_junction: false`,
+no lead vehicle, no obvious code-level reason the throttle should
+be blocked — but throttle simply never reaches CARLA.
+
+**Fix.** Reverted: removed `extra_env={'BRIDGE_SYNC_MODE': '1'}`
+from `UI.start_bridge`. Bridge is back to async mode. If the sim
+runs above real-time on a beefy host, the correct lever is on the
+CARLA server side (`./CarlaUE4.sh ... -benchmark -fps=20`), which
+paces the server's own physics loop without changing ROS callback
+scheduling. Not wired into the UI yet — TODO.
+
+### 33d. ACC steady-state error — `CRUISE_SPEED_KMH = 25` [FIXED]
+
+At `CRUISE_SPEED_KMH = 20.0`, the P-only cruise law
+(`_cruise_control`) plus drag + rolling resistance + the 0.5 m/s
+deadband landed at an effective ~15.7 km/h (`v ≈ 4.36 m/s` on every
+KF-STAN log line). Not a bug; just what a proportional controller
+without integral action does at any operating point where
+`k · e_ss = drag(v_ss)`.
+
+**Fix.** Bumped `CRUISE_SPEED_KMH` from `20.0` to `25.0`. This is
+purely a setpoint offset to compensate for the controller's own
+steady-state error; the effective operating envelope stated in the
+thesis ODD (0–20 km/h) is unchanged. The variable-slider path via
+`/ACC/target_speed` still overrides at runtime.
+
+Longer-term fix (not done): add an integral term to
+`_cruise_control` so the steady-state error goes to zero on its own
+and this setpoint offset becomes unnecessary.
+
+### 33e. Model-ready 1 Hz heartbeat [FIXED]
+
+`perception_node` and `lane_detection_node` each publish
+`Bool(data=True)` on `/ACC/perception/model_ready` and
+`/LKAS/perception/model_ready` respectively, using the `TRANSIENT_LOCAL`
+QoS so a late-joining `controller_node` still sees the retained
+message. The gate in `controller_node` (§28) holds throttle at 0
+until both are received.
+
+**Race identified.** Two failure modes were leaving the gate stuck
+even after both models loaded:
+
+1. On rapid startup, DDS occasionally drops the first retained
+   message before the subscriber has finished wiring — so the
+   controller never gets flagged even though the publisher's
+   `TRANSIENT_LOCAL` was correctly configured. This is a known
+   rmw edge case with `rmw_fastrtps_cpp`, not a bug in this code.
+2. The UI kills the shell-launched `lane_detection_node` ~1.5 s
+   after `start_adas.sh` boots and respawns it with the UI-selected
+   model (`_restart_lkas_with_ui_params`). When the first
+   `lane_detection_node` dies, its retained message dies with it —
+   DDS only serves retained messages while the publisher process is
+   alive. If the first process died before publishing (UFLD load
+   takes 3–5 s on GPU), the retained message never existed at all.
+
+**Fix.** In both `perception_node.py` and `lane_detection_node.py`,
+right after the initial `ready_pub.publish(Bool(data=True))`, add a
+1 Hz republish timer:
+
+```python
+self.create_timer(1.0,
+                  lambda: self.ready_pub.publish(Bool(data=True)))
+```
+
+Cheap (one `Bool` per second), idempotent, and eliminates both race
+paths — no matter when the controller subscribes or how many times
+the UI restarts the perception node, the gate flips within 1 s.
+
+### 33f. `ufld_repo` doubled path — `01_CV_Models/01_CV_Models/` [FIXED]
+
+The pulled `lane_detection_node.py`'s default `ufld_repo` parameter
+was:
+
+```
+/home/sirius/workspace/01_CV_Models/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2
+```
+
+Two `01_CV_Models/` segments. The path doesn't exist, so
+`UFLDInference.__init__` fails immediately with
+`ModuleNotFoundError: No module named 'utils'` (the class tries
+`from utils.config import Config` after inserting `ufld_repo` into
+`sys.path`). Symptom at runtime: `lane_detection_node` crashes on
+startup before publishing `model_ready`, the controller's gate holds
+throttle at 0 forever, the UI's LKAS button reads "partial" because
+Stanley is alive but perception is not.
+
+**Fix.** Deduped the path to
+`/home/sirius/workspace/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2`
+(the folder that actually contains `utils/config.py`).
+
+The IDE will keep flagging the `from utils.config import Config`
+line as "unresolved import" — that's expected, since the module is
+added to `sys.path` at runtime and static analysis can't follow it.
+
+### 33g. Speed-topic dual-type mismatch — Stanley rebroadcast [FIXED]
+
+`/Car_1/vehicle/speed` is published by:
+
+- CARLA bridge (`custom_ROS_pub_sub.py`) as `std_msgs/msg/Float64`.
+- MORAI adapter (`state_adapter_node`) as `example_interfaces/msg/Float64`.
+
+`stanley_node` and `controller_node` pick their subscription type
+from `-p simulator:=carla|morai` at their own launch time, so they
+always match the publisher. The UI, however, decides its speed
+message type at *UI-process startup* based on the value of the
+Simulator dropdown at that moment. If the UI was launched with
+`morai` selected but the running bridge is CARLA (or vice versa),
+DDS silently refuses to deliver messages across the type mismatch —
+the UI's `Speed:` label shows `— km/h` and never updates.
+
+Attempted first fix (destroy + recreate the subscription on
+dropdown-change trace) worked functionally but was hard to reason
+about across UI-restart edge cases; reverted.
+
+**Actual fix.** `stanley_node` now publishes an
+`std_msgs/msg/Float32` copy of `self.speed` (m/s) on
+`/ADAS/telemetry/speed_mps` every time its `speed_callback` fires.
+The UI subscribes to that instead of the raw
+`/Car_1/vehicle/speed` topic. Since Stanley's subscription type
+already matches whichever simulator is running, and the UI's
+subscription is now a fixed `Float32` regardless of dropdown state,
+the mismatch surface disappears entirely.
+
+Side-benefit: removed the `simulator: str` parameter from
+`TelemetryView.__init__` and the `example_interfaces` import from
+`UI.py`, so the UI process no longer has to know which simulator is
+running just to render a speed number.
+

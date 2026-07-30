@@ -162,6 +162,15 @@ class YoloDetection(Node):
         self.get_logger().info(f"YOLO model loaded from {model_path}")
         self.ready_pub.publish(Bool(data=True))
         self.get_logger().info("YOLO ready — /ACC/perception/model_ready = True")
+        # Belt-and-braces: republish the ready flag at 1 Hz forever.
+        # TRANSIENT_LOCAL alone is fragile across the UI's kill/respawn
+        # dance for lane_detection_node, and on rapid startup rmw
+        # sometimes drops the first retained message before the
+        # subscriber is fully wired. A cheap 1 Hz heartbeat costs
+        # nothing and guarantees the controller_node's gate flips
+        # within one second of it subscribing.
+        self.create_timer(1.0,
+                          lambda: self.ready_pub.publish(Bool(data=True)))
 
         self.last_log_time = 0.0
 

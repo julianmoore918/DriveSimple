@@ -186,7 +186,7 @@ class LaneDetectionNode(Node):
         simulator = self.get_parameter('simulator').get_parameter_value().string_value
 
         self.declare_parameter('ufld_repo',
-            '/home/sirius/workspace/01_CV_Models/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2')
+            '/home/sirius/workspace/01_CV_Models/01_Ultra_Fast_Lane_Detection_V2/Ultra-Fast-Lane-Detection-V2')
         self.declare_parameter('ufld_config_rel', 'configs/culane_res34.py')
         self.declare_parameter('model_filename', 'UFLD_F1=0.67.pth')
         self.declare_parameter('device', 'cuda')
@@ -306,6 +306,11 @@ class LaneDetectionNode(Node):
         self.get_logger().info("UFLD loaded — waiting for first camera frame")
         self.ready_pub.publish(Bool(data=True))
         self.get_logger().info("UFLD ready — /LKAS/perception/model_ready = True")
+        # 1 Hz heartbeat — matches the perception_node fix so the
+        # controller's gate is guaranteed to unlock within one second
+        # regardless of the UI's kill/respawn of this node.
+        self.create_timer(1.0,
+                          lambda: self.ready_pub.publish(Bool(data=True)))
 
         # ── I/O ──────────────────────────────────────────────────────────
         self.create_subscription(CompressedImage, cam_topic,

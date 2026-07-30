@@ -204,6 +204,15 @@ class StanleyNode(Node):
         # Absolute topic name — bypasses the LKAS namespace so steer lands on
         # the same /Car_1/* tree the bridge already owns.
         self.steer_pub = self.create_publisher(Float32, '/Car_1/cmd_steer', 20)
+        # UI-facing rebroadcast of the vehicle speed. The raw
+        # /Car_1/vehicle/speed topic gets published as std_msgs/Float64
+        # by CARLA and example_interfaces/Float64 by MORAI, and DDS
+        # will not deliver across the type mismatch. Rather than have
+        # the UI guess the right type at startup, we republish it here
+        # as a fixed std_msgs/Float32 so the UI can subscribe with one
+        # type regardless of which simulator is running.
+        self.speed_ui_pub = self.create_publisher(
+            Float32, '/ADAS/telemetry/speed_mps', 10)
 
         self.left_veh  = []      # list of (X_forward, Y_right)
         self.right_veh = []
@@ -240,6 +249,9 @@ class StanleyNode(Node):
 
     def speed_callback(self, msg):
         self.speed = abs(msg.data)
+        # Rebroadcast for the UI (see speed_ui_pub declaration above).
+        out = Float32(); out.data = float(self.speed)
+        self.speed_ui_pub.publish(out)
 
     def coeffs_callback(self, msg: Float32MultiArray):
         if len(msg.data) >= 3:

@@ -35,9 +35,9 @@ try:
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import CompressedImage
+    from rclpy.qos import qos_profile_sensor_data
     from geometry_msgs.msg import Twist
-    from std_msgs.msg import Float32, Float64 as StdFloat64
-    from example_interfaces.msg import Float64 as ExFloat64
+    from std_msgs.msg import Float32
     CAMERA_AVAILABLE = True
     _camera_err = None
 except ImportError as e:
@@ -334,7 +334,7 @@ class TelemetryView(Node):
     ACC / LKAS alive indicators.
     """
 
-    def __init__(self, simulator: str = 'carla'):
+    def __init__(self):
         super().__init__('adas_ui_telemetry')
         self.latest_jpegs = {t: None for t in CAMERA_SOURCES.values()}
         # IPM lives outside CAMERA_SOURCES (separate widget, not source-
@@ -345,28 +345,39 @@ class TelemetryView(Node):
         # Ego speed in m/s. None until the bridge publishes a first sample.
         self.speed_mps: float | None = None
 
+        # SensorDataQoS (best-effort, keep-last-1) for image streams.
+        # The default reliable + keep-last-10 profile lets up to 10 old
+        # JPEGs queue per topic when the render tick can't drain fast
+        # enough — switching the Source dropdown then exposes those
+        # stale frames as visible per-source lag. With depth 1, older
+        # frames are dropped in the middleware before they reach our
+        # callback, so `latest_jpegs[topic]` always holds the newest
+        # received frame.
         for topic in CAMERA_SOURCES.values():
             self.create_subscription(
                 CompressedImage, topic,
-                lambda msg, t=topic: self._on_image(t, msg), 10)
+                lambda msg, t=topic: self._on_image(t, msg),
+                qos_profile_sensor_data)
         self.create_subscription(
-            CompressedImage, IPM_DEBUG_TOPIC, self._on_bev, 10)
+            CompressedImage, IPM_DEBUG_TOPIC, self._on_bev,
+            qos_profile_sensor_data)
         self.create_subscription(
             Twist, CMD_VEL_TOPIC,
             lambda _msg: self._touch(CMD_VEL_TOPIC), 10)
         self.create_subscription(
             Float32, CMD_STEER_TOPIC,
             lambda _msg: self._touch(CMD_STEER_TOPIC), 10)
-        # ROS2 rejects two different message types on the same topic name
-        # within one node (rcl raises "invalid allocator") -- must pick a
-        # single type. Uses whatever the Simulator dropdown reads at UI
-        # startup; if you flip the dropdown afterward, restart the UI for
-        # this speed display to pick up the new type (controller_node /
-        # stanley_node aren't affected -- they read the dropdown fresh at
-        # their own launch time, which is always after you've set it).
-        SpeedMsg = ExFloat64 if simulator == 'morai' else StdFloat64
+        # Speed feed: subscribe to stanley_node's UI-facing rebroadcast
+        # on /ADAS/telemetry/speed_mps (std_msgs/Float32) rather than
+        # the raw /Car_1/vehicle/speed topic. The raw topic is
+        # std_msgs/Float64 on CARLA and example_interfaces/Float64 on
+        # MORAI, and DDS won't deliver across that type mismatch — so
+        # the display used to freeze at "— km/h" whenever the UI
+        # dropdown and the running simulator disagreed. The rebroadcast
+        # is a single fixed type, so this sub always works.
         self.create_subscription(
-            SpeedMsg, SPEED_TOPIC, self._on_speed, 10)
+            Float32, '/ADAS/telemetry/speed_mps',
+            self._on_speed, 10)
 
     def _on_speed(self, msg):
         self.speed_mps = float(msg.data)
@@ -805,7 +816,7 @@ class ADASUI:
         except RuntimeError:
             # Already initialised somewhere in this process.
             pass
-        self.ros_node = TelemetryView(self.simulator_var.get())
+        self.ros_node = TelemetryView()
         self.ros_thread = threading.Thread(
             target=lambda: rclpy.spin(self.ros_node), daemon=True)
         self.ros_thread.start()
@@ -1222,8 +1233,19 @@ class ADASUI:
         if self.rosbag_record_var.get():
             cmd.append('--record')
         self._log(f'$ (source ROS && cd {BRIDGE_DIR} && {" ".join(cmd)})')
-        self.bridge_proc = self._popen(cmd, cwd=str(BRIDGE_DIR),
-                                        source_ros=True, prefix='bridge')
+        # BRIDGE_SYNC_MODE=1 was tried here to lock CARLA to real-time,
+        # but at the 5 Hz UFLD load the bridge process pegs one core in
+        # the tick loop, starves its own ROS callbacks, and _cmd_vel_cb
+        # stops firing — CARLA then advances physics forever with the
+        # last stored (zero-throttle) control, and the car sits still
+        # even though ACC is commanding throttle = 1.0. Async mode
+        # keeps callbacks responsive; if the sim runs above real-time
+        # on this host, throttle back CARLA's own tick rate instead
+        # (Start CARLA with `-benchmark -fps=20`) or bound perception
+        # load elsewhere.
+        self.bridge_proc = self._popen(
+            cmd, cwd=str(BRIDGE_DIR),
+            source_ros=True, prefix='bridge')
         rec_note = ' + rosbag' if self.rosbag_record_var.get() else ''
         self.status_var.set(
             f'Bridge starting (spawn={spawn_index}, junction: {policy}{rec_note})')

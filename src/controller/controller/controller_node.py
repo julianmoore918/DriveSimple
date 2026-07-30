@@ -53,7 +53,14 @@ ENABLE_LOGGING = False  # set True to enable terminal output
 # throttle/brake from this controller via `throttle_brake_provider`
 # (see carlaaccsim/pure_pursuit_controller.py:_make_ego_speed_policy)
 # — so PP during junctions also tracks this same target indirectly.
-CRUISE_SPEED_KMH = 20.0
+CRUISE_SPEED_KMH = 25.0
+# Effective declared cruising speed for the ODD is 20 km/h. The P-only
+# cruise-mode throttle law + 0.5 m/s deadband + drag / rolling
+# resistance leaves a steady-state error of ~4 km/h below setpoint at
+# these speeds, so the setpoint is offset above the effective target
+# so the vehicle actually settles near 20 km/h. If an integral term is
+# added to _cruise_control() later, this can be reduced back to 20.
+# The ODD's declared System/Feature Designed Speed Range is unchanged.
 # MORAI's control-input calibration (steering scale, speed feedback) is
 # unvalidated -- start MORAI runs at a crawl until that's tuned. See
 # morai_bridge/control_adapter_node.py.
