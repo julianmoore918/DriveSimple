@@ -27,7 +27,9 @@ declaration is in the thesis chapter of the same name.
 
 _TODO: insert demo video showing ACC + LKAS driving Town10HD._
 
-<!-- placeholder — drop a link or embed here -->
+<video controls width="800">
+  <source src="ADAS_Stack_CARLA_comp.mp4" type="video/mp4">
+</video>
 
 ## Prerequisites
 
@@ -270,6 +272,7 @@ otherwise has to be done by hand.
 ![UI running on CARLA](docs/ui_carla.png)
 
 _TODO: insert `docs/ui_carla.png` (screenshot of UI driving CARLA)._
+![CARLA ADAS Demo](Screenshot%20from%202026-07-30%2014-08-02.png)
 
 ![UI running on MORAI](docs/ui_morai.png)
 
