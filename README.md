@@ -17,7 +17,7 @@ features implemented are:
 
 The declared System/Feature Designed Speed Range is **0–20 km/h**.
 The system is validated on CARLA's built-in weather presets covering
-**clear, cloudy and rainy conditions during daylight**; night, fog,
+**clear, cloudy, foggy and rainy conditions during daylight**; night,
 snow and ice are outside the declared ODD. Roadway domain is R171
 **Non-Highway** (urban and suburban with signalised and unsignalised
 intersections, painted lane markings or kerbs required). Full ODD
