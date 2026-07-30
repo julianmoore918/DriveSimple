@@ -25,11 +25,7 @@ declaration is in the thesis chapter of the same name.
 
 ## Demo
 
-_TODO: insert demo video showing ACC + LKAS driving Town10HD._
 
-<video controls width="800">
-  <source src="ADAS_Stack_CARLA_comp.mp4" type="video/mp4">
-</video>
 
 ## Prerequisites
 
@@ -205,10 +201,7 @@ Innovations are validated against a χ²(3, 0.95) = 7.815 gate; outliers
 are rejected without updating the state. Covariance updates use the
 Joseph form for symmetric-PD stability at the tuned q values.
 
-![KF flowchart](docs/kf_flowchart.png)
-
-_TODO: insert `docs/kf_flowchart.png` (KF flowchart used in the
-thesis)._
+![KF flowchart](Kalman_Filter_Input_Free.svg)
 
 ### KF tuned values
 
@@ -225,10 +218,7 @@ thesis)._
 The stack consists of five nodes across two packages, plus the CARLA
 bridge and two debug/BEV visualisation nodes.
 
-![ROS 2 node graph](docs/rosgraph.png)
-
-_TODO: insert `docs/rosgraph.png` (output of
-`ros2 run rqt_graph rqt_graph` on a running stack)._
+![ROS 2 node graph](ADAS_ROS2_Stack_Graph.svg)
 
 ### Command topics (bridge boundary)
 
@@ -269,10 +259,7 @@ The Tk-based UI (`UI.py`) is the recommended entry point for driving
 the stack — it handles the launch order and parameter passing that
 otherwise has to be done by hand.
 
-![UI running on CARLA](docs/ui_carla.png)
-
-_TODO: insert `docs/ui_carla.png` (screenshot of UI driving CARLA)._
-![CARLA ADAS Demo](Screenshot%20from%202026-07-30%2014-08-02.png)
+![UI running on CARLA](Screenshot%20from%202026-07-30%2014-08-02.png)
 
 ![UI running on MORAI](docs/ui_morai.png)
 
