@@ -50,7 +50,7 @@ FUSION_PID=$!
 echo "[INFO] Debug-image fusion node started (PID $FUSION_PID)"
 
 # ── Launch IPM bird's-eye view ──────────────────────────
-ros2 run perception ipm_view_node &
+ros2 run perception ipm_view_node --ros-args -p simulator:=$SIMULATOR &
 IPM_VIEW_PID=$!
 echo "[INFO] IPM view node started (PID $IPM_VIEW_PID)"
 

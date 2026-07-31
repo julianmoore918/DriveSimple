@@ -16,8 +16,9 @@ straight lane on a curving road, the blank-canvas view can't tell you
 that — both look like straight lines. The warped camera shows the real
 asphalt + lane markings; if UFLD's blue/green dots don't follow the
 warped lane paint, you can see it immediately. Doubles as a sanity
-check on the camera extrinsics (1.35 m / 0.6 m) — get them wrong and
-the warped lanes diverge from the painted ones with distance.
+check on the camera extrinsics (1.35 m / 0.6 m on CARLA, 0.9 m / 0.75 m
+on MORAI — see the `simulator` parameter) — get them wrong and the
+warped lanes diverge from the painted ones with distance.
 
 Subscribed topics:
     /Car_1/camera/front/compressed   (sensor_msgs/CompressedImage)
@@ -60,12 +61,19 @@ LATERAL_MAX_M    = (IMG_W / 2) / PX_PER_M             # ≈ ±10.7 m lateral
 
 # ── Camera intrinsics / extrinsics ──────────────────────────────────────
 # Must match the rig spawned by the bridge and used by
-# lane_detection_node. If you change them in one place, change them
-# everywhere — they're the contract for the IPM.
+# lane_detection_node / perception_node. If you change them in one
+# place, change them everywhere — they're the contract for the IPM.
+# FOV is shared across simulators; height/x-offset are not (MORAI's
+# camera mount sits lower and further forward than CARLA's) — see
+# DEFAULT_CAM_HEIGHT_M / DEFAULT_CAM_X_OFFSET below, read into
+# self.cam_h_m / self.cam_x_off from the `simulator` parameter in
+# IPMViewNode.__init__, same pattern as the other two nodes.
 CAM_FOV_DEG      = 90.0
-CAM_H_M          = 1.35
-CAM_X_OFF        = 0.6
 CAM_FOV_RAD      = math.radians(CAM_FOV_DEG)
+DEFAULT_CAM_HEIGHT_M        = 1.35
+DEFAULT_CAM_HEIGHT_M_MORAI  = 0.9
+DEFAULT_CAM_X_OFFSET        = 0.6
+DEFAULT_CAM_X_OFFSET_MORAI  = 0.75
 
 # ── Ground control points for the homography (vehicle frame) ────────────
 # Trapezoid in front of the ego: near-row + far-row, ±3 m laterally.
@@ -105,10 +113,13 @@ def veh_to_bev_unclipped(x_fwd: float, y_left: float):
     return [float(u), float(v)]
 
 
-def compute_homography(img_w: int, img_h: int) -> np.ndarray:
+def compute_homography(img_w: int, img_h: int,
+                        cam_h_m: float, cam_x_off: float) -> np.ndarray:
     """Return the 3×3 perspective transform that warps the forward
     camera image (img_w × img_h) onto the BEV canvas. Computed once per
-    camera resolution change."""
+    camera resolution change. cam_h_m/cam_x_off come from the node's
+    `simulator`-dependent parameters, not a fixed constant — CARLA and
+    MORAI mount the camera at different heights/offsets."""
     focal_px = img_w / (2.0 * math.tan(CAM_FOV_RAD / 2.0))
     cx, cy = img_w / 2.0, img_h / 2.0
 
@@ -116,9 +127,9 @@ def compute_homography(img_w: int, img_h: int) -> np.ndarray:
         # Inverse of lane_detection_node.ipm_pixel_to_vehicle: project a
         # point on the road plane forward into the camera. Mirrors the
         # same camera model so the warp lines up with UFLD's lanes.
-        dx = x_fwd - CAM_X_OFF
+        dx = x_fwd - cam_x_off
         u = cx + (-y_left) * focal_px / dx
-        v = cy + CAM_H_M * focal_px / dx
+        v = cy + cam_h_m * focal_px / dx
         return [float(u), float(v)]
 
     src = np.float32([ground_to_img(*p) for p in HOM_POINTS_GROUND])
@@ -129,6 +140,18 @@ def compute_homography(img_w: int, img_h: int) -> np.ndarray:
 class IPMViewNode(Node):
     def __init__(self):
         super().__init__('IPM_View_Node', namespace='ADAS')
+        # simulator (carla | morai) picks the camera-rig defaults below;
+        # an explicit -p cam_height_m:=... always overrides it regardless.
+        # Same pattern as perception_node / lane_detection_node.
+        self.declare_parameter('simulator', 'carla')
+        simulator = self.get_parameter('simulator').get_parameter_value().string_value
+        self.declare_parameter('cam_height_m',
+            DEFAULT_CAM_HEIGHT_M_MORAI if simulator == 'morai' else DEFAULT_CAM_HEIGHT_M)
+        self.declare_parameter('cam_x_offset',
+            DEFAULT_CAM_X_OFFSET_MORAI if simulator == 'morai' else DEFAULT_CAM_X_OFFSET)
+        self.cam_h_m   = self.get_parameter('cam_height_m').value
+        self.cam_x_off = self.get_parameter('cam_x_offset').value
+
         self.left_veh:  list[tuple[float, float]] = []
         self.right_veh: list[tuple[float, float]] = []
         # Closest in-lane lead's bb-bottom edge, IPM-projected (vehicle
@@ -187,7 +210,7 @@ class IPMViewNode(Node):
         # resolution changes (e.g., the bridge swap between 720p/1080p).
         shape = (bgr.shape[1], bgr.shape[0])
         if self.H is None or shape != self.H_for_shape:
-            self.H = compute_homography(*shape)
+            self.H = compute_homography(*shape, self.cam_h_m, self.cam_x_off)
             self.H_for_shape = shape
             self.get_logger().info(
                 f"Homography computed for {shape[0]}×{shape[1]} camera")

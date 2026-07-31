@@ -25,7 +25,7 @@ declaration is in the thesis chapter of the same name.
 
 ## Demo
 
-![ADAS Stack](ADAS_Stack_CARLA_comp.gif)
+![ADAS Stack](figures/ADAS_Stack_CARLA_comp.gif)
 
 ## Prerequisites
 
@@ -201,7 +201,7 @@ Innovations are validated against a χ²(3, 0.95) = 7.815 gate; outliers
 are rejected without updating the state. Covariance updates use the
 Joseph form for symmetric-PD stability at the tuned q values.
 
-![KF flowchart](Kalman_Filter_Input_Free.svg)
+![KF flowchart](figures/Kalman_Filter_Input_Free.svg)
 
 ### KF tuned values
 
@@ -218,7 +218,7 @@ Joseph form for symmetric-PD stability at the tuned q values.
 The stack consists of five nodes across two packages, plus the CARLA
 bridge and two debug/BEV visualisation nodes.
 
-![ROS 2 node graph](ADAS_ROS2_Stack_Graph.svg)
+![ROS 2 node graph](figures/ADAS_ROS2_Stack_Graph.svg)
 
 ### Command topics (bridge boundary)
 
@@ -259,7 +259,7 @@ The Tk-based UI (`UI.py`) is the recommended entry point for driving
 the stack — it handles the launch order and parameter passing that
 otherwise has to be done by hand.
 
-![UI running on CARLA](Screenshot%20from%202026-07-30%2014-08-02.png)
+![UI running on CARLA](figures/Screenshot%20from%202026-07-30%2014-08-02.png)
 
 ![UI running on MORAI](docs/ui_morai.png)
 

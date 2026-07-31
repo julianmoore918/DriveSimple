@@ -43,6 +43,11 @@ try:
 except ImportError as e:
     CAMERA_AVAILABLE = False
     _camera_err = str(e)
+    # Placeholder base class so `class TelemetryView(Node)` below doesn't
+    # NameError at import time. Safe: TelemetryView is only ever
+    # instantiated from _start_camera_view, which already checks
+    # CAMERA_AVAILABLE first and returns before reaching that line.
+    Node = object
 
 
 # --------------------------------------------------------------------------
