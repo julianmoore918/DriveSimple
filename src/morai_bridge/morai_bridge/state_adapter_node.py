@@ -40,7 +40,15 @@ forwarding an obviously-impossible value downstream. See DEBUG.md.
 
 Subscribed:
     <vehicleinfo_topic>  (morai_v2_1_ros2_msgs/msg/VehicleInfo),
-                         default /Car_1/vehicleinfo
+                         default /Ego/vehicleinfo -- MUST match the
+                         "Topic" field on the GroundTruth entity's
+                         ROS2 Interface in MORAI Studio exactly (an
+                         arbitrary, freely-renameable string with no
+                         connection to the vehicle's internal `id`
+                         field inside the message, or to any other
+                         topic's naming convention). If GT speed goes
+                         silent after touching that panel, check here
+                         first before assuming a sensor bug.
 
 Published:
     <speed_topic>  (example_interfaces/msg/Float64), default
@@ -64,7 +72,7 @@ class MoraiStateAdapter(Node):
     def __init__(self):
         super().__init__('Morai_State_Adapter')
 
-        self.declare_parameter('vehicleinfo_topic', '/Car_1/vehicleinfo')
+        self.declare_parameter('vehicleinfo_topic', '/Ego/vehicleinfo')
         self.declare_parameter('speed_topic', '/Car_1/vehicle/speed')
         vehicleinfo_topic = self.get_parameter('vehicleinfo_topic').value
         speed_topic = self.get_parameter('speed_topic').value
