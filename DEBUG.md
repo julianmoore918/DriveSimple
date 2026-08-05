@@ -3315,3 +3315,166 @@ and MORAI's own RTF/System-FPS readout side by side. Nothing in this
 session isolated a single cause; it only ruled out GPU/CPU compute and
 `inference_skip_n` as the explanation.
 
+
+---
+
+## 42. Cruise mode was P-only — set speed never reached, looked like a fallback to 25 km/h [FIXED]
+
+**Symptom.** Driving a scenario at 30 km/h, the VUT held 30 km/h through
+the scripted approach and then, the moment ACC took over, settled at
+**25.5 km/h** and stayed there. The obvious reading was that
+`/ACC/target_speed` had not been received and the node had fallen back
+to its `CRUISE_SPEED_KMH = 25.0` default.
+
+**That reading was wrong.** The same scenario at other speeds settled at
+44.8 km/h (setpoint 50) and 125.5 km/h (setpoint 130) — nowhere near 25.
+Every setpoint undershot by a near-constant 4.3–5.0 km/h. 30 km/h just
+happens to land on 25.
+
+**Cause.** `cruise_control()` was proportional-only *with a ±0.5 m/s
+deadband*:
+
+```python
+if speed_error > 0.5:   throttle = min(speed_error * 0.3, cap)
+elif speed_error < -0.5: brake    = min(-speed_error * 0.3, 0.6)
+else:                    throttle = brake = 0.0
+```
+
+Holding a speed requires a steady non-zero throttle to balance drag, and
+the deadband commands exactly zero there — so the loop could not hold any
+setpoint. It coasted until the error left the deadband, then settled
+wherever `0.3 * error` happened to equal drag. That puts steady state a
+fixed distance *below* setpoint, and the distance is exactly
+`throttle / cruise_gain`:
+
+| setpoint | steady throttle | predicted droop | predicted v | measured v |
+|---|---|---|---|---|
+| 30  | 0.413 | 4.95 km/h | 25.05 | **24.77** |
+| 50  | 0.414 | 4.97 km/h | 45.03 | **44.82** |
+| 130 | 0.359 | 4.31 km/h | 125.69 | **125.51** |
+
+Prediction matches measurement within 0.3 km/h at all three speeds.
+
+**Fix.** `cruise_control()` is now PI (`cruise_ki = 0.2`,
+`cruise_i_limit = 5.0`, so the integrator's authority tops out at full
+throttle). The throttle-side deadband is gone — it was the thing making
+steady-state tracking impossible. A small deadband remains on the brake
+side only, to stop the brake chattering against the throttle on a few
+cm/s of overshoot.
+
+Three things were load-bearing and are easy to get wrong if this is ever
+revisited:
+
+1. **`cruise_control(integrate=False)` from the ACC branch.** MODE 4
+   calls cruise every tick purely to take
+   `min(acc_throttle, cruise_throttle)` / `max(acc_brake, cruise_brake)`
+   as a set-speed cap. During an ACC braking event `v_ego` falls far
+   below set speed, so an integrator running there would wind up to full
+   throttle and slam it on the instant ACC released authority. Only the
+   CRUISE branch integrates.
+2. **Integral reset in GATE / STANDSTILL / EMERGENCY**, so cruise never
+   resumes with stale windup from a period when it was not driving.
+3. **`CRUISE_SPEED_KMH: 25.0 → 20.0`.** The 25.0 existed *solely* to
+   offset the droop this fix removes — the comment above it said as much
+   ("If an integral term is added to `_cruise_control()` later, this can
+   be reduced back to 20"). Leaving it at 25.0 would have converted a
+   compensating offset into a real +5 km/h and broken the declared 20 km/h
+   ODD. Effective on-road behaviour is unchanged.
+
+The old law is kept as `_legacy_cruise_control()` for reference.
+
+**Verified.** Scenario run at 50 km/h now holds 48.8–49.7 km/h through
+the whole approach instead of drooping to ~45.
+
+**Related.** The same `min`/`max` combination in MODE 4 is what stops the
+PD law accelerating into a stationary target when its distance term
+saturates to `a_max` — see §43.
+
+---
+
+## 43. UN R171 Annex 4 §4.2.5.2.1 scenario harness, and what it found [DONE]
+
+`scenarios/r171_stationary_target.py` + `scenarios/sim_adapter.py` drive
+the stack against a stationary target on a straight road (see
+`scenarios/README.md` for usage). The harness replaces
+`carlaaccsim/carlaAccSimTown.py` for the duration of a run — it is itself
+the CARLA↔ROS bridge, because it has to gate who owns the longitudinal
+channel: the scenario holds the approach speed open-loop until the DCAS
+trigger point at `gap = ttc * v`, then the stack's ACC takes over.
+
+**Town03 spawn 5 cannot host this test.** It sits 2 m from a junction —
+0 m of straight runway — and no Town03 spawn exceeds ~116 m. The matrix
+needs up to 469 m (130 km/h at a 10 s TTC margin). Measured straight
+runway, walking each lane forward until it deviates 1 m from the start
+heading: **Town06 spawn 80 gives 718 m** (road 48, centre lane of five,
+3.5 m wide, neighbour lanes both sides so UFLD has markings on both
+edges). Town06/Town07 added to `UI.py`'s `TOWNS`.
+
+**Headline KPI** is `a_req = v²/(2·gap)` — the constant deceleration
+needed to stop in the remaining gap — compared against 5 m/s². At the
+trigger point this reduces to `v/(2·ttc)`, so the scenario's own
+difficulty is set purely by its parameters; every metre the system spends
+not braking after that drives it up.
+
+### What it found
+
+**The PD law's brake onset is a fixed distance schedule, not a TTC one.**
+With `a = k_p(d − d_desired) + k_d·ḋ` and a stationary target (`ḋ = −v`),
+the ACC first commands `a ≤ 0` at
+
+```
+d_brake = d0 + (T_gap + k_d/k_p)·v
+```
+
+so the deceleration it implies grows linearly with speed. Measured runs
+tracked the prediction closely (30 km/h → pass at 2.4–3.1 m/s²;
+50 km/h → 5.8–6.6 m/s², over the limit).
+
+**Perception range is the binding constraint, not the gains.** Measured
+first-detection gap: ~25 m at 30 km/h, ~19 m at 50, ~12 m at 130. Once
+`d_brake` exceeds that range, raising `T_gap`/`k_d` changes nothing — the
+controller cannot brake for a target it has not been told about. Modelled
+against measured detection, four different gain sets give *identical*
+results at 70 km/h and above. The ceiling is `v_max = sqrt(2·a·D)`: at
+D ≈ 15–20 m, even full tyre grip (9 m/s²) caps avoidance near 60 km/h.
+
+**`d0: 3.0 → 7.0` stopped the collisions at 50 km/h.** It moves
+`d_brake` from 16.4 m to 20.4 m, past the ~20 m detection range, so the
+PD law wants to brake as soon as YOLO reports. 50 km/h went from
+`fail_collision` to `pass_over_limit` (stopped with 2.12 m to spare).
+
+**A dropped detection makes CRUISE accelerate into the target.**
+`lead_distance_callback` sets `d_lead = None` on a single `inf`, and
+MODE 2 (CRUISE) is tested *before* MODE 3 (EMERGENCY) and MODE 4 (ACC) —
+so during a dropout neither `emergency_distance` nor the PD law is
+reachable, and cruise opens the throttle toward set speed. In one 50 km/h
+run 103 of 140 measure-phase samples had no detection; mean throttle was
+0.364 while blind versus 0.102 while tracking. Candidate fix is a coast
+timeout (hold the last filtered value for ~0.5 s before declaring the
+lead gone) — **not yet applied**.
+
+**Why detection drops at close range** (code reading, not yet measured):
+`estimateLeadDist` rejects rather than misses. Two gates fail specifically
+when close — the side-pass guard `clipped_left ^ clipped_right`, which
+assumes a genuine lead is never clipped on exactly one side (false as soon
+as the bbox is large and the lead is laterally offset), and the
+`in_lane is None → continue` branch, whose fallback is explicitly
+disabled "for the diagnostic test". A lead at close range occludes the
+lane markings it sits on, so UFLD loses the centerline exactly there.
+
+**Do not cap ACC braking authority yet.** Capping at 5 m/s² is the
+obvious way to satisfy the limit, but the geometry says it would cause a
+crash. To stop at 5 m/s² *and* leave the `d0 = 7 m` standstill gap,
+braking must begin at `v²/10 + d0`:
+
+| v | braking must start by | measured detection | headroom |
+|---|---|---|---|
+| 30 km/h | 13.9 m | 17.7 m | **+3.7 m** |
+| 50 km/h | 26.3 m | 20.0 m | **−6.3 m** |
+
+At 50 km/h the last run needed 9.74 m/s² to stop in the room it had and
+delivered 9.32. Capping it at 5 would have put it into the target. The
+5 m/s² limit is reachable at 30 km/h and **not** reachable at 50 km/h
+until detection range improves. Order of work is therefore: extend
+perception range first, then start braking at first detection, and only
+then bound the authority.

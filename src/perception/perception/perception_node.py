@@ -36,7 +36,7 @@ from ament_index_python.packages import get_package_share_directory
 # is empty (UFLD warm-up or the bridge has paused inference inside a
 # junction zone).
 USE_LANE_ROI        = True
-MIN_CONFIDENCE      = 0.8     # detections below this are ignored.
+MIN_CONFIDENCE      = 0.5     # detections below this are ignored.
 # Was 0.1 — far too permissive: weak YOLO boxes on buildings / poles /
 # foliage at ~0.3-0.5 confidence were slipping through the lane-ROI
 # filter (when the UFLD polylines either didn't reach the false bb's
@@ -55,6 +55,41 @@ ENABLE_LOGGING      = True  # set True to enable terminal output
 # camera-mount geometry, not from per-class real-world height — so we
 # only need a *set* of vehicle classes to filter on. See DEBUG §22.
 VEHICLE_CLASSES     = {'car', 'truck', 'bus', 'motorcycle'}
+# Half-width [m] of the ego-lane corridor used ONLY as a fallback, when
+# the measured UFLD centerline does not reach the detection's forward
+# distance (see estimateLeadDist). Ground-space, so range-independent.
+#
+# Sized against the two cases it has to separate on a 3.5 m lane:
+#   ego-lane lead, offset up to 1.0 m  -> footprint spans ~[-1.9, +1.9]
+#                                         at worst, overlaps the corridor
+#   adjacent-lane car (centre 3.5 m)   -> footprint spans ~[2.6, 4.4]
+# 1.5 m accepts the first and leaves ~1.1 m of margin before the second
+# leaks in, which also absorbs the IPM's lateral error growth with range.
+# Tighten if adjacent-lane cars start triggering ACC at distance.
+LANE_FALLBACK_HALF_W = 1.5
+# Maximum forward distance [m] at which the IPM range estimate is
+# trustworthy enough to publish.
+#
+# IPM projects the bb-bottom pixel onto the road plane, so range error
+# grows roughly with range^2 — near the horizon one pixel is worth many
+# metres. Measured against CARLA ground truth over the scenario traces:
+#
+#     gt 0-30 m   err +0.5 .. +3.1 m   (~10%)   usable
+#     gt 30-40 m  err +6.8 m           ( 20%)   marginal
+#     gt 40-80 m  err +16.7 .. +29.2 m (~38%)   unusable
+#
+# Beyond ~40 m the number is not a distance, it is a guess: one 70 km/h
+# run reported 121 m for a true 76 m gap, and consecutive frames swung by
+# 30+ m. That noise flips the sign of the controller's closing-rate
+# estimate, which drops the kinematic braking latch and sets off a
+# throttle/brake limit cycle — the "brakes far too early, then
+# re-accelerates" behaviour. Publishing a detection we cannot range is
+# worse than not publishing it.
+#
+# This caps ACC's usable range, and with it the top speed at which the
+# 5 m/s^2 limit can be met (~70 km/h). Raising it requires a better range
+# estimate, not a bigger constant here. See DEBUG §43.
+MAX_IPM_TRUST_M = 40.0
 # Lower-bound clamp on the published distance. IPM saturates at small
 # gaps (bb-bottom clips at frame edge → distance can come out near 0
 # or negative). We clamp at 0.1 m so the value is still positive (the
@@ -487,29 +522,60 @@ class YoloDetection(Node):
                 # bb-bottom at or above horizon — can't ground-project.
                 continue
 
+            # Range trust gate. The detection may well be real, but past
+            # MAX_IPM_TRUST_M the IPM cannot say how far away it is to
+            # better than ~38%, and a distance that wrong is worse for the
+            # controller than no distance at all. Applied before the lane
+            # gates because it is a property of the range estimate itself,
+            # not of where the object sits.
+            if left_g[0] > MAX_IPM_TRUST_M:
+                continue
+
             if USE_LANE_ROI:
                 in_lane = self._bb_intersects_centerline(left_g, right_g)
                 if in_lane is False:
                     continue
-                if in_lane is None and self.simulator != 'morai':
-                    # FALLBACK DISABLED for the diagnostic test (CARLA
-                    # only). The gate is strictly BEV-centerline-
-                    # intersects-bb-ground: anything we can't evaluate
-                    # (no centerline at this X) is dropped. If passing
-                    # cars still trigger emergency brake under this,
-                    # the BEV test itself is the source of false
-                    # positives (not the fallback). Original branch:
-                    #   if not self._in_junction: continue
-                    #   if abs(box_center_x - img_center_x) > w * 0.05:
-                    #       continue
-                    continue
-                # MORAI: UFLD frequently has one polyline rejected
-                # (e.g. unmarked shoulder), leaving no centerline
-                # overlap even with a real lead dead ahead. Rather than
-                # blindly dropping every detection in that case, fall
-                # through to the already-applied keep-zone gate above
-                # (lines ~450-467) instead of requiring the centerline
-                # too — still rejects a definite in_lane=False.
+                if in_lane is None:
+                    # `None` means "couldn't evaluate", NOT "out of lane":
+                    # _centerline_at returns None past the shorter UFLD
+                    # polyline's tip, which is precisely the far-range
+                    # region where ACC needs the detection most. Dropping
+                    # it outright (the previous diagnostic behaviour)
+                    # capped effective detection at ~17-23 m and is the
+                    # single biggest limit on this stack's stopping
+                    # distance — see DEBUG §43.
+                    #
+                    # Fall back to the ego-lane corridor in GROUND space
+                    # rather than the old image-space centre strip. Both
+                    # bb-bottom corners are already IPM-projected here, so
+                    # the test costs nothing, and a corridor expressed in
+                    # metres is range-independent — an image-space strip
+                    # is not. At 40 m an adjacent-lane car sits only ~56 px
+                    # off centre in a 1280 px frame, so any fixed pixel
+                    # strip either rejects real leads up close or admits
+                    # the neighbouring lane far away. In metres the two
+                    # cases stay separated at every range.
+                    #
+                    # This is deliberately NOT the earlier extrapolated-
+                    # centerline variant that was reverted (see
+                    # _centerline_at): nothing here extrapolates UFLD, so
+                    # no per-polyline drift is inherited. The corridor is
+                    # fixed at Y=0 and only used when the measured
+                    # centerline is unavailable.
+                    y_lo, y_hi = sorted((left_g[1], right_g[1]))
+                    if (y_lo > LANE_FALLBACK_HALF_W
+                            or y_hi < -LANE_FALLBACK_HALF_W):
+                        continue
+                # The corridor fallback above now serves both simulators.
+                # MORAI reaches it constantly for a different reason —
+                # UFLD frequently has one polyline rejected there (e.g. an
+                # unmarked shoulder), so the centerline is missing even
+                # with a real lead dead ahead. It previously fell through
+                # to the keep-zone gate alone, i.e. accepted anything the
+                # image-space trapezoid allowed. The ground corridor is
+                # strictly more principled than that, so both paths now
+                # share it. NOTE: this is a behaviour change on the MORAI
+                # side that has not been validated live.
             elif abs(box_center_x - img_center_x) > w * 0.2:
                 continue
 

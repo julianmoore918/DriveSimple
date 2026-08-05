@@ -28,3 +28,5 @@ src/perception/models/UFLD_F1=0.87.pth:Zone.Identifier
 src/perception/models/UFLD_F1=0.67.pth:Zone.Identifier
 .gitignore
 src/perception/models/RLD_best.pth:Zone.Identifier
+
+scenarios/results

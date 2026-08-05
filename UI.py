@@ -82,6 +82,13 @@ CARLA_INI     = Path('/home/sirius/CARLA_0.9.16/CarlaUE4/Config/DefaultEngine.in
 CARLA_PYTHON  = Path('/home/sirius/CARLA_0.9.16/carla-env/bin/python3')
 BRIDGE_DIR    = Path('/home/sirius/workspace/carlaaccsim')
 BRIDGE_SCRIPT = BRIDGE_DIR / 'carlaAccSimTown.py'
+# Scenario harness. Note this is an ALTERNATIVE to BRIDGE_SCRIPT, not an
+# addition: it is itself the CARLA<->ROS bridge for the duration of a run,
+# because it has to gate who owns the longitudinal channel (the scenario
+# before the DCAS trigger point, the stack's ACC after). Running both at
+# once means two writers on /Car_1/cmd_vel and the ego's apply_control.
+SCENARIO_DIR    = ADAS_WK / 'scenarios'
+SCENARIO_SCRIPT = SCENARIO_DIR / 'r171_stationary_target.py'
 START_ADAS_SH  = ADAS_WK / 'start_adas.sh'
 ROS_SETUP     = '/opt/ros/humble/setup.bash'
 
@@ -129,10 +136,15 @@ CAMERA_W      = 960
 CAMERA_H      = 540
 
 TOWNS = [
-    'Town01', 'Town02', 'Town03', 'Town04', 'Town05',
+    'Town01', 'Town02', 'Town03', 'Town04', 'Town05', 'Town06', 'Town07',
     'Town10HD_Opt', 'Town01_Opt', 'Town02_Opt', 'Town03_Opt',
-    'Town04_Opt', 'Town05_Opt', 'Town10HD',
+    'Town04_Opt', 'Town05_Opt', 'Town06_Opt', 'Town07_Opt', 'Town10HD',
 ]
+# Town06 carries the longest dead-straight road in the stock map set —
+# spawn 80 (road 48, centre lane of 5) gives 718 m before the lane
+# deviates, vs ~116 m for the best Town03 spawn. That runway is what
+# makes the UN R171 Annex 4 §4.2.5.2.1 matrix runnable at 130 km/h with
+# a 10 s TTC margin (needs 469 m). See scenarios/r171_stationary_target.py.
 
 WEATHER_PRESETS = [
     'ClearNoon', 'CloudyNoon', 'WetNoon', 'WetCloudyNoon',
@@ -417,6 +429,9 @@ class ADASUI:
         # Long-lived child processes.
         self.carla_proc: subprocess.Popen | None = None
         self.bridge_proc: subprocess.Popen | None = None
+        # Scenario harness. Mutually exclusive with bridge_proc — it is
+        # itself the CARLA<->ROS bridge while a scenario runs.
+        self.scenario_proc: subprocess.Popen | None = None
         self.stack_proc: subprocess.Popen | None = None         # start_adas.sh
         self.foxglove_proc: subprocess.Popen | None = None      # foxglove_bridge
         self.acc_procs: list[subprocess.Popen] = []             # when toggled independently
@@ -794,9 +809,18 @@ class ADASUI:
         # can see the BEV simultaneously with whichever camera source is
         # selected. Native IPM is 320×480, rendered here at BEV_W × BEV_H
         # with aspect preserved (see _render_bev_frame).
-        self._bev_frame = ttk.LabelFrame(outer, text='BEV — /ADAS/ipm/debug_image',
+        # Column 2 holds the BEV on top and the scenario controls beneath
+        # it. The BEV gets the row weight so it keeps absorbing spare
+        # vertical space; the scenario panel takes its natural height.
+        rightcol = ttk.Frame(outer)
+        rightcol.grid(row=0, column=2, sticky='ns', padx=(8, 0))
+        rightcol.rowconfigure(0, weight=1)
+        rightcol.columnconfigure(0, weight=1)
+
+        self._bev_frame = ttk.LabelFrame(rightcol,
+                                         text='BEV — /ADAS/ipm/debug_image',
                                          padding=4)
-        self._bev_frame.grid(row=0, column=2, sticky='ns', padx=(8, 0))
+        self._bev_frame.grid(row=0, column=0, sticky='ns')
         self._bev_placeholder_photo = tk.PhotoImage(width=BEV_W, height=BEV_H)
         bev_placeholder = ('waiting for IPM frame…'
                            if CAMERA_AVAILABLE
@@ -808,6 +832,84 @@ class ADASUI:
                                   compound='center')
         self.bev_label.image = self._bev_placeholder_photo
         self.bev_label.grid(row=0, column=0, sticky='ns')
+
+        # ── Scenario harness (UN R171 Annex 4 §4.2.5.2.1) ────────────────
+        # Drives the stack against a stationary target on a straight road.
+        # Starts scenarios/r171_stationary_target.py, which acts as the
+        # CARLA<->ROS bridge for the run — so Start Bridge has to be
+        # stopped first (_start_scenario does that automatically).
+        # Lives under the BEV rather than in the left column: that column
+        # is already full to the window's height, and a ninth LabelFrame
+        # there collided with Features.
+        scen = ttk.LabelFrame(rightcol, text='Scenario — UN R171 stationary '
+                                             'target', padding=6)
+        scen.grid(row=1, column=0, sticky='new', pady=(8, 0))
+        scen.columnconfigure(1, weight=1)
+
+        ttk.Label(scen, text='Approach speed:').grid(
+            row=0, column=0, sticky='w', pady=2)
+        self.scen_speed_var = tk.StringVar(value='50')
+        ttk.Combobox(scen, textvariable=self.scen_speed_var,
+                     values=['30', '50', '70', '90', '110', '130'],
+                     width=7).grid(row=0, column=1, sticky='ew', pady=2)
+        ttk.Label(scen, text='km/h').grid(row=0, column=2, sticky='w',
+                                          padx=(4, 0))
+
+        ttk.Label(scen, text='Lateral offset:').grid(
+            row=1, column=0, sticky='w', pady=2)
+        self.scen_offset_var = tk.StringVar(value='0.0')
+        ttk.Combobox(scen, textvariable=self.scen_offset_var,
+                     values=['0.0', '0.5', '1.0'],
+                     width=7).grid(row=1, column=1, sticky='ew', pady=2)
+        ttk.Label(scen, text='m').grid(row=1, column=2, sticky='w',
+                                       padx=(4, 0))
+
+        # TTC margin sets the handover distance: the scenario holds the
+        # approach speed open-loop until gap == ttc * v, then the stack's
+        # ACC owns throttle/brake. 4.5 s at 50 km/h = 62.5 m.
+        ttk.Label(scen, text='TTC margin:').grid(
+            row=2, column=0, sticky='w', pady=2)
+        self.scen_ttc_var = tk.StringVar(value='6.0')
+        ttk.Combobox(scen, textvariable=self.scen_ttc_var,
+                     values=['4.5', '6.0', '10.0'],
+                     width=7).grid(row=2, column=1, sticky='ew', pady=2)
+        ttk.Label(scen, text='s').grid(row=2, column=2, sticky='w',
+                                       padx=(4, 0))
+
+        # locked = the scenario holds the lane centreline, isolating the
+        # longitudinal result. lkas = Stanley owns steer via /Car_1/cmd_steer.
+        ttk.Label(scen, text='Lateral mode:').grid(
+            row=3, column=0, sticky='w', pady=2)
+        self.scen_lateral_var = tk.StringVar(value='locked')
+        ttk.Combobox(scen, textvariable=self.scen_lateral_var,
+                     values=['locked', 'lkas'], state='readonly',
+                     width=7).grid(row=3, column=1, sticky='ew', pady=2)
+
+        self.scen_spawn_note = ttk.Label(
+            scen, text='Town06 spawn 80 — 718 m straight',
+            foreground='#666666')
+        self.scen_spawn_note.grid(row=4, column=0, columnspan=3,
+                                  sticky='w', pady=(4, 4))
+
+        ttk.Button(scen, text='Run single point',
+                   command=self.start_scenario_single).grid(
+            row=5, column=0, columnspan=3, sticky='ew', pady=2)
+        matrix_frame = ttk.Frame(scen)
+        matrix_frame.grid(row=6, column=0, columnspan=3, sticky='ew', pady=2)
+        for col in (0, 1, 2):
+            matrix_frame.columnconfigure(col, weight=1)
+        ttk.Button(matrix_frame, text='Matrix 30',
+                   command=lambda: self.start_scenario_matrix(None)).grid(
+            row=0, column=0, sticky='ew')
+        ttk.Button(matrix_frame, text='Block A',
+                   command=lambda: self.start_scenario_matrix('A')).grid(
+            row=0, column=1, sticky='ew', padx=(4, 0))
+        ttk.Button(matrix_frame, text='Block B',
+                   command=lambda: self.start_scenario_matrix('B')).grid(
+            row=0, column=2, sticky='ew', padx=(4, 0))
+        ttk.Button(scen, text='Stop scenario',
+                   command=self.stop_scenario).grid(
+            row=7, column=0, columnspan=3, sticky='ew', pady=2)
 
     # --------------------------------------------------------------------
     # Logging
@@ -1270,6 +1372,64 @@ class ADASUI:
         self.bridge_proc = None
 
     # --------------------------------------------------------------------
+    # Scenario harness (scenarios/r171_stationary_target.py)
+    # --------------------------------------------------------------------
+    def start_scenario_single(self):
+        """One scenario point from the three spinners."""
+        try:
+            speed = float(self.scen_speed_var.get())
+            offset = float(self.scen_offset_var.get())
+            ttc = float(self.scen_ttc_var.get())
+        except ValueError:
+            self._log('[ui] scenario: speed / offset / TTC must be numbers')
+            self.status_var.set('Scenario: invalid parameters')
+            return
+        self._start_scenario(
+            ['--speed-kmh', str(speed),
+             '--offset-m', str(offset),
+             '--ttc-s', str(ttc)],
+            f'{speed:g} km/h, offset {offset:g} m, TTC {ttc:g} s '
+            f'(handover at {ttc * speed / 3.6:.0f} m)')
+
+    def start_scenario_matrix(self, block=None):
+        """Block A (18), Block B (12), or the full 30-point matrix."""
+        extra = ['--matrix']
+        if block:
+            extra += ['--block', block]
+        label = f'Block {block}' if block else 'full 30-point matrix'
+        self._start_scenario(extra, label)
+
+    def _start_scenario(self, extra_args, label):
+        if self.scenario_proc and self.scenario_proc.poll() is None:
+            self._log('[ui] scenario already running — Stop scenario first')
+            return
+        # The harness IS the bridge for the duration of a run. Leaving
+        # carlaAccSimTown.py up would put two writers on /Car_1/cmd_vel and
+        # on the ego's apply_control; the harness refuses to start in that
+        # case, so stop it here rather than surfacing a confusing error.
+        if self.bridge_proc and self.bridge_proc.poll() is None:
+            self._log('[ui] stopping Bridge — the scenario harness replaces '
+                      'it for the duration of the run')
+            self.stop_bridge()
+            time.sleep(1.0)
+
+        cmd = [str(CARLA_PYTHON), str(SCENARIO_SCRIPT),
+               '--lateral-mode', self.scen_lateral_var.get()]
+        cmd += extra_args
+        self._log(f'$ (source ROS && cd {SCENARIO_DIR} && {" ".join(cmd)})')
+        # source_workspace=True: unlike the bridge, the harness imports the
+        # workspace's message types for the topics it publishes.
+        self.scenario_proc = self._popen(
+            cmd, cwd=str(SCENARIO_DIR),
+            source_ros=True, source_workspace=True, prefix='scenario')
+        self.status_var.set(f'Scenario running — {label}')
+
+    def stop_scenario(self):
+        self._terminate(self.scenario_proc, 'Scenario')
+        self.scenario_proc = None
+        self.status_var.set('Scenario stopped')
+
+    # --------------------------------------------------------------------
     # MORAI bridge (morai_bridge: state_adapter_node + control_adapter_node)
     # --------------------------------------------------------------------
     @staticmethod
@@ -1589,6 +1749,9 @@ def main():
         app._terminate(app.npc_spawn_proc, 'NPC spawner')
         app.npc_spawn_proc = None
         app.stop_stack()
+        # Before the bridge: a running scenario owns the ego's control and
+        # holds actors it destroys on its own shutdown path.
+        app.stop_scenario()
         app.stop_bridge()
         app.stop_carla()
         app.stop_foxglove()
