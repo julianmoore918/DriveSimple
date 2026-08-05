@@ -200,12 +200,17 @@ class LaneDetectionNode(Node):
             DEFAULT_CAM_X_OFFSET_MORAI if simulator == 'morai' else DEFAULT_CAM_X_OFFSET)
 
         # Run UFLD on every Nth camera frame. CARLA publishes at ~20 Hz;
-        # N=4 gives ~5 Hz inference, plenty at the 20 km/h target. MORAI's
-        # camera rate has been inconsistent and often well under 20 Hz in
-        # testing, so skipping 3/4 frames on top of an already-sparse feed
-        # starves UFLD further -- process every frame instead. GPU headroom
-        # isn't the bottleneck at these input rates.
-        self.declare_parameter('inference_skip_n', 1 if simulator == 'morai' else 4)
+        # N=4 gives ~5 Hz inference, plenty at the 20 km/h target. MORAI
+        # was set to N=1 (every frame) because its camera rate used to be
+        # inconsistent/sparse under Variable-timestep mode, and skipping
+        # frames on top of an already-sparse feed starved UFLD further.
+        # Switching MORAI to Fixed 20fps timestep fixed the sparse-camera
+        # problem but made N=1 run UFLD at a genuine sustained ~20 Hz,
+        # competing with YOLO + MORAI's own Epic-quality rendering for the
+        # same GPU -- observed RTF sagging to ~0.56. N=2 halves UFLD's
+        # load; trade-off is coarser Kalman tracking between updates,
+        # not usually noticeable at typical driving speeds.
+        self.declare_parameter('inference_skip_n', 2 if simulator == 'morai' else 4)
         self.declare_parameter('enable_kalman', True)
 
         ufld_repo   = self.get_parameter('ufld_repo').value
@@ -450,6 +455,18 @@ class LaneDetectionNode(Node):
     # Every N frames, print a "steady <REASON>" line even if the reason
     # hasn't changed, so a stall isn't invisible in the log.
     KF_LOG_EVERY = 40
+    # If the chi-square gate rejects this many *consecutive* measurements
+    # (n_rejected resets on any accepted one -- see lane_kalman.py), the
+    # filter's own state has diverged from reality, not the detector: a
+    # sustained REJ streak means genuinely good UFLD detections are being
+    # thrown out for disagreeing with an increasingly-wrong prediction,
+    # with no coast/RST path to recover since REJ != missing/weak data.
+    # Force a reset so the next good measurement re-seeds the filter from
+    # scratch instead of being rejected forever. Same order of magnitude
+    # as KF_MAX_COAST_TICKS (~4 s at 5 Hz). Found via n_rej=1665 stuck on
+    # MORAI's right lane while UFLD's raw detections tracked the road
+    # fine the whole time -- see DEBUG.md.
+    KF_MAX_REJECT_TICKS = 20
 
     def _kf_smooth(self, kf, veh_points, conf, dt, side: str = ''):
         """Fit → step → resample. Returns empty (== HOLD signal
@@ -494,7 +511,12 @@ class LaneDetectionNode(Node):
         kf.step(z, R=cov, dt=dt)
         # If n_rejected went up, the χ² gate ate this measurement.
         if kf.n_rejected > n_rej_before:
-            self._kf_log(side, 'REJ', kf)
+            reason = 'REJ'
+            if kf.n_rejected >= self.KF_MAX_REJECT_TICKS:
+                kf.initialized = False
+                kf.n_rejected = 0
+                reason += ' RST'
+            self._kf_log(side, reason, kf)
             return []
         self._kf_log(side, 'OK', kf)
         return self._sample_kf(kf, veh_points)

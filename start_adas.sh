@@ -13,14 +13,25 @@
 
 # ── Check argument ──────────────────────────────────────
 if [ "$1" != "carla" ] && [ "$1" != "morai" ]; then
-    echo "Usage: ./start_adas.sh [carla|morai]"
+    echo "Usage: ./start_adas.sh [carla|morai] [dry_run]"
     echo "  Note: LKAS nodes are CARLA-tuned. In morai mode they still launch"
     echo "        but lane detection / Stanley behaviour has not been validated."
+    echo "  dry_run: MORAI only. ACC/LKAS still compute and publish"
+    echo "           cmd_vel/cmd_steer normally, but control_adapter_node"
+    echo "           never sends them to the vehicle -- drive by hand in"
+    echo "           MORAI and watch ACC/LKAS output for validation."
     exit 1
 fi
 
 SIMULATOR=$1
+DRY_RUN=false
+if [ "$2" = "dry_run" ]; then
+    DRY_RUN=true
+fi
 echo "[INFO] Starting ADAS stack for: $SIMULATOR"
+if [ "$DRY_RUN" = true ]; then
+    echo "[INFO] DRY RUN -- no commands will be sent to the vehicle"
+fi
 
 # ── Source ROS 2 & workspace ────────────────────────────
 source /opt/ros/humble/setup.bash
@@ -76,7 +87,7 @@ if [ "$SIMULATOR" = "morai" ]; then
         STATE_ADAPTER_PID=$!
         echo "[INFO] MORAI state adapter started (PID $STATE_ADAPTER_PID)"
 
-        ros2 run morai_bridge control_adapter_node &
+        ros2 run morai_bridge control_adapter_node --ros-args -p dry_run:=$DRY_RUN &
         CONTROL_ADAPTER_PID=$!
         echo "[INFO] MORAI control adapter started (PID $CONTROL_ADAPTER_PID)"
     fi

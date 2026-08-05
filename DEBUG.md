@@ -60,6 +60,7 @@ thesis Objective / Methods / Results structure:
 - [§12](#12-ego-still-stalls-at-full-acc-throttle--bridge-jpeg-encoder-starves-the-ros-executor-at-1920×1080-fixed-with-caveat) JPEG encoder starves the ROS executor at 1920×1080
 - [§17](#17-synchronous-mode-ui-control-removed-done) Synchronous-mode UI control removed
 - [§14](#14-bonnet-flicker-is-worse-in-town10hd-than-town03-known-mitigation-only) Bonnet flicker worse in Town10HD than Town03
+- [§33](#33-carla-side-hardening-session-2026-07-21-done) CARLA-side hardening session — inference-rate sweep, UI camera QoS, sync-mode regression, cruise setpoint, model-ready race, speed-topic mismatch
 
 ### Chapter 2 — Perception
 - [§2](#2-no-on-screen-indication-that-acc--lkas-are-running-fixed) On-screen indication that ACC / LKAS are running
@@ -71,6 +72,9 @@ thesis Objective / Methods / Results structure:
 - [§21](#21-adas-stack-near-cpu-capacity--ufld-diagnosis--rate-limit-fixed-with-planned-follow-up) ADAS stack near CPU capacity — UFLD diagnosis & rate limit
 - [§22](#22-lead-distance-pinhole--ipm-and-semantics--bumper-to-bumper-gap-fixed) Lead distance: pinhole → IPM and semantics → bumper-to-bumper gap
 - [§23](#23-anchor-based-loop-route-for-lead--pp-fallback-done) Anchor-based loop route for lead + PP fallback
+- [§34](#34-morai-specific-yolo-fine-tune-dataset-pipeline--labelimg-pyqt5-crashes-done) MORAI-specific YOLO fine-tune: dataset pipeline + labelImg PyQt5 crashes
+- [§35](#35-best_moraipt-showed-no-bounding-box-in-the-live-ui--three-unrelated-causes-not-the-model-fixed--mixed) `best_MORAI.pt` showed no bounding box — three unrelated causes, not the model
+- [§40](#40-lane-kf-stuck-in-rejection-lockup--χ²-gate-had-no-escape-path-fixed) Lane KF stuck-in-rejection lockup — χ² gate had no escape path
 
 ### Chapter 3 — Control
 - [§30](#30-morai-brake-leaves-the-vehicle-stuck--cruise-mode-coasts-instead-of-braking-on-morai-fixed) MORAI brake leaves the vehicle stuck — cruise mode coasts instead of braking
@@ -96,6 +100,11 @@ thesis Objective / Methods / Results structure:
 - [§27](#27-second-new-machine-move--cuda-13-default-wheel--colconsetuptoolspackaging-conflict-fixed) Second new-machine move (dependency setup gotchas)
 - [§29](#29-morais-imu-never-populates-linear-velocity--switched-speed-source-to-groundtruth-vehicleinfo-fixed) MORAI's IMU never populates linear velocity — switched to GroundTruth VehicleInfo
 - [§32](#32-morais-groundtruth-vehicleinfo-local_velocity-is-frozen-not-live--29s-caveat-confirmed-known-unresolved) MORAI's GroundTruth VehicleInfo local_velocity is frozen, not live
+- [§36](#36-new-machine-move-pc-acm-02--uipy-crash-on-missing-rclpy-real-degraded-mode-bug-found-fixed) New-machine move (`PC-ACM-02`) — `UI.py` crash on missing `rclpy`
+- [§37](#37-morai-groundtruth-vehicleinfo-topic-renamed-to-egovehicleinfo--reconfirms-32s-frozen-value-bug-independently-fixed--confirmed) MORAI GroundTruth VehicleInfo topic renamed to `/Ego/vehicleinfo` — reconfirms §32
+- [§38](#38-ipm_view_nodepy-had-no-morai-camera-extrinsics-awareness-fixed) `ipm_view_node.py` had no MORAI camera-extrinsics awareness
+- [§39](#39-dry-run-switch--validate-acclkas-while-driving-manually-since-morais-gt-sensor-is-known-broken-done) Dry-run switch — validate ACC/LKAS while driving manually
+- [§41](#41-morai-camera-publish-rate-investigation--paused-unresolved-known-unresolved) MORAI camera publish-rate investigation — paused, unresolved
 
 ---
 
@@ -2964,4 +2973,345 @@ Side-benefit: removed the `simulator: str` parameter from
 `TelemetryView.__init__` and the `example_interfaces` import from
 `UI.py`, so the UI process no longer has to know which simulator is
 running just to render a speed number.
+
+## 34. MORAI-specific YOLO fine-tune: dataset pipeline + labelImg PyQt5 crashes [DONE]
+
+**Objective.** The CARLA-trained `best.pt` (4 classes: car/truck/bus/
+motorcycle; 100 epochs, `yolov8n.pt` base, imgsz 1280) doesn't reliably
+detect vehicles in MORAI due to the rendering/domain shift. Needed:
+label MORAI frames as ground truth, fine-tune on them. Nothing for
+this existed in the repo — no dataset, training script, or labeling
+tool — only the CARLA weights were ever committed.
+
+**Pipeline built** under `tools/yolo_finetune/` (gitignored):
+`extract_frames.py` (samples frames from a `Raw`-source UI recording),
+`auto_label.py` (runs the CARLA `best.pt` at `conf=0.25` to draft
+labels + preview jpgs so correcting is "fix a box" not "label from
+nothing" — encouragingly, CARLA-only `best.pt` already detected most
+MORAI cars at 0.87-0.95 confidence), `make_split.py` (train/val file
+lists), `train_finetune.py` (warm-starts from `best.pt`, not stock
+`yolov8n.pt`, `--freeze 10` + low `lr0` to limit catastrophic
+forgetting).
+
+**Correction tool: labelImg crashed repeatedly, root-caused and
+patched.** `labelImg` (1.8.6, ~2018 code) passes float pixel
+coordinates into `QPainter` calls that current system PyQt5 (5.15.6)
+now strictly type-checks, raising `TypeError` instead of silently
+coercing. Three call sites patched in-place (`int(...)` casts):
+`labelImg/labelImg.py:965` (`scroll_request`, mouse-wheel), and two in
+`libs/canvas.py`'s `paintEvent` (`526`: live rectangle preview while
+drawing a box — this one was fatal, corrupting the `QPainter` state
+into a segfault on the next repaint; `530-531`: hover crosshair).
+Label Studio was tried as an alternative (browser-based, avoids PyQt5
+entirely; venv at `~/.venvs/label-studio`) but hit an unresolved
+import limit; reverted to patched labelImg.
+
+**Result.** All 416 frames (extracted at `--stride 2` from a 832-frame
+recording) manually corrected. Fine-tune: 50 epochs, `freeze=10`,
+`AdamW(lr=0.00125)` auto-selected, ~4 min on an RTX 4090. Val metrics
+(single `car` class only): precision 0.99, recall 0.958, mAP50 0.989,
+mAP50-95 0.90 — **caveat**: random split of one continuous ~1 min
+recording, so adjacent near-duplicate frames likely landed on both
+sides; optimistic, not a real generalization measure (confirmed later
+in §35). Weights copied to `src/perception/models/best_MORAI.pt` (and
+manually into the colcon-installed share dir — that copy is a plain
+file, not a symlink, so needs a rebuild to stay in sync with `src/`)
+and added to `OBJECT_MODELS` in `UI.py`.
+
+**Known unfixed bug**: `auto_label.py`'s `project=` path bug (Ultralytics
+silently nests any relative `project` path under its own `runs/<task>/`
+rather than using it as given — confirmed via Ultralytics' own
+docstring example) was fixed there (`os.path.abspath(args.out)` +
+reading `results[0].save_dir` back rather than assuming the path).
+**`train_finetune.py` has the identical bug and was not fixed** — its
+output lands at `runs/detect/tools/yolo_finetune/runs/morai_finetune/
+weights/best.pt` (repo root), not `tools/yolo_finetune/runs/
+morai_finetune` as documented. Low priority; will bite again next run.
+
+## 35. `best_MORAI.pt` showed no bounding box in the live UI — three unrelated causes, not the model [FIXED / mixed]
+
+**Objective.** After swapping in `best_MORAI.pt` (§34), the `ACC
+(YOLO)` debug view showed no bounding box around vehicles clearly
+visible on-screen, across three different live MORAI test scenarios.
+Each had a different root cause; none were actually about the
+fine-tuned model's detection quality.
+
+**Cause 1 — real UI bug: `Run start_adas.sh` never applied the Object
+model dropdown.** `perception_node`'s `model_filename` parameter is
+only set at process-launch time, and `run_start_adas()` (`UI.py`)
+launched `perception_node`/`controller_node` via the raw shell script
+with **zero** ROS params — the ACC-side twin of a bug the LKAS half of
+the UI had already hit and fixed (`_restart_lkas_with_ui_params`),
+just never mirrored for ACC. Toggling `ACC: OFF`→`ON` directly *did*
+work; only the `Run start_adas.sh` path was broken.
+**Fix**: factored `toggle_acc`'s launch logic into a shared
+`_start_acc_procs()` (mirroring `_start_lkas_procs`), added
+`_restart_acc_with_ui_params()`, wired into `run_start_adas()`
+alongside the existing LKAS restart.
+
+**Cause 2 — working as designed.** One test scenario showed a parked
+car, clearly visible, outside the ego lane. The `ACC (YOLO)` debug
+view only draws boxes that survive the *entire* ACC lead-vehicle gate
+(class filter → `conf ≥ 0.8` → side-clip guard → ego-lane ROI /
+centerline test), not a raw-detections viewer. A correctly-gated
+non-lead vehicle drawing no box is expected.
+
+**Cause 3 — wrong topic selected.** A separate test showed no box on a
+car dead-center in the ego lane; the UI's `Source` combobox was set to
+`Raw` (`/Car_1/camera/front/compressed`), not `ACC (YOLO)`
+(`/ACC/perception/debug_image`) — boxes only ever draw onto the
+latter.
+
+**Cause 4 — real gate limitation on MORAI, worked around, later
+superseded.** With `Source` corrected and LKAS nominally active, a car
+dead-center in the lane still showed no box because `_centerline_at()`
+requires **both** UFLD polylines to have valid data at the same
+forward distance, and the right lane's Kalman filter was in steady
+rejection (rural road, grass shoulder, no visible right-side paint).
+`in_lane is None` (undecidable) was unconditionally dropped by design
+(a deliberate CARLA-side diagnostic change — see the "FALLBACK
+DISABLED" comment in `perception_node.py`), so MORAI was blind to
+every lead whenever this happened, even a real one dead ahead.
+**Fix, MORAI-only**: `perception_node.py` now stores `self.simulator`
+and the centerline gate skips the unconditional drop on `in_lane is
+None` when `self.simulator == 'morai'`, falling through to the earlier
+keep-zone/lane-ROI check instead; `in_lane is False` still rejected
+regardless of simulator. CARLA unchanged. **Note (§40 below)**: the
+*actual* cause of the right lane's rejection streak turned out to be a
+separate, more fundamental KF bug (rejections never reset, so one bad
+patch of road could wedge a lane shut indefinitely) — this gate change
+is still correct/kept, but §40's fix addresses the deeper problem.
+
+**Diagnostic aside**: ran `best_MORAI.pt` directly via `ultralytics`
+`model.predict()` (no gating) over the source recording at `conf=0.15`
+— good detections, but same recording the fine-tuning frames came
+from, so this confirms the training loop worked, not generalization to
+new scenes (§34's caveat).
+
+## 36. New-machine move (`PC-ACM-02`) — `UI.py` crash on missing `rclpy`, real degraded-mode bug found [FIXED]
+
+**Symptom.** `python3 UI.py` in a fresh terminal on the newly-set-up
+machine: `NameError: name 'Node' is not defined` at `class
+TelemetryView(Node):`.
+
+**Root cause.** Simple immediate trigger: ROS2 wasn't sourced in that
+shell (`source /opt/ros/humble/setup.bash && source install/
+setup.bash` fixed it directly — ROS2 Humble and the built workspace
+were both already present). But that exposed a real, independent bug:
+`UI.py` wraps `import rclpy` etc. in `try/except ImportError` and sets
+`CAMERA_AVAILABLE = False` on failure, clearly intending a degraded
+no-camera mode (checked before `TelemetryView()` is ever instantiated,
+in `_start_camera_view`) — but `class TelemetryView(Node):` at module
+scope is *not* guarded by that flag. Python evaluates base classes at
+class-definition time, so any environment where the ROS import fails
+crashes immediately, before the intended fallback ever gets a chance
+to run.
+
+**Fix.** In the `except ImportError` branch, `Node = object` — a
+placeholder base class so the class statement doesn't `NameError`.
+Safe: `TelemetryView` is only ever instantiated from
+`_start_camera_view`, which already checks `CAMERA_AVAILABLE` first
+and returns before reaching that line.
+
+## 37. MORAI GroundTruth VehicleInfo topic renamed to `/Ego/vehicleinfo` — reconfirms §32's frozen-value bug independently [FIXED / CONFIRMED]
+
+**Objective.** MORAI Studio's `GroundTruth_1` ROS2 Interface was found
+publishing on `/Ego/vehicleinfo` (confirmed live in Foxglove at
+11.55-33.82 Hz), not `/Car_1/vehicleinfo`. `state_adapter_node.py`'s
+`vehicleinfo_topic` parameter defaulted to `/Car_1/vehicleinfo`, and
+neither `start_adas.sh` nor `UI.py`'s "Start MORAI Bridge" ever
+overrode it — ROS topic matching is exact-string, so
+**`state_adapter_node` was receiving zero VehicleInfo messages**, not
+merely stale ones.
+
+**Fix.** Default changed to `/Ego/vehicleinfo`; docstring updated to
+flag that this must match the GroundTruth entity's Interface "Topic"
+field exactly (an arbitrary, freely-renameable string, unrelated to
+the vehicle's internal `id` field inside the message payload, and
+unrelated to any other topic's naming convention — `Camera_1` staying
+on `/Car_1/...` while GT moved to `/Ego/...` is not a problem, since
+each ROS topic name is independent).
+
+**Confirms, doesn't replace, §32.** After the fix, GT data *did* start
+flowing live (11.55 Hz) — but `local_velocity_x=2.9433467388153076`,
+`local_velocity_y=-1.0842...e-19`, `location_z=-5.181118965148926`,
+`rotation_x=36893488147419103000` were all **bit-for-bit identical**
+across two Foxglove captures ~13+ minutes apart. So the topic-name fix
+was necessary (zero messages → real messages) but insufficient — the
+payload itself is still frozen, strongly supporting §32's "Detect
+Radius" theory (`GroundTruth_1`'s was set to a suspiciously tiny
+`0.05`) as a MORAI-side sensor bug, independent of the ROS plumbing.
+Also noticed: the Stanley log's `v=2.94 m/s` throughout this whole
+session is this exact frozen value — displayed speed has been stuck on
+one stale GT reading regardless of actual vehicle motion the entire
+time. Not yet tried: bumping Detect Radius (§32's proposed next step).
+
+## 38. `ipm_view_node.py` had no MORAI camera-extrinsics awareness [FIXED]
+
+**Objective.** `perception_node.py` and `lane_detection_node.py` both
+already branch `cam_height_m`/`cam_x_offset` on the `simulator`
+parameter (MORAI: 0.9 m / 0.75 m — camera mounted lower and further
+forward than CARLA's 1.35 m / 0.6 m). `ipm_view_node.py` (drives the
+BEV panel) did not: `CAM_H_M = 1.35` / `CAM_X_OFF = 0.6` were hardcoded
+module constants, and `start_adas.sh` launched it with zero ROS params
+at all — the BEV's ground-plane warp was silently using CARLA's
+geometry on every MORAI run.
+
+**Fix.** Added the same `simulator` parameter + MORAI-aware defaults
+(`DEFAULT_CAM_HEIGHT_M_MORAI = 0.9`, `DEFAULT_CAM_X_OFFSET_MORAI =
+0.75`) as the other two nodes. `compute_homography()` now takes
+`cam_h_m`/`cam_x_off` as arguments instead of reading module globals.
+`start_adas.sh`'s `ipm_view_node` launch line now gets `-p
+simulator:=$SIMULATOR` like every other node in the stack. FOV stays a
+shared constant (unchanged between simulators in the existing pattern
+too).
+
+## 39. Dry-run switch — validate ACC/LKAS while driving manually, since MORAI's GT sensor is known-broken [DONE]
+
+**Objective.** With §37 confirming MORAI's GroundTruth speed sensor is
+genuinely broken (frozen, not a plumbing issue), closed-loop ACC
+validation on MORAI isn't trustworthy right now. Wanted: drive the car
+by hand in MORAI while ACC/LKAS keep computing and publishing normally,
+to validate YOLO/UFLD output quality directly, without ADAS actually
+touching the vehicle.
+
+**Design.** Single choke point: `control_adapter_node._publish()`
+(`src/morai_bridge/`) is the *only* place that sends `/Car_1/control`
+to MORAI — `controller_node`/`stanley_node` upstream keep computing
+and publishing `/Car_1/cmd_vel`/`/Car_1/cmd_steer` regardless, which is
+exactly what stays inspectable (Foxglove plots, debug images, Stanley
+logs) to judge ACC/LKAS quality. Added a `dry_run` parameter
+(default `false`); when true, `_publish()` returns before the
+`control_pub.publish()` call, but all subscriptions/state-tracking/
+logging run unchanged.
+
+**Wiring**: new `Dry run (no vehicle commands)` checkbox in `UI.py`'s
+Processes panel (next to "Record rosbag"), threaded into both
+`start_morai_bridge()` (`-p dry_run:=true` on `control_adapter_node`)
+and `run_start_adas()` (`./start_adas.sh morai dry_run`, a new second
+positional arg). Scoped to MORAI only — doesn't touch the CARLA
+actuation path (`carlaaccsim`, external repo, out of scope while
+MORAI-focused).
+
+## 40. Lane KF stuck-in-rejection lockup — χ² gate had no escape path [FIXED]
+
+**Objective.** BEV/debug-view lane lines intermittently vanished
+("only sometimes" visible) and, in one capture, visibly diverged from
+the road (KF's blue/red lines cutting across the lane while raw UFLD's
+green detection dots tracked it correctly). Root-caused via the log:
+`[KF R] steady REJ n_coast=0 n_rej=1665`.
+
+**Root cause.** `n_coast=0` means UFLD was delivering strong, valid
+detections every frame — the "too few points"/"too low confidence"
+coast path never fired. `n_rej=1665` means the filter's own χ²
+Mahalanobis outlier gate (`lane_kalman.py`, inside `update()`) rejected
+roughly that many consecutive measurements as statistically
+inconsistent with the filter's *own* current belief — and unlike the
+coast path (which has `KF_MAX_COAST_TICKS`-based reset logic in
+`_kf_smooth`), a rejection was a dead end: `n_rejected` just kept
+incrementing forever with **no reset on success and no forced
+re-initialization**, whether cumulative or consecutive. Once the
+filter's state drifted from reality (plausibly during an earlier
+sustained curve), it entered a self-reinforcing lockout: every new,
+genuinely correct detection looked like a statistical outlier relative
+to its own increasingly-wrong prediction, got rejected, and it kept
+dead-reckoning forward from stale state indefinitely. This same
+mechanism explains the BEV flicker too — `ipm_view_node._on_left`/
+`_on_right`/`_on_centerline` directly mirror the latest `/LKAS/
+ego_lane_*` Path message with no staleness tolerance, and a rejected
+frame's `_kf_smooth` returns `[]` (empty Path) for that side that tick.
+
+**Fix.** `lane_kalman.py`: `LaneKalmanFilter.update()` now resets
+`self.n_rejected = 0` on any accepted measurement (mirrors `n_coast`'s
+"since last reset" semantics — `n_rejected` now means "consecutive
+rejects since the last accepted frame," not a lifetime total).
+`lane_detection_node.py`: new `KF_MAX_REJECT_TICKS = 20` (same order
+of magnitude as `KF_MAX_COAST_TICKS`, ~4 s at 5 Hz); when a side's
+`n_rejected` hits that threshold, `_kf_smooth` forces `kf.initialized
+= False` and resets the counter, so the next good measurement re-seeds
+the filter from scratch (`initialize()`) instead of being rejected
+forever. Mirrors the existing coast-timeout pattern exactly, just
+keyed off consecutive REJ instead of consecutive weak/missing frames.
+
+## 41. MORAI camera publish-rate investigation — paused, unresolved [KNOWN, unresolved]
+
+**Status at pause.** MORAI development is paused here to switch back
+to CARLA-specific scenario work (see §33 above). This section is the
+handoff: what's confirmed, what's ruled out, and what's still open.
+
+**What's confirmed ruled out as the cause:**
+- **GPU is not saturated.** `nvidia-smi` during a live run: 32 %
+  utilization, 12.4 GB / 24 GB memory on an RTX 4090. The earlier
+  hypothesis ("YOLO + UFLD + MORAI's own Epic-quality rendering
+  fighting over the GPU") does not hold up against measurement.
+- **CPU is not saturated.** 28 cores available, system 95.4 % idle,
+  load average ~1.6. `debug_image_fusion_node` was unexpectedly the
+  single biggest CPU consumer among our own nodes (53 % of one core,
+  more than `perception_node`/YOLO at ~13-15 % or `lane_detection_node`
+  /UFLD at ~17-21 %) — worth a look eventually since it's pure
+  visualization overhead, not part of the control loop, but nowhere
+  near enough to explain a system-wide stall on a 28-core box.
+- **`inference_skip_n` tuning was very likely the wrong lever.**
+  Raised MORAI's default from `1` to `2` (halving UFLD's per-frame
+  load) specifically to test the GPU-contention theory; RTF did not
+  improve (0.56 → 0.49 → 0.62 across samples, no clean trend). Once
+  the actual camera rate was measured directly (below), this stopped
+  being a plausible explanation at all.
+
+**The actual live measurement, and why it reframes everything:**
+`ros2 topic hz /Car_1/camera/front/compressed` while the stack was
+running: **average 1.242 Hz**, `min 0.054 s, max 1.556 s, std dev
+0.751 s` — wildly erratic (instantaneous rate swinging between ~18 Hz
+and ~0.64 Hz frame to frame), and nowhere near the 20 Hz "Fixed"
+timestep mode was switched to specifically to achieve (see the earlier
+Variable→Fixed 20 fps change in this session, which subjectively felt
+like an improvement but was never measured this precisely). At this
+real rate, `inference_skip_n=2` gives UFLD a fresh frame roughly every
+~1.6 s — sparser than even the original `skip_n=1` MORAI default was
+designed to avoid. Given GPU/CPU are confirmed idle, **the bottleneck
+is upstream of every ROS node in this repo** — in whatever produces
+`/Car_1/camera/front/compressed` itself.
+
+**Potential causes, not yet tested, roughly in order of suspicion:**
+
+1. **MORAI's own camera sensor capture/encode/publish pipeline**
+   (Windows-host side, outside this repo and outside what a WSL shell
+   can inspect — `nvidia-smi` inside WSL2 does report true physical
+   GPU utilization across the whole machine, so the 32 % figure above
+   *should* include MORAI's Windows-side rendering load, but a single
+   snapshot can miss transient spikes). This is the leading suspect
+   simply by elimination: everything measurable on the Linux/ROS side
+   is idle.
+2. **Fixed-timestep + dry-run interaction, untested.** MORAI Studio's
+   ROS2 Interface panel shows `Mode: Fixed` with an
+   `ExternalControlInterface` **subscriber** — plausible that a
+   fixed-step sim expects to receive control input each tick before
+   advancing. Since dry-run (§39) means `control_adapter_node` never
+   publishes `/Car_1/control` at all anymore, it's a concrete,
+   testable hypothesis that dry-run itself is stalling MORAI's
+   step-advance loop. **Next action**: toggle dry-run off (accepting
+   the car will actually drive) and compare the camera-topic Hz
+   measurement above, same scene, before/after.
+3. **Quality preset (`Epic`) vs. rendering budget.** Never tested
+   lowering MORAI's Quality dropdown from `Epic` to see if RTF/camera
+   rate improves — cheap experiment, not yet tried this session.
+4. **WSLg/Xwayland or WSL2 networking overhead** on whatever channel
+   carries the camera sensor's ROS2 publish from the MORAI process to
+   the ROS graph — untested; §26j documents a related but distinct
+   WSLg rendering bug (blank window at Xwayland startup), not
+   necessarily connected to sustained per-frame throughput.
+5. **Scene complexity.** The lowest RTF (0.49) and the highest (0.62)
+   were measured in visually different scenes (open intersection vs. a
+   vegetation-heavy roundabout) — scene GPU cost on the MORAI/Windows
+   side was never controlled for across the RTF samples in this
+   session, so some of the variance may just be scene-dependent
+   rendering cost rather than a single fixed bottleneck.
+
+**Not yet done, for whoever picks this back up:** a controlled A/B
+comparison (same scene, same NPC count, same weather) toggling one
+variable at a time — dry-run on/off, Quality preset, Fixed vs.
+Variable timestep — while logging `ros2 topic hz` on the camera topic
+and MORAI's own RTF/System-FPS readout side by side. Nothing in this
+session isolated a single cause; it only ruled out GPU/CPU compute and
+`inference_skip_n` as the explanation.
 

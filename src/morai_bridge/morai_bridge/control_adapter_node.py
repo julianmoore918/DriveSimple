@@ -16,6 +16,12 @@ Subscribed:
 
 Published:
     /Car_1/control     (morai_v2_1_ros2_msgs/msg/VehicleManualControl)
+                       -- unless `dry_run:=true`, in which case this
+                       node still subscribes/tracks/logs normally but
+                       never actually publishes, so ACC/LKAS can be
+                       validated (via /Car_1/cmd_vel, /Car_1/cmd_steer,
+                       and the debug images/BEV) while a human drives
+                       the car directly in MORAI.
 
 UNCALIBRATED: MORAI's field is literally named "steering_wheel_angle",
 i.e. behind a steering ratio, not the road-wheel angle our steer value
@@ -64,6 +70,13 @@ class MoraiControlAdapter(Node):
         # rebuild.
         self.declare_parameter('throttle_scale', 1.0)
         self.declare_parameter('brake_scale', 1.0)
+        # Validation mode: keep computing/publishing everything upstream
+        # (cmd_vel, cmd_steer, debug images) but never actually command
+        # the vehicle -- lets a human drive while ACC/LKAS run alongside
+        # for comparison, e.g. while MORAI's GroundTruth speed sensor is
+        # known-broken (see DEBUG.md) and end-to-end closed-loop
+        # validation isn't trustworthy anyway.
+        self.declare_parameter('dry_run', False)
 
         cmd_vel_topic   = self.get_parameter('cmd_vel_topic').value
         cmd_steer_topic = self.get_parameter('cmd_steer_topic').value
@@ -72,6 +85,7 @@ class MoraiControlAdapter(Node):
         self.steer_sign  = float(self.get_parameter('steer_sign').value)
         self.throttle_scale = float(self.get_parameter('throttle_scale').value)
         self.brake_scale    = float(self.get_parameter('brake_scale').value)
+        self.dry_run = bool(self.get_parameter('dry_run').value)
 
         self._throttle = 0.0
         self._brake = 0.0
@@ -90,7 +104,10 @@ class MoraiControlAdapter(Node):
             f'    steer_scale:   {self.steer_scale} deg (UNCALIBRATED)\n'
             f'    steer_sign:    {self.steer_sign}\n'
             f'    throttle_scale: {self.throttle_scale} (UNCALIBRATED)\n'
-            f'    brake_scale:    {self.brake_scale} (UNCALIBRATED)')
+            f'    brake_scale:    {self.brake_scale} (UNCALIBRATED)\n'
+            f'    DRY RUN:        {self.dry_run} -- '
+            + ('NOT sending anything to the car' if self.dry_run
+               else 'sending control commands normally'))
 
     def _on_cmd_vel(self, msg: Twist):
         self._throttle = msg.linear.x
@@ -102,6 +119,8 @@ class MoraiControlAdapter(Node):
         self._publish()
 
     def _publish(self):
+        if self.dry_run:
+            return
         out = VehicleManualControl()
         out.throttle = float(self._throttle) * self.throttle_scale
         out.brake = float(self._brake) * self.brake_scale

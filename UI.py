@@ -582,20 +582,30 @@ class ADASUI:
         ttk.Checkbutton(procs, text='Record rosbag',
                         variable=self.rosbag_record_var).grid(
             row=6, column=0, columnspan=2, sticky='w', pady=(0, 4))
+        # Dry run: ACC/LKAS keep computing and publishing cmd_vel/
+        # cmd_steer normally (so their output is still fully visible/
+        # validatable), but control_adapter_node never forwards it to
+        # MORAI -- for driving by hand and watching ACC/LKAS output
+        # without them actually touching the vehicle. MORAI only; has
+        # no effect on CARLA (carlaaccsim bridge doesn't read this).
+        self.dry_run_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(procs, text='Dry run (no vehicle commands)',
+                        variable=self.dry_run_var).grid(
+            row=7, column=0, columnspan=2, sticky='w', pady=(0, 4))
         ttk.Button(procs, text='Run start_adas.sh', command=self.run_start_adas).grid(
-            row=7, column=0, columnspan=2, sticky='ew', pady=2)
-        ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
             row=8, column=0, columnspan=2, sticky='ew', pady=2)
+        ttk.Button(procs, text='Stop ADAS Stack', command=self.stop_stack).grid(
+            row=9, column=0, columnspan=2, sticky='ew', pady=2)
         # Foxglove bridge — independent visualisation tool. Opens
         # ws://localhost:8765 for Foxglove Studio (desktop or web).
         # Lives outside the ADAS/CARLA lifecycle so layouts can also be
         # used for rosbag playback after the stack is stopped.
         ttk.Button(procs, text='Start Foxglove',
                    command=self.start_foxglove).grid(
-            row=9, column=0, sticky='ew', pady=2)
+            row=10, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop Foxglove',
                    command=self.stop_foxglove).grid(
-            row=9, column=1, sticky='ew', pady=2, padx=(4, 0))
+            row=10, column=1, sticky='ew', pady=2, padx=(4, 0))
         # MORAI adapter nodes (state_adapter_node + control_adapter_node,
         # package morai_bridge) — translate MORAI's ROS2 Interface topics
         # to/from this stack's /Car_1/* topics. No CARLA/bridge process
@@ -603,10 +613,10 @@ class ADASUI:
         # MORAI's own simulator + ROS2 Interfaces must already be running.
         ttk.Button(procs, text='Start MORAI Bridge',
                    command=self.start_morai_bridge).grid(
-            row=10, column=0, sticky='ew', pady=2)
+            row=11, column=0, sticky='ew', pady=2)
         ttk.Button(procs, text='Stop MORAI Bridge',
                    command=self.stop_morai_bridge).grid(
-            row=10, column=1, sticky='ew', pady=2, padx=(4, 0))
+            row=11, column=1, sticky='ew', pady=2, padx=(4, 0))
 
         # Feature toggles. Each row has a button (user intent — ON/OFF) and a
         # small status dot reflecting whether the backing nodes are actually
@@ -1295,14 +1305,19 @@ class ADASUI:
                        f'session) — not starting a duplicate. Stop it first.')
             self.status_var.set('MORAI bridge already running elsewhere')
             return
-        self._log('[ui] starting MORAI bridge (state + control adapters)')
+        dry_run = self.dry_run_var.get()
+        self._log('[ui] starting MORAI bridge (state + control adapters)'
+                   + (' [DRY RUN -- no vehicle commands]' if dry_run else ''))
+        control_cmd = ['ros2', 'run', 'morai_bridge', 'control_adapter_node']
+        if dry_run:
+            control_cmd += ['--ros-args', '-p', 'dry_run:=true']
         self.morai_bridge_procs = [
             self._popen(
                 ['ros2', 'run', 'morai_bridge', 'state_adapter_node'],
                 cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
                 prefix='morai-state'),
             self._popen(
-                ['ros2', 'run', 'morai_bridge', 'control_adapter_node'],
+                control_cmd,
                 cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
                 prefix='morai-control'),
         ]
@@ -1351,8 +1366,13 @@ class ADASUI:
             self._log('[ui] start_adas.sh already running')
             return
         cmd = ['./start_adas.sh', self.simulator_var.get()]
+        if self.dry_run_var.get():
+            cmd.append('dry_run')
         self._log(f'[ui] ### LAUNCHING WITH SIMULATOR = {self.simulator_var.get().upper()} ### '
                    '(check the dropdown if this is wrong)')
+        if self.dry_run_var.get():
+            self._log('[ui] DRY RUN -- ACC/LKAS will compute normally but '
+                       'no commands will be sent to the vehicle')
         self._log(f'$ (cd {ADAS_WK} && {" ".join(cmd)})')
         # start_adas.sh sources ROS itself.
         self.stack_proc = self._popen(cmd, cwd=str(ADAS_WK),

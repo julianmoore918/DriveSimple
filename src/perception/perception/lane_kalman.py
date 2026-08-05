@@ -183,6 +183,15 @@ class LaneKalmanFilter:
             self.n_rejected += 1
             return self.coeffs                   # keep the prior, do not correct
 
+        # Accepted: consecutive-reject streak ends here. n_rejected tracks
+        # "rejects since last accepted measurement" (mirrors n_coast's
+        # "coasts since last reset"), not a lifetime total -- a filter
+        # that's diverged from reality will otherwise reject every
+        # subsequent good measurement forever (they look like outliers
+        # relative to its own wrong prediction) with no way back in. See
+        # KF_MAX_REJECT_TICKS in lane_detection_node.py, and DEBUG.md.
+        self.n_rejected = 0
+
         K = self.P @ self.H.T @ Sinv             # Kalman gain
         self.x = self.x + K @ nu
 
