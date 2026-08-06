@@ -3478,3 +3478,173 @@ delivered 9.32. Capping it at 5 would have put it into the target. The
 until detection range improves. Order of work is therefore: extend
 perception range first, then start braking at first detection, and only
 then bound the authority.
+
+## 44. GT `VehicleInfo` garbage fields — ruled out "uninitialized memory," found a fixed deterministic pattern instead [KNOWN, unresolved — handoff before pausing MORAI]
+
+**Objective.** §29/§32/§37 documented `morai_v2_1_ros2_msgs/VehicleInfo`
+publishing occasional garbage (~3.7e19-ish) on random-looking fields,
+attributed in `state_adapter_node.py`'s docstring to "an
+uninitialized-memory/buffer-reuse bug inside MORAI's own serializer."
+Live investigation with the sim running found something more specific.
+
+**The official `MORAI-ROS2_morai_msgs` GitHub repo is not the right
+reference at all.** Cloned it, read every one of its 30 `.msg`/6
+`.srv` files plus the README. No `VehicleInfo` message exists there —
+the README reveals it targets a *different* MORAI product entirely,
+**"MORAI SIM: Drive"**, with fixed non-configurable topics
+(`/Ego_topic`, `/ctrl_cmd`, `/Object_topic`, ...). What we're actually
+using is MORAI **Studio**'s flexible ROS2 Interface panel
+(user-configurable Topic name + a "Message Template" dropdown,
+versioned to match our local `morai_v2_1_ros2_msgs` package name) —
+a different integration mechanism with its own message set that isn't
+published in this repo. One structural pattern is still worth noting:
+every message in that repo, without exception, uses `std_msgs/Header`
++ `geometry_msgs/Vector3` (float64 x/y/z) for position/velocity/
+acceleration — never flat `float32` scalar triples like our
+`VehicleInfo.msg` does.
+
+**Live re-diagnosis, with the sim actually running.** `ros2 topic
+list` showed **both** `/Car_1/vehicleinfo` (2 publishers) and
+`/Ego/vehicleinfo` (0 publishers) simultaneously — reconfirms §37's
+finding that the GT topic name is scenario-specific/arbitrary, and in
+*this* scenario config it had been switched back to `/Car_1/
+vehicleinfo`, meaning `state_adapter_node`'s current default (`/Ego/
+vehicleinfo`, set in §37) was receiving nothing again. Echoing
+`/Car_1/vehicleinfo` directly (three samples, `stamp_sec` genuinely
+incrementing, other fields like `angular_velocity_z`/`brake`/
+`steer_angle` visibly changing between samples — so the message is
+live, not frozen) showed:
+
+- `rotation_z`, `local_velocity_y`, `local_acceleration_z` were
+  **exactly `0x60000000` (= 2^65) in every single sample, with zero
+  exceptions**, while surrounding fields at the same moments read
+  ordinary, plausible values.
+
+A fixed value at a fixed set of field *names*, every time, while nearby
+fields genuinely vary — that rules out "uninitialized memory" (which
+would vary sample to sample). Mapped the field order to byte offsets
+(all `float32`, 4-byte CDR-aligned, after `stamp_sec`/`stamp_nanosec`/
+the `id` string) to test a byte-alignment-shift theory: garbage lands
+at field-index 5, 7, 11 — **an irregular stride** (+2, then +4), not
+the contiguous run a simple "our `.msg` has one field's width wrong
+so everything after it is shifted" theory would produce. So this is
+*not* a clean global misalignment either. Two remaining, undistinguished
+hypotheses:
+1. Our `.msg` mis-defines/mis-orders these three specific fields
+   relative to MORAI's true schema (a scattered, not global, mismatch).
+2. MORAI's own serializer simply never populates these three specific
+   fields for a GroundTruth-bound `VehicleInfo` (always writes the same
+   sentinel there), independent of whether our `.msg` is correct.
+
+Distinguishing these needs the raw CDR bytes off the wire — `ros2
+topic echo` output is already decoded *using our own possibly-wrong
+schema*, which isn't sufficient to test either theory rigorously. Not
+done this session.
+
+**`EgoVehicleStatus.msg` as an alternative — investigated, inconclusive.**
+Confirmed the official repo's `EgoVehicleStatus.msg` (fields: `header`,
+`unique_id` (int32), `acceleration`/`position`/`velocity`/
+`angular_velocity` (all `geometry_msgs/Vector3`, velocity documented in
+**km/h**, not m/s), `heading`/`accel`/`brake`/`front_steer`/
+`rear_steer` (float64)) is a completely different, fully-documented
+schema — attractive *if* MORAI Studio's GroundTruth entity actually
+offers it as a selectable "Message Template". Could not confirm either
+way this session (two screenshots of the Message Template dropdown
+both failed to transmit/render). **This is the single highest-value
+next check** for whoever resumes MORAI work: open `GroundTruth_1`'s
+ROS2 Interface config in Studio and read off every entry in that
+dropdown. If `EgoVehicleStatus` (or equivalent) is offered, switching
+to it sidesteps all of the above guesswork with an officially-documented
+schema — but would require vendoring `EgoVehicleStatus.msg` into our
+own msgs package (depends only on `std_msgs/Header` +
+`geometry_msgs/Vector3`, both standard) and rewriting
+`state_adapter_node.py`'s field access + a km/h→m/s conversion
+(`speed = abs(msg.velocity.x) / 3.6` instead of the current
+`abs(msg.local_velocity_x)`). If it's *not* offered (plausible —
+GroundTruth-type entities may only expose `VehicleInfo`), the only
+remaining path is a raw-byte capture to empirically determine
+`VehicleInfo`'s true wire layout.
+
+**Update — confirmed we never followed MORAI's own ROS2 setup guide.**
+The user supplied MORAI's official "Developer Setup for ROS2" doc.
+Step 4 is explicit: `git clone
+https://github.com/MORAI-Autonomous/MORAI-ROS2_morai_msgs.git` into
+the workspace `src/`, then `colcon build`. Checked our workspace:
+`src/morai_v2_1_ros2_msgs/msg/` contains exactly **2** hand-written
+files (`VehicleInfo.msg`, `VehicleManualControl.msg`) sharing **zero**
+names with any of the official repo's 30 messages. We never cloned or
+built against MORAI's real message definitions at all — someone wrote
+a custom, never-validated-against-the-real-schema package from
+scratch instead. Toolchain otherwise matches the guide fine (WSL2,
+ROS2 Humble, `colcon`/`rosdep`/`build-essential`, `rqt`, `rviz2` all
+present; only `ros-humble-compressed-image-transport` is missing, but
+this stack never uses the `image_transport` plugin API — every topic
+is a plain `sensor_msgs/CompressedImage` via manual `cv2.imencode`/
+`imdecode` — so that gap is very likely inconsequential in practice).
+
+This substantially upgrades the `EgoVehicleStatus` recommendation
+above from "worth trying" to "very likely the actual fix": rather than
+reverse-engineering our custom `VehicleInfo`'s true byte layout, the
+straightforward correct path is to follow MORAI's own setup guide
+properly — clone the real `MORAI-ROS2_morai_msgs` repo into `src/`,
+`colcon build`, reconfigure `GroundTruth_1`'s Message Template in
+Studio to `EgoVehicleStatus` (still needs confirming that template
+name is actually offered in Studio's dropdown — unconfirmed this
+session, see above), and rewrite `state_adapter_node.py` against the
+official schema (`unique_id` int32 instead of a string `id`, etc.).
+**This is the concrete next step** for whoever resumes MORAI work,
+ahead of any raw-byte-capture approach.
+
+**Done, this session**: cloned `MORAI-ROS2_morai_msgs` into
+`src/` (ROS2 package name `morai_ros2_msgs`, distinct from our own
+`morai_v2_1_ros2_msgs`), `rosdep install` + `colcon build --packages-
+select morai_ros2_msgs` succeeded, `ros2 interface show
+morai_ros2_msgs/msg/EgoVehicleStatus` confirms it's correctly built
+and introspectable. **Correction to a unit claim made earlier in this
+same investigation**: re-reading the freshly-cloned source file
+directly (`grep` on the actual `.msg`, not a possibly-stale `curl`
+fetch from earlier) shows `geometry_msgs/Vector3 velocity  # Velocity
+vector [m/s]` — **m/s, not km/h** as stated above. No `/3.6`
+conversion needed if/when `state_adapter_node.py` is rewritten against
+this message. Cause of the discrepancy not confirmed (repo doc
+possibly corrected upstream between the two fetches, or a
+transcription slip) — trust the locally cloned file, not the earlier
+number in this entry.
+
+Building the package alone doesn't change what MORAI Studio actually
+publishes on the wire, though — `GroundTruth_1`'s Interface still has
+to be switched to whichever Message Template corresponds to
+`EgoVehicleStatus` (if offered) before this new package does anything
+useful.
+
+**Conclusive answer, closes out this path**: checked Studio's Message
+Template dropdown directly — **none of the official
+`MORAI-ROS2_morai_msgs` types (`EgoVehicleStatus` included) are
+offered there at all.** Studio's ROS2 Interface system is disconnected
+from MORAI's own public messages repo; only its own custom template
+set (`VehicleInfo`, etc. — the undocumented schema our
+`morai_v2_1_ros2_msgs` package guesses at) is selectable in the
+product. This is a MORAI-side product gap, not something fixable from
+our side — their official message definitions exist on GitHub but
+aren't wired into Studio's own Interface UI. **Status: blocked,
+waiting on MORAI to respond/fix.** The newly-cloned `morai_ros2_msgs`
+package is built but currently unusable for actually talking to
+Studio; kept in `src/` in case MORAI fixes this and it becomes
+relevant later, or reference material for whenever `VehicleInfo`'s
+true layout needs reverse-engineering. Until then, our custom
+`morai_v2_1_ros2_msgs/VehicleInfo` remains the only interface
+Studio's GroundTruth entity actually supports, garbage fields and all
+— the only remaining self-service diagnostic left (raw CDR byte
+capture) still stands as the next option if this needs revisiting
+before MORAI responds.
+
+**Aside, not a bug**: also traced why `/ADAS/perception/debug_image`
+can show a *higher* Hz than the raw `/Car_1/camera/front/compressed`
+it's derived from — `debug_image_fusion_node` (and `ipm_view_node`
+for the BEV panel) run their own independent fixed ~10 Hz publish
+timers (`self.create_timer(1.0 / PUB_HZ, self._publish)`), re-compositing
+whatever's cached (latest raw frame + latest ACC/LKAS overlay masks)
+on every tick regardless of whether anything new has actually arrived
+from the erratic upstream camera. Working as designed, not a
+regression — but means "higher Hz" on those two topics specifically
+doesn't imply "more real new content," just a faster re-publish clock.
