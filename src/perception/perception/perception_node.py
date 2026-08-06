@@ -67,29 +67,49 @@ VEHICLE_CLASSES     = {'car', 'truck', 'bus', 'motorcycle'}
 # leaks in, which also absorbs the IPM's lateral error growth with range.
 # Tighten if adjacent-lane cars start triggering ACC at distance.
 LANE_FALLBACK_HALF_W = 1.5
-# Maximum forward distance [m] at which the IPM range estimate is
-# trustworthy enough to publish.
+# Maximum forward distance [m] at which a range estimate is published.
 #
-# IPM projects the bb-bottom pixel onto the road plane, so range error
-# grows roughly with range^2 — near the horizon one pixel is worth many
-# metres. Measured against CARLA ground truth over the scenario traces:
+# Was 40.0, chosen because IPM range error measured ~38% beyond that:
+#     gt 0-30 m   err +0.5 .. +3.1 m   (~10%)
+#     gt 30-40 m  err +6.8 m           ( 20%)
+#     gt 40-80 m  err +16.7 .. +29.2 m (~38%)
+# IPM projects the bb-bottom onto the road plane, so its error grows with
+# range^2 — near the horizon one pixel is worth many metres.
 #
-#     gt 0-30 m   err +0.5 .. +3.1 m   (~10%)   usable
-#     gt 30-40 m  err +6.8 m           ( 20%)   marginal
-#     gt 40-80 m  err +16.7 .. +29.2 m (~38%)   unusable
+# Raised to 80.0 once the scenario runs showed 40 m was the binding limit
+# on ACC's top speed: 70 km/h needs ~44 m of sight to stop within the
+# 5 m/s^2 ceiling, and the cap was holding first detection at ~34 m.
+# 70 km/h passes at 80 m. The controller tolerates the noisier far-range
+# estimate far better than it used to — the alpha-beta tracker smooths it
+# and the rate-limited speed reference means gap noise can no longer turn
+# into deceleration (see DEBUG §45).
 #
-# Beyond ~40 m the number is not a distance, it is a guess: one 70 km/h
-# run reported 121 m for a true 76 m gap, and consecutive frames swung by
-# 30+ m. That noise flips the sign of the controller's closing-rate
-# estimate, which drops the kinematic braking latch and sets off a
-# throttle/brake limit cycle — the "brakes far too early, then
-# re-accelerates" behaviour. Publishing a detection we cannot range is
-# worse than not publishing it.
+# NOTE the parallel pinhole estimate on /ACC/lead_distance_pinhole measured
+# substantially better over the same runs (bias +0.19 m vs +1.62 m, RMS
+# 0.47 m vs 1.86 m, and flat with range rather than growing). Switching the
+# published distance to it — or blending, IPM close where boxes clip and
+# pinhole far — is the obvious next step and would make this cap generous
+# rather than load-bearing.
+MAX_IPM_TRUST_M = 80.0
+# Real-world heights [m] for the pinhole range estimate, d = f*H/bb_height.
+# This is the pre-IPM approach, reinstated as a PARALLEL diagnostic rather
+# than a replacement — see the pinhole publisher in estimateLeadDist.
 #
-# This caps ACC's usable range, and with it the top speed at which the
-# 5 m/s^2 limit can be met (~70 km/h). Raising it requires a better range
-# estimate, not a bigger constant here. See DEBUG §43.
-MAX_IPM_TRUST_M = 40.0
+# Its per-pixel precision is no better than IPM's (cam_h 1.35 m is close to
+# a car's 1.5 m, so `dv below horizon` and `bb height` are nearly the same
+# pixel count). What differs is the dependency: IPM measures against the
+# HORIZON, so it is corrupted by camera pitch, road slope, and — the
+# suspicious one — the vehicle's own pitch under braking. At 40 m one
+# degree of pitch is a 52% distance error, and the car pitches exactly
+# when ACC is braking. bb-height is immune to all three; it pays instead
+# with a bias from the assumed height and a sensitivity to clipped boxes.
+OBJECT_HEIGHTS = {
+    'car':        1.50,
+    'truck':      3.20,
+    'bus':        3.20,
+    'motorcycle': 1.60,
+}
+OBJECT_HEIGHT_DEFAULT = 1.50
 # Lower-bound clamp on the published distance. IPM saturates at small
 # gaps (bb-bottom clips at frame edge → distance can come out near 0
 # or negative). We clamp at 0.1 m so the value is still positive (the
@@ -156,6 +176,12 @@ class YoloDetection(Node):
 
         # Publishers
         self.dist_pub  = self.create_publisher(Float32,          '/ACC/lead_vehicle_distance',   10)
+        # Parallel pinhole (bb-height) range estimate for the SAME selected
+        # lead. Diagnostic only — no consumer for control. Exists so the
+        # two methods can be scored against CARLA ground truth over a real
+        # braking event, where the IPM's dependence on the horizon (and so
+        # on the vehicle's pitch under braking) is most likely to show.
+        self.pinhole_pub = self.create_publisher(Float32,        '/ACC/lead_distance_pinhole',   10)
         self.debug_pub = self.create_publisher(CompressedImage,  '/ACC/perception/debug_image',  10)
         # Closest in-lane lead's bb-bottom edge, IPM-projected to vehicle
         # frame as (left_corner, right_corner). Two-pose Path so
@@ -452,6 +478,7 @@ class YoloDetection(Node):
     # ========================
     def estimateLeadDist(self, img, boxes, confs, classes, header):
         min_distance = None
+        best_pinhole = None
         best_conf    = None        # YOLO conf of the currently-selected lead
         closest_bb_ground = None   # ((X_left,Y_left), (X_right,Y_right)) for BEV
 
@@ -588,7 +615,19 @@ class YoloDetection(Node):
             distance_m = max(MIN_PUBLISHED_GAP_M,
                              left_g[0] - self.ego_extent_x)
 
+            # Parallel pinhole estimate from the bounding-box height.
+            # Diagnostic only — nothing consumes it for control yet. Logged
+            # beside the IPM value and ground truth so the two can be
+            # scored against each other over a real approach before either
+            # is trusted above 40 m.
+            bb_h_px = max(1.0, float(y_max - y_min))
+            focal_px = w / (2.0 * math.tan(self.CAM_FOV_RAD / 2.0))
+            h_real = OBJECT_HEIGHTS.get(class_name, OBJECT_HEIGHT_DEFAULT)
+            pinhole_m = max(MIN_PUBLISHED_GAP_M,
+                            focal_px * h_real / bb_h_px - self.ego_extent_x)
+
             if min_distance is None or distance_m < min_distance:
+                best_pinhole = pinhole_m
                 min_distance = distance_m
                 best_conf    = float(conf)   # track conf of selected lead
                 closest_bb_ground = (left_g, right_g)
@@ -604,6 +643,9 @@ class YoloDetection(Node):
             msg = Float32()
             msg.data = float(min_distance)
             self.dist_pub.publish(msg)
+            self.pinhole_pub.publish(Float32(data=float(best_pinhole))
+                                     if best_pinhole is not None
+                                     else Float32(data=float('inf')))
             if ENABLE_LOGGING:
                 conf_text = (f"{best_conf:.2f}"
                              if best_conf is not None else "n/a")
@@ -613,6 +655,9 @@ class YoloDetection(Node):
             msg = Float32()
             msg.data = float('inf')
             self.dist_pub.publish(msg)
+            # Keep the diagnostic in lockstep with the real topic, so a
+            # gap in one is never mistaken for disagreement between them.
+            self.pinhole_pub.publish(Float32(data=float('inf')))
 
         # ── BB-bottom ground line publish (for ipm_view_node BEV) ──
         bb_path = Path()

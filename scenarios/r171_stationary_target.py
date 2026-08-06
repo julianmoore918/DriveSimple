@@ -153,6 +153,46 @@ DECEL_VALID_SPEED_MPS = 1.0
 DECEL_PHYSICAL_MAX = 9.0
 
 
+def _peak_decel_from_trace(samples: list, half_window_s: float = 0.12):
+    """Peak deceleration [m/s^2] from a run trace, measured offline.
+
+    Fits v(t) by least squares over a window centred on each sample and
+    takes the steepest negative slope. Centred means no group delay, and
+    fitting over a window rather than differencing adjacent samples means
+    single-sample speed noise cannot masquerade as 20 m/s^2.
+
+    Excludes the same regions the online metric does — the standstill snap
+    and the collision impulse — since neither is braking performance.
+
+    Restricted to the MEASURE phase. The approach phase is flown by the
+    scenario itself and opens with a kinematic snap to the test speed,
+    which differentiates to ~12 m/s^2 at t≈1 s. Including it reported that
+    snap as the run's peak deceleration and attributed the harness's own
+    setup transient to the system under test.
+    """
+    pts = [(s['t'], s['v_kmh'] / 3.6, s['gap_gt_m'])
+           for s in samples if s.get('phase') == 'measure']
+    if len(pts) < 3:
+        return None
+    peak = None
+    for i, (ti, _, _) in enumerate(pts):
+        win = [(t, v) for (t, v, _) in pts if abs(t - ti) <= half_window_s]
+        if len(win) < 3:
+            continue
+        n = len(win)
+        mt = sum(t for t, _ in win) / n
+        mv = sum(v for _, v in win) / n
+        den = sum((t - mt) ** 2 for t, _ in win)
+        if den <= 0:
+            continue
+        slope = sum((t - mt) * (v - mv) for t, v in win) / den
+        _, v_i, gap_i = pts[i]
+        if (v_i > DECEL_VALID_SPEED_MPS and gap_i > DECEL_VALID_GAP_M
+                and -slope <= DECEL_PLAUSIBLE_MAX):
+            peak = -slope if peak is None else max(peak, -slope)
+    return peak
+
+
 def required_decel(speed_mps: float, gap_m: float) -> float:
     """Constant deceleration needed to stop in the remaining gap [m/s^2].
 
@@ -267,6 +307,17 @@ class ScenarioBridge(Node):
         # so an outside reconstruction disagrees near the boundaries.
         self.create_subscription(String, '/ACC/control_mode',
                                  self._on_control_mode, 10)
+        # The gap the controller acts on (tracked + latency-compensated)
+        # and the governor's reference speed. Neither is derivable from
+        # outside, and both were guesswork when debugging earlier runs.
+        self.create_subscription(Float32, '/ACC/tracked_gap',
+                                 self._on_tracked_gap, 10)
+        self.create_subscription(Float32, '/ACC/speed_reference',
+                                 self._on_speed_ref, 10)
+        # Parallel bb-height range estimate, for scoring against the IPM
+        # value and ground truth. Diagnostic only.
+        self.create_subscription(Float32, '/ACC/lead_distance_pinhole',
+                                 self._on_pinhole, 10)
 
         ready_qos = QoSProfile(depth=1,
                                durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -281,10 +332,27 @@ class ScenarioBridge(Node):
         self.stack_throttle = 0.0
         self.stack_brake = 0.0
         self.stack_steer = 0.0
+        # Event-driven steer application. The original bridge
+        # (custom_ROS_pub_sub.CarlaAVT._cmd_steer_cb) called apply_control
+        # the instant a steer message landed. This harness replaced that
+        # with a polled read once per director iteration (~19 Hz), which
+        # silently added up to 52 ms of latency to the LATERAL loop — 1.0 m
+        # of travel at 70 km/h, and pure phase lag to a controller that has
+        # to close around it. Stanley held 70 km/h lanes before and drifted
+        # out of them after, so the latency is restored to zero here.
+        #
+        # `_control_sink` is set by the director only in --lateral-mode lkas;
+        # in locked mode the scenario owns steer and this path stays off.
+        self._control_sink = None
+        self._longitudinal = (0.0, 0.0)
+        self._sink_lock = threading.Lock()
         self.stack_cmd_vel_seen = False
         self.lead_distance: float | None = None
         self.lead_distance_stamp = 0.0
         self.acc_mode: str = ''
+        self.tracked_gap: float | None = None
+        self.speed_ref: float | None = None
+        self.pinhole_gap: float | None = None
 
     # -- inbound from the stack --------------------------------------------
     def _on_cmd_vel(self, msg: Twist) -> None:
@@ -294,6 +362,21 @@ class ScenarioBridge(Node):
 
     def _on_cmd_steer(self, msg: Float32) -> None:
         self.stack_steer = float(min(max(msg.data, -1.0), 1.0))
+        sink = self._control_sink
+        if sink is not None:
+            # Same pattern the original bridge used: apply immediately with
+            # the most recent longitudinal command. The lock serialises this
+            # against the director's own apply_control so the two never
+            # interleave a simulator RPC.
+            with self._sink_lock:
+                thr, brk = self._longitudinal
+                sink(thr, brk, self.stack_steer)
+
+    def set_control_sink(self, fn) -> None:
+        self._control_sink = fn
+
+    def set_longitudinal(self, throttle: float, brake: float) -> None:
+        self._longitudinal = (throttle, brake)
 
     def _on_lead_distance(self, msg: Float32) -> None:
         d = float(msg.data)
@@ -305,6 +388,16 @@ class ScenarioBridge(Node):
 
     def _on_control_mode(self, msg: String) -> None:
         self.acc_mode = msg.data
+
+    def _on_tracked_gap(self, msg: Float32) -> None:
+        self.tracked_gap = float(msg.data)
+
+    def _on_speed_ref(self, msg: Float32) -> None:
+        self.speed_ref = float(msg.data)
+
+    def _on_pinhole(self, msg: Float32) -> None:
+        d = float(msg.data)
+        self.pinhole_gap = None if d == float('inf') or d <= 0.0 else d
 
     def _on_yolo_ready(self, msg: Bool) -> None:
         self.yolo_ready = self.yolo_ready or bool(msg.data)
@@ -573,6 +666,9 @@ class ScenarioRunner:
             self.bridge.publish_speed(ego.speed)
             perceived = self.bridge.lead_distance
             acc_mode = self.bridge.acc_mode
+            tracked_gap = self.bridge.tracked_gap
+            speed_ref = self.bridge.speed_ref
+            pinhole_gap = self.bridge.pinhole_gap
             if (perceived is not None
                     and math.isnan(m.gap_at_first_detection_m)):
                 m.gap_at_first_detection_m = gap
@@ -624,7 +720,12 @@ class ScenarioRunner:
                 steer = self.lane_hold.step(lane.cross_track_m,
                                             lane.heading_err_rad, ego.speed)
 
-            self.adapter.apply_control(throttle, brake, steer)
+            # Hand the latest longitudinal command to the bridge so a
+            # steer callback arriving between iterations applies the right
+            # throttle/brake alongside it.
+            self.bridge.set_longitudinal(throttle, brake)
+            with self.bridge._sink_lock:
+                self.adapter.apply_control(throttle, brake, steer)
 
             # ---- metrics ----
             m.min_gap_m = min(m.min_gap_m, gap)
@@ -663,6 +764,14 @@ class ScenarioRunner:
                     # speed" — the two look identical in throttle/brake.
                     acc_mode=acc_mode,
                     acc_pd_active=(acc_mode == 'ACC'),
+                    # What the controller believes, vs gap_gt_m which is
+                    # truth and gap_perceived_m which is the raw topic.
+                    gap_tracked_m=(round(tracked_gap, 3)
+                                   if tracked_gap is not None else ''),
+                    v_ref_kmh=(round(speed_ref * 3.6, 2)
+                               if speed_ref is not None else ''),
+                    gap_pinhole_m=(round(pinhole_gap, 3)
+                                   if pinhole_gap is not None else ''),
                     throttle=round(throttle, 3),
                     brake=round(brake, 3),
                     steer=round(steer, 4),
@@ -690,6 +799,22 @@ class ScenarioRunner:
             if elapsed > timeout:
                 m.outcome = 'timeout'
                 break
+
+        # Recompute peak deceleration from the trace with a centred-window
+        # slope of v(t), and take that as the reported figure.
+        #
+        # The online estimate (sim_adapter's EMA, alpha=0.3) both lags and
+        # attenuates: on one 50 km/h run it reported a 7.29 m/s^2 peak
+        # where the true value was 9.11. Every peak_decel figure produced
+        # before this fix is understated by roughly that margin. A centred
+        # window cannot be used online — it needs samples from after the
+        # instant it describes — but the run record is offline by
+        # definition, so the KPI has no reason to inherit the online
+        # estimator's lag. Raw sample-to-sample differencing is not an
+        # option either: it peaks at 23 m/s^2 on single-sample noise.
+        peak = _peak_decel_from_trace(samples)
+        if peak is not None:
+            m.peak_decel_achieved_mps2 = peak
 
         m.final_gap_m = self.adapter.gap_m()
         m.final_speed_kmh = self.adapter.ego_state().speed * 3.6
@@ -962,6 +1087,10 @@ def main(argv=None) -> int:
         runway = adapter.straight_runway_m()
         print(f"[sim] straight runway ahead of the start line: "
               f"{runway:.0f} m", flush=True)
+
+        if args.lateral_mode == 'lkas':
+            # Zero-latency steer path — see ScenarioBridge._on_cmd_steer.
+            bridge.set_control_sink(adapter.apply_control)
 
         camera_pump = CameraPump(adapter, bridge)
         camera_pump.start()

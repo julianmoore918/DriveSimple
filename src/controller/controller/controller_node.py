@@ -34,6 +34,8 @@ Published topics:
                                                    straight to /Car_1/cmd_steer.
 """
 
+import math
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
@@ -128,6 +130,13 @@ class ACCNode(Node):
         # boundaries.
         self.mode_pub = self.create_publisher(String, '/ACC/control_mode', 10)
         self._mode = ''
+        # Diagnostics. The gap the controller actually acts on is NOT what
+        # /ACC/lead_vehicle_distance carries — it is tracked, predicted to
+        # now, and latency-compensated — and the governor's reference speed
+        # is invisible from outside entirely. Both were guesswork to debug
+        # from the traces, so publish them.
+        self.gap_pub = self.create_publisher(Float32, '/ACC/tracked_gap', 10)
+        self.vref_pub = self.create_publisher(Float32, '/ACC/speed_reference', 10)
 
         # ── ACC parameters ───────────────────────────────────────────────
         # NOTE: all distances below are *bumper-to-bumper gaps*, not
@@ -237,7 +246,43 @@ class ACCNode(Node):
         # the controller saw a stale "lots of room" reading and accelerated
         # into the back of a closing lead. 0.4 gives ~3-sample (≈300 ms)
         # response while still smoothing single-frame YOLO jitter.
-        self.ALPHA             = 0.4
+        # ── Lead-gap tracker (alpha-beta) ────────────────────────────────
+        # Replaces the old first-order low-pass on /ACC/lead_vehicle_distance.
+        #
+        # That filter was the single largest source of dead time in the
+        # whole loop. A first-order low-pass lags by (1-a)/a samples, and
+        # this one ran at the PERCEPTION rate (~12 Hz), not the control
+        # rate: alpha=0.4 -> 1.5 samples -> ~123 ms, out of a total
+        # measured brake->decel->estimate dead time of 208 ms. Simulated
+        # against the real plant, cutting dead time to ~104 ms is what
+        # brings peak deceleration under 5 m/s^2 (5.75 -> 4.83); no
+        # control-law change achieves that on its own. See DEBUG §43.
+        #
+        # An alpha-beta tracker fixes three things the low-pass could not:
+        #   1. No group delay — it PREDICTS between measurements instead
+        #      of lagging behind them.
+        #   2. Closing rate becomes an estimated STATE, not a numerical
+        #      derivative of an already-filtered noisy signal. The old
+        #      derivative flipped sign on far-range IPM jitter, which
+        #      dropped the kinematic braking latch mid-stop.
+        #   3. Between perception frames the control loop gets a fresh
+        #      extrapolated gap at 20 Hz rather than a held stale value.
+        #
+        # Beta is set from alpha by the standard critically-damped
+        # relation b = a^2/(2-a), which avoids the ringing an arbitrary
+        # pair produces.
+        self.AB_ALPHA          = 0.45
+        self.AB_BETA           = (self.AB_ALPHA ** 2) / (2.0 - self.AB_ALPHA)
+        self.track_d           = None   # estimated gap [m]
+        self.track_v           = 0.0    # estimated closing rate [m/s], -ve = closing
+        self.track_t           = None   # timestamp of the last tracker update
+        # Perception transport lag, measured by comparing the published
+        # distance against CARLA ground truth: the over-read scaled with
+        # speed (+1.95 m at 9.6 m/s, +1.44 m at 5.0 m/s) and collapsed to
+        # a near-constant ~0.25 s when divided by it — a latency, not a
+        # calibration bias. The tracker predicts forward by this much so
+        # the control law sees where the lead is NOW, not where it was.
+        self.PERCEPTION_LAG_S  = 0.25
         self.d_lead_filtered   = None
         # Consecutive no-detection frames bridged before the lead is
         # declared gone. 3 at the perception rate covers the 1-3 frame
@@ -320,16 +365,62 @@ class ACCNode(Node):
         # made the hunting asymmetric: the loop would dump 0.91 -> 0.10 in
         # one tick, undershoot, then ramp all the way back up.
         self.BRAKE_RATE_DOWN   = 0.10
-        # Brake authority model, fitted from the scenario traces:
-        #     decel [m/s^2] = brake * (16.70 - 0.814 * v_ego)
-        # (brake 0.781 measured 5.16 m/s^2 at 12.39 m/s and 9.61 at 5.39).
-        # Authority RISES as speed falls, so a fixed feed-forward is wrong
-        # at every speed but one. Scheduling it on v_ego leaves the PI only
-        # a small residual to trim — which matters a lot with 208 ms of
-        # delay, since the PI is the part the delay destabilises.
-        self.BRAKE_AUTH_A0     = 16.70
-        self.BRAKE_AUTH_A1     = 0.814
-        self.BRAKE_AUTH_MIN    = 4.0
+        # Brake authority model: decel [m/s^2] = brake * (A0 - A1*v_ego).
+        #
+        # REFITTED. The first fit used the scenario harness's logged
+        # acceleration, which is an EMA (alpha=0.3) and therefore both
+        # lagged and attenuated — it under-reported a 9.11 m/s^2 peak as
+        # 7.29. Fitting against a lagged signal produced authority values
+        # roughly half the truth, so the feed-forward asked for about
+        # twice the brake actually needed and the PI then had to unwind
+        # it. That is what drove the ramp-to-0.70-then-collapse cycles.
+        #
+        # Re-measured with a centred-window slope of v(t) (lag-free,
+        # noise-robust) over the 50 km/h traces, n=26, rms 1.60:
+        #     decel = brake * (34.2 - 1.84 * v)
+        # vs the old (16.7 - 0.81*v), i.e. 1.6-2.0x too small everywhere.
+        #
+        # Authority varies ~3x across the speed range, which is exactly why
+        # a fixed brake_scale could never work and scheduling is required.
+        #
+        # NOTE the fit is only supported over v ~2-14 m/s (the braking
+        # range of these runs). Extrapolated naively the line reaches zero
+        # near 18.6 m/s, which is unphysical, so it is clamped both ends.
+        # Re-fit before trusting it above ~50 km/h.
+        self.BRAKE_AUTH_A0     = 34.2
+        self.BRAKE_AUTH_A1     = 1.84
+        self.BRAKE_AUTH_MAX    = 30.0
+        # Authority assumed by the brake feed-forward. Deliberately the
+        # strong end of the measured range, not the middle — see
+        # brake_for_decel for why the bias direction matters.
+        self.BRAKE_FF_AUTHORITY = 30.0
+        # ── Speed governor ───────────────────────────────────────────────
+        # Deceleration the reference profile is designed around. The
+        # vehicle decelerates at this rate while it tracks the profile, so
+        # this — not a brake constant — is what sets the deceleration.
+        # Held below DECEL_LIMIT (5.0) so tracking error has somewhere to
+        # go before the R171 ceiling is reached: the profile aims for 3.0
+        # and the remaining 2.0 is margin for the speed loop's overshoot.
+        self.ACC_PROFILE_DECEL = 3.0
+        # How fast the reference may RISE again. Kept modest so a gap
+        # estimate that jumps outward cannot command a throttle surge —
+        # the previous run showed v_ref stepping back up 39.9 -> 44.4 km/h
+        # on estimator noise, which released the brake mid-stop.
+        self.ACC_PROFILE_ACCEL = 1.0
+        # Speed band over which the profile deceleration ramps from the
+        # comfort value up to DECEL_LIMIT. Below LO nothing changes, so
+        # low-speed stops stay as gentle as before.
+        self.ACC_DECEL_V_LO = 10.0   # 36 km/h
+        self.ACC_DECEL_V_HI = 30.0   # 108 km/h
+        # Largest speed error the governor will let build between the
+        # vehicle and its reference [m/s]. With cruise_gain = 0.3 an error
+        # of e produces ~0.3*e of brake, so 0.6 m/s keeps the proportional
+        # contribution near 0.18 — about 5 m/s^2 even at the strong end of
+        # the measured brake authority. Trim down if the late-stop
+        # deceleration is still harsh, up if the stop feels sluggish.
+        self.MAX_TRACK_ERROR_MPS = 0.6
+        self.v_ref_last        = 0.0
+        self.BRAKE_AUTH_MIN    = 6.0
         # Brake hold across a lost lead: see control_loop's CRUISE branch.
         self.last_acc_brake    = 0.0
         self.last_acc_brake_t  = None
@@ -353,6 +444,8 @@ class ACCNode(Node):
         # distance; the kinematic demand squares it, so it gets its own
         # low-pass before being used.
         self.closing_rate_filt = 0.0
+        # CLOSING_ALPHA is vestigial: the alpha-beta tracker estimates the
+        # closing rate directly, so there is nothing left to post-filter.
         self.CLOSING_ALPHA     = 0.4
         self.d_lead            = None
         self.prev_d_lead       = None
@@ -429,41 +522,60 @@ class ACCNode(Node):
             if d == float('inf') or d <= 0.0:
                 self.lead_miss_count += 1
                 if (self.lead_miss_count > self.LEAD_MISS_TOLERANCE
-                        or self.d_lead_filtered is None):
+                        or self.track_d is None):
                     # Genuinely gone (or never seen) — hand back to CRUISE.
-                    self.d_lead = None
-                    self.d_lead_filtered = None
-                    self.closing_rate_filt = 0.0
+                    self._reset_tracker()
                     return
-
-                # Bridge the miss. Extrapolating along the last known
-                # closing rate rather than merely freezing the value is
-                # deliberate: acc_control derives closing_rate by
-                # differencing d_lead, so a frozen distance would collapse
-                # the D term to zero and *reduce* braking during exactly
-                # the interval we are trying to hold it steady through.
-                dt = min(max(now - self.last_lead_time, 0.0), 0.2) \
-                    if self.last_lead_time is not None else 0.0
-                self.d_lead_filtered = max(
-                    0.0, self.d_lead_filtered + self.closing_rate_filt * dt)
-                self.d_lead = self.d_lead_filtered
-                self.last_lead_time = now
+                # Bridge the miss by coasting the tracker. No special case
+                # needed: prediction is what the tracker does anyway, so a
+                # dropout is simply an update-free interval.
                 return
 
             self.lead_miss_count = 0
 
-            # Low-pass filter: smooth out noisy distance measurements
-            # d_filtered = ALPHA * d_new + (1 - ALPHA) * d_prev
-            if self.d_lead_filtered is None:
-                self.d_lead_filtered = d  # initialise on first valid detection
-            else:
-                self.d_lead_filtered = self.ALPHA * d + (1 - self.ALPHA) * self.d_lead_filtered
+            # ---- alpha-beta update ----
+            if self.track_d is None:
+                self.track_d, self.track_v, self.track_t = d, 0.0, now
+                self.d_lead = d
+                return
 
-            self.d_lead = self.d_lead_filtered
-            self.last_lead_time = now
+            dt = min(max(now - self.track_t, 1e-3), 0.5)
+            d_pred = self.track_d + self.track_v * dt
+            residual = d - d_pred
+            self.track_d = d_pred + self.AB_ALPHA * residual
+            self.track_v = self.track_v + (self.AB_BETA / dt) * residual
+            self.track_t = now
 
         except Exception as e:
             self.get_logger().error(f"Lead distance callback error: {e}")
+
+    def _reset_tracker(self):
+        """Drop the lead track. Called when the miss tolerance expires or
+        control hands back to CRUISE."""
+        self.d_lead = None
+        self.track_d = None
+        self.track_v = 0.0
+        self.track_t = None
+        self.closing_rate_filt = 0.0
+
+    def _tracked_gap(self):
+        """Gap and closing rate predicted to NOW.
+
+        Two corrections are applied on top of the tracker state:
+          * `now - track_t` advances the estimate across the interval since
+            the last perception frame (~82 ms at 12 Hz), so the 20 Hz
+            control loop stops consuming a stale held value between frames.
+          * PERCEPTION_LAG_S advances it across the camera->YOLO->IPM
+            transport delay, so the control law sees where the lead is now
+            rather than where it was a quarter of a second ago.
+
+        Returns (gap [m] or None, closing_rate [m/s], negative = closing).
+        """
+        if self.track_d is None:
+            return None, 0.0
+        now = self.get_clock().now().nanoseconds / 1e9
+        dt = min(max(now - self.track_t, 0.0), 0.5) + self.PERCEPTION_LAG_S
+        return max(0.0, self.track_d + self.track_v * dt), self.track_v
 
     def target_speed_callback(self, msg):
         self.target_speed = msg.data / 3.6
@@ -489,7 +601,7 @@ class ACCNode(Node):
 
         Computes a desired longitudinal acceleration based on:
           - The distance error:  d_lead − d_desired
-          - The closing rate:    d(d_lead)/dt  (estimated numerically)
+          - The closing rate:    taken from the alpha-beta tracker state
 
         Parameters
         ----------
@@ -503,25 +615,18 @@ class ACCNode(Node):
         # Desired following distance: standstill gap + speed-dependent gap.
         d_desired = self.d0 + self.T_gap * v_ego
 
-        # -- Estimate closing rate from consecutive distance measurements --
+        # -- Closing rate comes from the tracker, not a difference quotient --
         # closing_rate > 0  → gap is increasing  (lead pulls away)
         # closing_rate < 0  → gap is shrinking    (ego approaches lead)
-        # closing_rate ≈ 0  → gap is stable
-        now = self.get_clock().now().nanoseconds / 1e9
-        closing_rate = 0.0
-
-        if self.prev_d_lead is not None and self.prev_time is not None:
-            dt = now - self.prev_time
-            if dt > 0.01:  # guard against division by zero / tiny dt
-                closing_rate = (d_lead - self.prev_d_lead) / dt
-
-        # Store current values for next iteration.
-        self.prev_d_lead = d_lead
-        self.prev_time = now
-
-        self.closing_rate_filt = (self.CLOSING_ALPHA * closing_rate
-                                  + (1.0 - self.CLOSING_ALPHA)
-                                  * self.closing_rate_filt)
+        # It used to be (d_lead - prev_d_lead)/dt over the already-low-passed
+        # distance, then low-passed again. Differentiating a filtered noisy
+        # signal is the worst way to get a velocity: on far-range IPM data
+        # (which swung 30+ m between frames) the result flipped sign
+        # repeatedly, dropping the kinematic braking latch mid-stop. The
+        # alpha-beta tracker estimates it as a state instead, so it is both
+        # smoother and free of the extra filter delay.
+        closing_rate = self.track_v
+        self.closing_rate_filt = closing_rate
 
         # -- PD control --
         # P-term: positive when too far (accelerate), negative when too
@@ -609,31 +714,269 @@ class ACCNode(Node):
         # PI trim. Anti-windup: stop integrating once the total command is
         # already outside the actuator range in the direction we're pushing.
         error = target - measured
-        # Speed-scheduled feed-forward instead of the fixed brake_scale.
-        authority = max(self.BRAKE_AUTH_MIN,
-                        self.BRAKE_AUTH_A0 - self.BRAKE_AUTH_A1 * self.v_ego)
-        ff = target / authority
-        unsat = ff + self.brake_kp * error + self.brake_integral
-        if (error > 0 and unsat < 1.0) or (error < 0 and unsat > 0.0):
+        # Feed-forward deliberately assumes the STRONGEST plausible brake.
+        #
+        # The speed-scheduled model this replaces cannot be trusted: the
+        # same 50 km/h run measured authority 7.6 at 45 km/h and 34.7 at
+        # 21 km/h — a 4.6x swing that no linear fit reproduces (the refit
+        # predicts only 2.1x). With the plant gain uncertain by that much,
+        # the direction of the modelling error decides whether the vehicle
+        # overshoots the deceleration limit or merely takes longer to
+        # reach it, and only one of those is acceptable in a law meant to
+        # BOUND deceleration.
+        #
+        # Assuming a strong brake makes the opening command small, so a
+        # plant that turns out stronger than expected cannot overshoot;
+        # the integrator supplies the rest when it turns out weaker.
+        # Simulated across the measured authority range, target 5 m/s^2:
+        #     ff assumes 8.6  -> peak 5.3 / 10.0 / 13.6   (overshoots badly)
+        #     ff assumes 30   -> peak 5.0 /  5.8 /  6.9   (bounded)
+        # The cost is onset time when the brake really is weak (~1.1 s to
+        # reach target instead of 0.25 s), i.e. stopping distance traded
+        # for a bounded peak. That is the correct trade here: collisions
+        # are already avoided up to ~70 km/h; the limit is what is not met.
+        ff = target / self.BRAKE_FF_AUTHORITY
+
+        # What the loop WANTS this tick, before any actuator limits.
+        requested = ff + self.brake_kp * error + self.brake_integral
+        commanded = max(0.0, min(requested, 1.0))
+        # What the actuator can actually deliver: rising is rate-limited,
+        # releasing is not (backing off must be immediate).
+        applied = min(commanded, self.prev_acc_brake + self.BRAKE_RATE_UP)
+        applied = max(applied, self.prev_acc_brake - self.BRAKE_RATE_DOWN)
+        applied = max(0.0, min(applied, 1.0))
+
+        # ---- anti-windup ----
+        # Integrate ONLY while the actuator is actually following the
+        # request. The previous test (`unsat < 1.0`) let the integrator
+        # keep charging all the way through the rate-limited ramp: during
+        # the ~0.3 s it takes to ramp to the feed-forward value the
+        # measured deceleration is still climbing, so the error stays
+        # positive, and by the time it clears the integrator has added
+        # enough to drive the command far past what was needed. Measured:
+        # the brake ramped to 0.70 where ~0.58 was the feed-forward and
+        # ~0.25 turned out to be enough, then had to unwind to zero —
+        # the ramp/collapse/ramp cycle in the traces.
+        #
+        # This is the standard remedy for an actuator with a rate limit:
+        # a rate-limited actuator is a *saturated* actuator for as long as
+        # it is ramping, and you must not integrate into a saturation.
+        tracking = (abs(applied - commanded) < 1e-9
+                    and 0.0 < applied < 1.0)
+        if tracking:
             self.brake_integral += self.brake_ki * error * self.CRUISE_DT
             self.brake_integral = max(min(self.brake_integral,
                                           self.brake_i_limit),
                                       -self.brake_i_limit)
 
-        brake = max(0.0, min(unsat, 1.0))
-        # Limit how fast the brake may RISE, so the loop never saturates
-        # during the window where it is still blind to the deceleration it
-        # is causing. Releasing is not limited — backing off must be able
-        # to happen immediately.
-        brake = min(brake, self.prev_acc_brake + self.BRAKE_RATE_UP)
-        brake = max(brake, self.prev_acc_brake - self.BRAKE_RATE_DOWN)
-        brake = max(0.0, min(brake, 1.0))
-        self.prev_acc_brake = brake
-        return brake
+        self.prev_acc_brake = applied
+        return applied
 
     # ====================================================================
     # CRUISE CONTROL (fallback when no lead vehicle detected)
     # ====================================================================
+
+    # ====================================================================
+    # SPEED GOVERNOR  (distance -> reference speed)
+    # ====================================================================
+
+    def speed_reference(self, gap: float, closing_rate: float,
+                        v_ego: float) -> float:
+        """The speed the vehicle should be doing right now, given the gap.
+
+        This replaces commanding a force or an acceleration. Braking is
+        expressed as a SPEED PROFILE and handed to the speed loop:
+
+            v_ref = v_lead + sqrt(2 * a_profile * (gap - d_desired))
+
+        Two properties make this the right shape for a law that has to
+        BOUND deceleration:
+
+        1. Differentiating the profile along the trajectory gives exactly
+           -a_profile. So while the vehicle tracks it, the deceleration is
+           whatever we designed, not whatever the brake happened to do.
+        2. It closes the loop on SPEED, which is measured directly, at
+           20 Hz, with no meaningful lag. Every previous attempt closed on
+           deceleration — differentiated, filtered, and delayed — or fed
+           brake forward through a gain we could not predict.
+
+        That gain is the reason for the rewrite. Measured cleanly, brake
+        authority (achieved decel / brake command) ranges 8-49 across the
+        run and varies 2-3x WITHIN a single speed band, so it is not a
+        function of speed we failed to fit — it is not predictable at all.
+        No feed-forward survives that. A speed loop does, because its
+        integrator simply finds whatever brake produces the required
+        speed, and a gain error shows up as a small speed error rather
+        than a deceleration overshoot.
+
+        The v_lead term generalises it to a moving lead: with the lead
+        matching our speed the sqrt term handles the gap error alone, and
+        with a stationary lead v_lead is 0 and this reduces to the plain
+        distance-to-stop profile.
+        """
+        v_lead = max(0.0, v_ego + closing_rate)
+        # Headway is referenced to the LEAD's speed, not the ego's.
+        #
+        # With d_safe = d0 + T_gap*v_ego the profile asks the vehicle to
+        # stop at its own current-speed headway: at 50 km/h that is 22.8 m,
+        # so v_ref hit zero while the gap was still 20 m and the car would
+        # have halted 20 m short of a stationary target. Referencing the
+        # lead makes the policy degenerate correctly — a stationary lead
+        # gives d_safe = d0, so the profile runs all the way down to the
+        # standstill gap — while still yielding a T_gap-second headway
+        # behind a moving one (as gap -> d_safe, v_ref -> v_lead).
+        d_safe = self.d0 + self.T_gap * v_lead
+        gap_err = gap - d_safe
+
+        # Profile deceleration scales with speed: the faster we are going,
+        # the more of the available budget the profile is allowed to use.
+        # Below ACC_DECEL_V_LO the comfort value is kept unchanged; above
+        # ACC_DECEL_V_HI the profile is allowed the full DECEL_LIMIT.
+        #
+        # Note the onset distance, d0 + v^2/(2a), already grows with the
+        # SQUARE of speed, so braking starts far earlier at speed whatever
+        # `a` is (12.9 m at 30 km/h, ~132 m at 130 km/h). What this adds is
+        # the other half of the request — braking harder, not just sooner —
+        # which matters because at high speed a fixed comfort rate cannot
+        # bring the car down inside the distance perception actually gives.
+        span = max(1e-3, self.ACC_DECEL_V_HI - self.ACC_DECEL_V_LO)
+        frac = (v_ego - self.ACC_DECEL_V_LO) / span
+        frac = max(0.0, min(1.0, frac))
+        a = (self.ACC_PROFILE_DECEL
+             + (self.DECEL_LIMIT - self.ACC_PROFILE_DECEL) * frac)
+
+        if gap_err >= 0.0:
+            v_ref = v_lead + math.sqrt(2.0 * a * gap_err)
+        else:
+            # Inside the desired gap — target below the lead's speed so the
+            # gap reopens, rather than merely matching and staying close.
+            v_ref = v_lead - math.sqrt(2.0 * a * (-gap_err))
+
+        v_ref = max(0.0, min(v_ref, self.target_speed))
+
+        # ---- rate-limit the reference ----
+        # The gap estimate still steps: measured, the tracked gap moved
+        # 27.7 -> 24.6 m within one 50 ms tick, which threw v_ref from
+        # 49.3 to 44.7 km/h and had the speed loop slamming the brake from
+        # 0.31 to 0 to 0.53 chasing it. The loop was tracking correctly;
+        # the reference was not physically realisable.
+        #
+        # Since deceleration equals -dv_ref/dt while the vehicle tracks the
+        # profile, bounding the reference's rate of change bounds the
+        # commanded deceleration DIRECTLY — no matter how noisy the gap
+        # estimate is. This is what actually makes the limit hold: it moves
+        # the guarantee out of the (unpredictable) brake plant and into the
+        # trajectory, where it is arithmetic.
+        # Rate-limit the DESCENT at the hard limit, not the comfort target.
+        #
+        # Limiting it to ACC_PROFILE_DECEL looked right — the profile's own
+        # time-derivative is exactly that while it is being tracked — but
+        # it is only true when tracking is perfect. Running ~3 km/h above
+        # the reference, the gap closes faster than the profile assumed, so
+        # v_prof(gap(t)) falls faster than the comfort rate and the limiter
+        # blocked the reference from ever catching up. Measured: the
+        # reference marched down a straight 3.00 m/s^2 line while the true
+        # profile dropped away beneath it, and the vehicle was still doing
+        # 23.5 km/h with 2.00 m of gap left. It hit the target.
+        #
+        # The profile still ASKS for ACC_PROFILE_DECEL in the nominal case;
+        # this bound only binds when the reference has to catch up, or when
+        # estimator noise would otherwise demand something absurd. Placing
+        # it at DECEL_LIMIT keeps the R171 guarantee intact while leaving
+        # the authority to actually stop.
+        dv_down = self.DECEL_LIMIT * self.CRUISE_DT
+        dv_up = self.ACC_PROFILE_ACCEL * self.CRUISE_DT
+        v_ref = max(v_ref, self.v_ref_last - dv_down)
+        # Ratchet. While the gap is CLOSING the reference may fall but not
+        # rise. The tracked gap still wobbles a metre or so frame to frame
+        # (24.76 -> 25.25 -> 24.50 measured), and without this the profile
+        # wobbles with it: v_ref climbed +0.36 twice mid-stop, the brake
+        # released to zero, deceleration sagged from 3.9 to 2.3 — and the
+        # distance lost there had to be paid back at the end as 6.2 m/s^2.
+        # That release WAS the harsh late braking.
+        #
+        # Rising is still allowed once the gap genuinely opens (the lead
+        # pulling away, closing_rate >= 0), so this does not trap the
+        # vehicle at a low reference behind a car that has moved on.
+        if closing_rate < 0.0:
+            v_ref = min(v_ref, self.v_ref_last)
+        else:
+            v_ref = min(v_ref, self.v_ref_last + dv_up)
+
+        # An earlier version clamped v_ref to v_ego - 0.6 m/s here to stop
+        # the tracking error growing. It backfired: holding the reference
+        # just under the vehicle starves the loop of the error signal it
+        # needs, and with the integrator still carrying the cruise throttle
+        # (~2.15, what held 50 km/h) the loop stayed net-POSITIVE and drove
+        # throttle into a stationary target. Unwinding at ki*e = 0.09/s
+        # would have taken ~12 s; the car arrived first, at 24.6 km/h.
+        #
+        # The reference must be free to lead. Bounding actual deceleration
+        # is the rate limit's job above; keeping the error small is the
+        # speed loop's, via the integral handover in speed_control.
+        return max(0.0, v_ref)
+
+    def speed_control(self, v_target: float, integrate: bool = True,
+                      brake_cap: float = 1.0) -> tuple:
+        """PI speed tracking. Shared by CRUISE and ACC.
+
+        CRUISE passes the set speed; ACC passes the governor's reference.
+        Having one loop for both removes the old
+        `min(acc_throttle, cruise_throttle)` / `max(acc_brake, cruise_brake)`
+        combination, which existed only because two independent controllers
+        were fighting over the same actuator.
+
+        `brake_cap` lets CRUISE keep its gentle 0.6 ceiling for bleeding off
+        overshoot while ACC gets full authority.
+        """
+        speed_error = v_target - self.v_ego
+
+        # Bumpless handover between accelerating and braking. The
+        # integrator holds whatever throttle sustained the PREVIOUS
+        # setpoint, and that bias survives into a braking event — it is
+        # what kept throttle at 0.43 while closing on a stationary target.
+        # Once the required action reverses sign the stored term is no
+        # longer the right answer, so dropping it costs nothing and
+        # removes a multi-second delay before the brake is reached.
+        if speed_error < 0.0 and self.cruise_integral > 0.0:
+            self.cruise_integral = 0.0
+        elif speed_error > 0.0 and self.cruise_integral < 0.0:
+            self.cruise_integral = 0.0
+
+        u_p = self.cruise_gain * speed_error
+        if integrate:
+            u_unsat = u_p + self.cruise_ki * self.cruise_integral
+            if -1.0 < u_unsat < self.cruise_throttle_cap:
+                self.cruise_integral += speed_error * self.CRUISE_DT
+                self.cruise_integral = max(min(self.cruise_integral,
+                                               self.cruise_i_limit),
+                                           -self.cruise_i_limit)
+        u = u_p + self.cruise_ki * self.cruise_integral
+
+        if u > 0.0:
+            self.prev_acc_brake = 0.0
+            return (min(u, self.cruise_throttle_cap), 0.0)
+
+        if self.simulator == 'morai':
+            # MORAI's brake leaves the vehicle stuck rather than
+            # decelerating smoothly (DEBUG.md) — coast instead.
+            self.prev_acc_brake = 0.0
+            return (0.0, 0.0)
+
+        if u > -self.CRUISE_BRAKE_DEADBAND:
+            self.prev_acc_brake = max(0.0, self.prev_acc_brake
+                                      - self.BRAKE_RATE_DOWN)
+            return (0.0, self.prev_acc_brake)
+
+        brake = min(-u, brake_cap)
+        # Rate-limit both directions. Rising slowly keeps the loop from
+        # slamming the brake before the speed response is visible; falling
+        # slowly stops the release/re-apply chatter seen in earlier runs.
+        brake = min(brake, self.prev_acc_brake + self.BRAKE_RATE_UP)
+        brake = max(brake, self.prev_acc_brake - self.BRAKE_RATE_DOWN)
+        brake = max(0.0, min(brake, brake_cap))
+        self.prev_acc_brake = brake
+        return (0.0, brake)
 
     def cruise_control(self, integrate: bool = True) -> tuple:
         """
@@ -666,6 +1009,18 @@ class ACCNode(Node):
         # PI. Anti-windup: only accumulate while the unsaturated command
         # is still inside the actuator range, and only when this branch
         # actually owns the vehicle.
+        # Bumpless handover between accelerating and braking. The
+        # integrator holds whatever throttle sustained the PREVIOUS
+        # setpoint, and that bias survives into a braking event — it is
+        # what kept throttle at 0.43 while closing on a stationary target.
+        # Once the required action reverses sign the stored term is no
+        # longer the right answer, so dropping it costs nothing and
+        # removes a multi-second delay before the brake is reached.
+        if speed_error < 0.0 and self.cruise_integral > 0.0:
+            self.cruise_integral = 0.0
+        elif speed_error > 0.0 and self.cruise_integral < 0.0:
+            self.cruise_integral = 0.0
+
         u_p = self.cruise_gain * speed_error
         if integrate:
             u_unsat = u_p + self.cruise_ki * self.cruise_integral
@@ -737,6 +1092,18 @@ class ACCNode(Node):
         """
         control_msg = Twist()
 
+        # Refresh the gap from the tracker every tick. Previously d_lead
+        # was only written when a perception message arrived (~12 Hz), so
+        # between frames this 20 Hz loop re-used a stale value that was
+        # already ~123 ms behind reality thanks to the old low-pass. The
+        # tracker predicts to the current instant instead, which is where
+        # most of the recovered dead time comes from.
+        tracked, _ = self._tracked_gap()
+        if tracked is not None:
+            self.d_lead = tracked
+            self.gap_pub.publish(Float32(data=float(tracked)))
+        self.vref_pub.publish(Float32(data=float(self.v_ref_last)))
+
         # ---- MODE 0: MODEL-LOAD GATE ----
         # Refuse to command any throttle until both perception models
         # (YOLO for ACC, UFLD for LKAS) have confirmed they're loaded.
@@ -747,6 +1114,7 @@ class ACCNode(Node):
             self.cruise_integral = 0.0
             self.brake_integral = 0.0
             self.prev_acc_brake = 0.0
+            self.v_ref_last = self.v_ego
             self._publish_mode('GATE')
             self.control_pub.publish(control_msg)  # throttle=0, brake=0
             self.prev_throttle = 0.0
@@ -771,6 +1139,7 @@ class ACCNode(Node):
             self.cruise_integral = 0.0
             self.brake_integral = 0.0
             self.prev_acc_brake = 0.0
+            self.v_ref_last = self.v_ego
             self._publish_mode('STANDSTILL')
             self.control_pub.publish(control_msg)
             self.prev_throttle = 0.0
@@ -780,7 +1149,11 @@ class ACCNode(Node):
 
         # ---- MODE 2: CRUISE (no lead vehicle detected) ----
         if self.d_lead is None:
-            throttle, brake = self.cruise_control()
+            # Same loop the ACC branch uses, just tracking the set speed.
+            # 0.6 brake ceiling: cruise only ever bleeds off overshoot,
+            # it never has to stop for anything.
+            throttle, brake = self.speed_control(self.target_speed,
+                                                 brake_cap=0.6)
 
             # Brake hold across a lost lead. Falling into CRUISE mid-stop
             # used to drop the brake straight to 0 and open the throttle
@@ -808,12 +1181,12 @@ class ACCNode(Node):
             control_msg.linear.x = throttle
             control_msg.linear.y = brake
             self.brake_integral = 0.0
+            self.v_ref_last = self.v_ego
             self._publish_mode('CRUISE')
             self.control_pub.publish(control_msg)
 
-            # Reset closing-rate state since there is no lead vehicle
-            self.prev_d_lead = None
-            self.prev_time = None
+            # Closing rate is a tracker state now; prev_d_lead/prev_time
+            # were the old difference-quotient scratch and are unused.
 
             if ENABLE_LOGGING:
                 self._log_throttled("CRUISE", throttle, brake)
@@ -826,6 +1199,7 @@ class ACCNode(Node):
             self.cruise_integral = 0.0
             self.brake_integral = 0.0
             self.prev_acc_brake = 0.0
+            self.v_ref_last = self.v_ego
             self._publish_mode('EMERGENCY')
             self.control_pub.publish(control_msg)
             self.prev_throttle = 0.0
@@ -833,37 +1207,27 @@ class ACCNode(Node):
                 self._log_throttled("EMERGENCY", 0.0, 1.0)
             return
 
-        # ---- MODE 4: ACC (adaptive distance control) ----
-        a = self.acc_control(self.v_ego, self.d_lead)
+        # ---- MODE 4: ACC (speed governor) ----
+        # The governor turns the gap into a reference SPEED; the speed loop
+        # tracks it. Deceleration is set by the shape of the profile rather
+        # than by a brake command, so it is bounded by design instead of by
+        # calibration — which matters because brake authority here is not
+        # predictable (8-49, and 2-3x within a single speed band).
+        #
+        # This also retires the old min(acc_throttle, cruise_throttle) /
+        # max(acc_brake, cruise_brake) combination: the governor already
+        # clamps its reference to target_speed, so "follow the lead OR hold
+        # set speed, whichever is slower" falls out of one loop instead of
+        # two controllers arguing over one actuator.
+        v_ref = self.speed_reference(self.d_lead, self.track_v, self.v_ego)
+        self.v_ref_last = v_ref
+        throttle, brake = self.speed_control(v_ref)
 
-        if a >= 0:
-            acc_throttle = min(a / self.throttle_scale, 1.0)
-            acc_brake    = 0.0
-            # Not braking — don't let the trim wind up for the next event.
-            self.brake_integral = 0.0
-            self.prev_acc_brake = 0.0
-        else:
-            acc_throttle = 0.0
-            # Closed loop on achieved deceleration, bounded at DECEL_LIMIT.
-            acc_brake    = self.brake_for_decel(-a)
-            if acc_brake > 0.0:
-                self.last_acc_brake = acc_brake
-                self.last_acc_brake_t = self.get_clock().now().nanoseconds / 1e9
+        if brake > 0.0:
+            self.last_acc_brake = brake
+            self.last_acc_brake_t = self.get_clock().now().nanoseconds / 1e9
 
-        # ACC must respect CRUISE_SPEED_KMH as an upper cap. The PD law
-        # above has no concept of "we're already at set speed" — with a
-        # lead 30 m ahead, distance_error stays large and saturates
-        # a → a_max → throttle = 1.0 *indefinitely*, even past 100 km/h.
-        # Real ACC behaves as "follow the lead OR hold set speed,
-        # whichever is slower" — implemented here as the lower throttle
-        # and the higher brake of the two controllers. The cruise side
-        # commands brake whenever v_ego > target + 0.5, which arrests
-        # the runaway.
-        cruise_throttle, cruise_brake = self.cruise_control(integrate=False)
-        throttle = min(acc_throttle, cruise_throttle)
-        brake    = max(acc_brake,    cruise_brake)
-
-        # Rate limit throttle — braking is always instant
+        # Rate limit throttle — braking is rate-limited inside speed_control
         throttle = min(throttle, self.prev_throttle + self.THROTTLE_RATE_LIMIT)
         self.prev_throttle = throttle
 

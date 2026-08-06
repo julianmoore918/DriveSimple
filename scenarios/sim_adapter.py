@@ -534,16 +534,39 @@ class CarlaAdapter(SimAdapter):
     def lane_error(self) -> LaneError:
         carla = self._carla
         ego_tf = self._ego_tf()
+
+        # Cross-track is measured against the START-LINE RAY, not against a
+        # per-tick waypoint lookup.
+        #
+        # get_waypoint() snaps to whatever lane is nearest, so the instant
+        # the vehicle crosses a marking the reference jumps to the next
+        # lane and the reported error flips sign. One 70 km/h run showed
+        # cte going -1.66 -> +1.47 m in a single 50 ms sample while the
+        # vehicle's world y moved a steady +0.26 m per sample: a straight
+        # lane departure, reported as a 3.13 m oscillation. The metric hid
+        # exactly the failure it existed to reveal.
+        #
+        # This scenario runs on a dead-straight road by construction, so
+        # the start ray IS the intended path and the perpendicular offset
+        # from it is the honest lateral error, unbounded by lane width.
+        p0 = self._start_tf.location
+        start_right = self._start_tf.get_right_vector()
+        d0x = ego_tf.location.x - p0.x
+        d0y = ego_tf.location.y - p0.y
+        cte_ray = d0x * start_right.x + d0y * start_right.y
+
         wp = self.map.get_waypoint(ego_tf.location, project_to_road=True,
                                    lane_type=carla.LaneType.Driving)
         lane_tf = wp.transform
         right = lane_tf.get_right_vector()
         d = ego_tf.location - lane_tf.location
-        cte = d.x * right.x + d.y * right.y
+        # Heading error still comes from the local lane (it is continuous
+        # across lane boundaries and is what the locked-lateral controller
+        # needs); only the cross-track term uses the start ray.
         heading_err = math.radians(
             (lane_tf.rotation.yaw - ego_tf.rotation.yaw + 540.0) % 360.0
             - 180.0)
-        return LaneError(cross_track_m=cte, heading_err_rad=heading_err)
+        return LaneError(cross_track_m=cte_ray, heading_err_rad=heading_err)
 
     def apply_control(self, throttle: float, brake: float,
                       steer: float) -> None:

@@ -3648,3 +3648,205 @@ on every tick regardless of whether anything new has actually arrived
 from the erratic upstream camera. Working as designed, not a
 regression — but means "higher Hz" on those two topics specifically
 doesn't imply "more real new content," just a faster re-publish clock.
+
+---
+
+## 45. Longitudinal rework — ACC rebuilt as a speed governor, and the measurement errors that hid the real problems [DONE]
+
+Driven by the R171 harness (§43). The headline was simple — "deceleration
+exceeds 5 m/s²" — but four separate causes were stacked behind it, two of
+them **in the measurement rather than the controller**. Recording the false
+trails as well as the fixes, because three of them looked conclusive at the
+time and cost a lot of runs.
+
+### 45.1 Measurement errors that pointed the wrong way [FIXED]
+
+**The harness's own acceleration signal was lagged and attenuated.**
+`sim_adapter` estimated acceleration with an EMA (α=0.3) and the KPI read
+it directly. On one 50 km/h run it reported a **7.29 m/s² peak where the
+truth was 9.11**. Everything derived from that signal inherited the error:
+
+* A brake-vs-deceleration cross-correlation put the loop's dead time at
+  **208 ms**, and a whole tuning pass was built on "the dead time is the
+  binding constraint". Re-measured with a **centred-window slope of v(t)**
+  (lag-free, noise-robust) the two align at **~zero lag**. Most of that
+  208 ms was the filter being measured through.
+* The brake-authority model `decel = brake*(16.7 - 0.81*v)` was fitted to
+  the same lagged signal and came out ~2x too small, so the feed-forward
+  asked for roughly twice the brake actually needed.
+
+The KPI now recomputes peak deceleration offline with a centred window.
+Raw sample-to-sample differencing is not an alternative — it peaks at
+23 m/s² on single-sample noise.
+
+**The KPI also included the approach phase.** `_peak_decel_from_trace` ran
+over every sample, and the scenario's own kinematic snap to the test speed
+differentiates to ~12 m/s² at t≈1 s. Runs were being reported at 11.81 and
+12.26 m/s² when the post-handover peaks were 8.63 and 9.11. Now restricted
+to the measure phase.
+
+**`cte_m` hid a lane departure as an oscillation.** The harness computed
+cross-track from a per-tick `map.get_waypoint()`, which snaps to whichever
+lane is nearest. One 70 km/h run reported cte swinging **-1.66 → +1.47 m
+in a single 50 ms sample** while world `y` moved a steady +0.26 m per
+sample — a clean 2.89 m lane departure, reported as a 3.13 m oscillation.
+Now anchored to the start-line ray, which on a dead-straight scenario IS
+the intended path and is unbounded by lane width.
+
+### 45.2 The brake plant is not modellable [KNOWN]
+
+Measured cleanly, brake authority (achieved decel / brake command) ranges
+**8 to 49**, and varies **2-3x within a single speed band** — the spread at
+8-10 m/s is 18-49. It is not hidden speed dependence that a better fit
+would capture; it is not predictable from speed at all.
+
+That killed the whole family of approaches that compute a brake force:
+the PD law, the closed-loop deceleration PI, the scheduled feed-forward.
+No feed-forward survives 3x gain uncertainty, and a feedback loop on
+deceleration has to close around a differentiated, filtered, delayed
+signal. Every one of them hunted: ramp to 0.70, collapse to zero, ramp
+again.
+
+### 45.3 The rewrite — speed governor [DONE]
+
+`acc_control` + the kinematic term + `brake_for_decel` are replaced by
+`speed_reference()` + a shared `speed_control()`. Distance is turned into a
+reference SPEED and the speed loop tracks it:
+
+```
+v_lead = max(0, v_ego + closing_rate)
+d_safe = d0 + T_gap * v_lead
+v_ref  = v_lead + sqrt(2 * a_profile * (gap - d_safe))
+```
+
+Why this shape:
+
+* Differentiating the profile along the trajectory gives exactly
+  `-a_profile`, so **deceleration is set by the plan, not by the brake**.
+  The guarantee moves out of the unpredictable plant and into arithmetic.
+* It closes on SPEED — measured directly, at 20 Hz, with no meaningful
+  lag — instead of on deceleration.
+* One loop now serves CRUISE and ACC, retiring the
+  `min(acc_throttle, cruise_throttle)` / `max(acc_brake, cruise_brake)`
+  combination that existed only because two controllers were fighting one
+  actuator.
+
+Four things were load-bearing and are easy to get wrong:
+
+1. **Headway references the LEAD's speed, not the ego's.** With
+   `d_safe = d0 + T_gap*v_ego` the profile asks the vehicle to stop at its
+   own current-speed headway — 22.8 m at 50 km/h — so `v_ref` hit zero
+   with 20 m of gap left and the car halted 20 m short. Referencing the
+   lead degenerates correctly: a stationary lead gives `d_safe = d0`.
+2. **The reference is rate-limited at DECEL_LIMIT, not at a_profile.**
+   Limiting it to the comfort rate looked right (the profile's own time
+   derivative is exactly that) but only holds when tracking is perfect.
+   Running 3 km/h above the reference the gap closes faster than the
+   profile assumed, the true profile falls away beneath the limiter, and
+   the reference never catches up — the vehicle was still doing 23.5 km/h
+   with 2.00 m of gap left, and hit the target.
+3. **Ratchet: the reference may not rise while the gap is closing.** The
+   tracked gap still steps ~1 m frame to frame; without the ratchet `v_ref`
+   rose 65 times mid-stop (+5.3 km/h cumulative), releasing the brake,
+   sagging deceleration from 3.9 to 2.3 — and that lost distance was repaid
+   at the end as 6.2 m/s². The harsh late braking WAS a mid-stop release.
+4. **Bumpless integral handover.** The integrator holds whatever throttle
+   sustained the previous setpoint (~2.15 while cruising at 50 km/h) and
+   that bias survives into a braking event. The loop stayed net-positive
+   and drove **throttle 0.43 into a stationary target**; unwinding at
+   `ki*e = 0.09/s` would have taken ~12 s. It is now dropped the moment the
+   required action reverses sign.
+
+**A failed fix worth not repeating:** clamping `v_ref` to `v_ego - 0.6 m/s`
+to bound the tracking error. It starves the loop of the very error signal
+that unwinds the integrator, and turned "brakes too hard at the end" into
+"does not brake at all". The reference must be free to lead.
+
+### 45.4 Estimator — alpha-beta tracker [DONE]
+
+The `ALPHA = 0.4` low-pass on `/ACC/lead_vehicle_distance` was the single
+largest source of lag in the sensing path: a first-order filter lags
+`(1-a)/a` samples and it ran at the **perception** rate (~12 Hz), so ~123 ms
+of the budget. Replaced with an alpha-beta tracker (`beta = a²/(2-a)`,
+critically damped) that predicts to now and compensates a measured ~0.25 s
+perception transport lag. Scored on replayed real data: bias **+1.53 →
++0.20 m**, RMS **2.20 → 0.97 m**.
+
+Closing rate is now a tracker STATE rather than a difference quotient over
+an already-filtered signal — the old derivative flipped sign on far-range
+noise, which dropped the braking latch mid-stop.
+
+Short dropouts are bridged (`LEAD_MISS_TOLERANCE = 3` frames). Before that,
+a single `inf` nulled `d_lead`, and MODE 2 (CRUISE) is tested *before*
+EMERGENCY and ACC — so mid-stop the brake was released and the throttle
+opened toward set speed. Measured: 103 of 140 samples in one run had no
+detection, mean brake 0.010 while blind versus 0.445 while tracking.
+
+### 45.5 Cruise was P-only [FIXED]
+
+Covered in §42. Included here because it was the first symptom chased and
+looked like a scenario bug ("30 km/h falls back to 25") when it was a
+4.3-5.0 km/h steady-state droop affecting every setpoint.
+
+### 45.6 Perception range was the real ceiling [FIXED]
+
+`estimateLeadDist` was *rejecting* detections, not missing them. The
+`in_lane is None` branch — "no UFLD centerline at this X", which is the
+far-range case by definition — dropped them outright, capping effective
+detection at 17-23 m. Replaced with a ground-space ego-lane corridor
+(`LANE_FALLBACK_HALF_W = 1.5 m`), used only when the measured centerline is
+unavailable. Metres, not pixels: at 40 m an adjacent-lane car sits only
+~56 px off centre, so no fixed pixel strip separates the cases at both
+ranges. Detection went to 90-155 m immediately.
+
+`MAX_IPM_TRUST_M` then became the binding limit and was raised 40 → 80 m.
+70 km/h needs ~44 m of sight to stop within 5 m/s²; the cap was holding
+first detection at ~34 m, which demands 5.89. **70 km/h passes at 80 m.**
+
+### 45.7 Steer latency regression [FIXED]
+
+The harness polled `/Car_1/cmd_steer` once per director iteration (~19 Hz)
+where the original bridge applied it event-driven in the callback. That
+added up to **52 ms of latency to the lateral loop — 1.0 m of travel at
+70 km/h** — and Stanley, which had been holding 70 km/h lanes, drifted out
+of them. Restored to event-driven application with a lock serialising it
+against the director's own `apply_control`. Cross-track went from a 2.89 m
+departure to **±0.15 m**.
+
+Worth remembering as a class of bug: nothing in `stanley_node.py` or
+`lane_detection_node.py` changed. The regression was entirely in how often
+its output reached the vehicle.
+
+### 45.8 Where it stands
+
+| | |
+|---|---|
+| 30 km/h | passes |
+| 50 km/h | passes |
+| 70 km/h | passes (with `MAX_IPM_TRUST_M = 80`) |
+| 90 km/h+ | untested since the rework |
+
+Peak deceleration still runs above 5 m/s² on some stops. The reference
+descent is hard-bounded, but the total is reference + the speed loop's
+correction, and the correction's outcome still depends on the plant gain
+that §45.2 showed is unpredictable.
+
+**Open, in rough priority order:**
+
+* **Switch the published distance to the pinhole estimate.** Already
+  computed and published in parallel on `/ACC/lead_distance_pinhole`.
+  Scored against ground truth over the same runs: bias **+0.19 m vs
+  +1.62 m**, RMS **0.47 vs 1.86 m**, and flat with range where IPM's grows
+  (+0.87 → +3.28 m). Keep IPM below ~10 m where boxes clip the frame edge.
+  Note the pitch hypothesis that motivated it was **wrong** — IPM error is
+  the same braking (+1.86 ±0.85) as coasting (+1.82 ±0.85), so it is a
+  static calibration offset, not dynamic pitch.
+* **Re-check `PERCEPTION_LAG_S = 0.25`** afterwards. It was tuned against
+  IPM's +1.6 m bias and currently over-compensates: tracked gap reads
+  1.5-3 m BELOW truth.
+* **The tracker is amplifying, not smoothing** — raw 0.352 m/sample in,
+  tracked 0.413 m/sample out. Suspect the 0.25 s prediction multiplying a
+  noisy velocity state; lower `AB_ALPHA` now that prediction covers the lag.
+* `acc_control`, `brake_for_decel` and `cruise_control` are called 0x.
+  Left in place for comparison against the governor; delete once it proves
+  out.
