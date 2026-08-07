@@ -94,30 +94,78 @@ perception processes still unlock the throttle (see DEBUG.md §33e).
 
 ### ACC control laws
 
-**CRUISE mode** — symmetric proportional law with a 0.5 m/s deadband:
+Both modes share **one speed loop**. Distance is turned into a *reference
+speed* and the loop tracks it, rather than either mode computing a brake
+force directly — see DEBUG §45 for why (brake authority in CARLA measures
+8–49 and varies 2–3× within a single speed band, so no force-based
+feed-forward is reliable).
 
-    e_v      = v_target − v_ego
-    throttle = min(k_cruise · e_v, cap)    if e_v > +0.5 m/s
-    brake    = min(k_cruise · |e_v|, 0.6)   if e_v < −0.5 m/s
-    else     throttle = brake = 0
+**Speed governor** — gap to reference speed:
 
-**ACC mode** — desired following distance and PD control on the gap:
+    v_lead = max(0, v_ego + closing_rate)
+    d_safe = d0 + T_gap · v_lead
+    v_ref  = v_lead + sqrt(2 · a_profile · (gap − d_safe))
+    v_ref  = clamp(v_ref, 0, v_set)
 
-    d_desired = d0 + T_gap · v_ego
-    a         = k_p · (d_lead − d_desired) + k_d · d(closing_rate)/dt
+then rate-limited (descent ≤ `DECEL_LIMIT`, rise ≤ `ACC_PROFILE_ACCEL`) and
+ratcheted so it cannot rise while the gap is closing.
+
+Deceleration equals `−dv_ref/dt` while the vehicle tracks the profile, so
+it is bounded by the *shape of the plan* rather than by brake calibration.
+`a_profile` scales with speed from `ACC_PROFILE_DECEL` up to `DECEL_LIMIT`.
+
+**Speed loop** — PI, shared by CRUISE (tracks the set speed) and ACC
+(tracks `v_ref`):
+
+    e_v = v_target − v_ego
+    u   = k_cruise · e_v + k_i · ∫e_v
+    u > 0 → throttle = min(u, cap)
+    u < 0 → brake    = −u, rate-limited ±0.10/tick
+
+The integrator is dropped whenever the required action reverses sign, so a
+cruise throttle bias cannot survive into a braking event.
+
+**Lead-gap estimation** — an α-β tracker on `/ACC/lead_vehicle_distance`
+predicts to the current instant and compensates the perception transport
+lag; closing rate is a tracker state, not a difference quotient. Short
+detection dropouts are bridged (`LEAD_MISS_TOLERANCE`).
+
+**EMERGENCY** remains a separate branch at full brake, deliberately not
+bound by `DECEL_LIMIT`.
 
 ### ACC tuned values
 
 | Symbol | Meaning | Value |
 |---|---|---|
-| `CRUISE_SPEED_KMH` | Setpoint (offset above declared 20 km/h to compensate for P-controller steady-state error, see DEBUG.md §33d) | **25 km/h** |
-| `d0` | Standstill gap | 5.0 m |
-| `T_gap` | Time headway | 1.5 s |
-| `k_p` | Distance gain | 1.2 |
-| `k_d` | Closing-rate gain | 0.8 |
-| `emergency_distance` | EMERGENCY-brake threshold | 3.0 m |
-| `MIN_CONFIDENCE` | YOLO detection confidence gate | 0.80 |
-| `MIN_PUBLISHED_GAP_M` | Lower clamp on published gap (IPM saturation) | 0.1 m |
+| `CRUISE_SPEED_KMH` | Cruise setpoint (PI tracks it; the old +5 offset compensated a P-only droop, DEBUG §42) | **20 km/h** |
+| `d0` | Standstill gap | 2.0 m |
+| `T_gap` | Time headway (referenced to the **lead's** speed) | 1.5 s |
+| `ACC_PROFILE_DECEL` | Fallback profile deceleration — gentler means braking starts *earlier* (§46.5) | 1.2 m/s² |
+| `DECEL_LIMIT` | Ceiling on profile descent (UN R171) | 5.0 m/s² |
+| `ACC_PROFILE_ACCEL` | Max reference rise rate | 1.0 m/s² |
+| `REF_DESCENT_MARGIN` / `_FLOOR` | Reference may descend at this multiple of the latched plan | 2.0× / 2.0 m/s² |
+| `ACC_LATCH_MARGIN` | Acquisition latch: `a = margin · v_close²/(2·gap_err)` | 0.95 |
+| `COAST_DECEL` | Measured engine-braking table, 0.5–13.5 m/s (§46.2) | 0.81 … **6.57** … 2.73 m/s² |
+| `BRAKE_AUTHORITY` | Deceleration per unit brake, coast removed, lag aligned | 4.44 m/s² |
+| `THROTTLE_AUTHORITY` | Acceleration per unit throttle | 6.0 m/s² |
+| `MIN_BRAKE_NO_THROTTLE` | Brake floor whenever throttle is off | 0.10 |
+| `cruise_gain` / `cruise_ki` | Speed-loop PI gains | 0.3 / 0.2 |
+| `AB_ALPHA` | α-β tracker gain (β = α²/(2−α)) | 0.20 |
+| `AB_MAX_REL_ACCEL` | Damping: largest believable relative acceleration | 6.0 m/s² |
+| `PERCEPTION_LAG_S` | Measured perception transport lag, compensated by the tracker | 0.25 s |
+| `LEAD_MISS_TOLERANCE` | Detection dropouts bridged before the lead is dropped | 3 frames |
+| `emergency_distance` | EMERGENCY-brake threshold (not bound by `DECEL_LIMIT`) | 1.0 m |
+| `MIN_CONFIDENCE` | YOLO detection confidence gate | 0.50 |
+| `MAX_IPM_TRUST_M` | Max range at which a distance is published | 80 m |
+| `LANE_FALLBACK_HALF_W` | Ego-lane corridor when no UFLD centerline reaches the detection | 1.5 m |
+
+**Deceleration is not commanded by the brake alone.** Engine braking in
+CARLA reaches 6.57 m/s² with nothing pressed — above the R171 ceiling — so
+holding *partial throttle* is how a soft deceleration is produced. See
+DEBUG §45.2 / §46.2.
+
+The PD cascade (`acc_control`, `brake_for_decel`, `cruise_control`) and its
+`k_p`/`k_d` gains were removed in full once the governor proved out.
 
 Runtime override: publish `Float32` in km/h on `/ACC/target_speed` to
 change the cruise target on the fly.
@@ -235,6 +283,16 @@ bridge and two debug/BEV visualisation nodes.
     /ACC/lead_vehicle_distance         std_msgs/Float32                ← lead distance [m]
     /ACC/target_speed                  std_msgs/Float32                ← target [km/h] slider
     /ACC/perception/model_ready        std_msgs/Bool                    ← latched + 1 Hz heartbeat
+
+Diagnostic only — nothing consumes these for control:
+
+    /ACC/control_mode                  std_msgs/String                 ← GATE|STANDSTILL|CRUISE|EMERGENCY|ACC
+    /ACC/tracked_gap                   std_msgs/Float32                ← gap the controller acts on (tracked,
+                                                                          predicted to now, latency-compensated;
+                                                                          NOT the same as lead_vehicle_distance)
+    /ACC/speed_reference               std_msgs/Float32                ← speed governor's reference [m/s]
+    /ACC/lead_distance_pinhole         std_msgs/Float32                ← parallel bb-height range estimate,
+                                                                          for scoring against IPM (DEBUG §45)
 
 ### LKAS internal topics
 

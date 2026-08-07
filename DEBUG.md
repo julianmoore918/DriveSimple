@@ -3693,19 +3693,71 @@ sample — a clean 2.89 m lane departure, reported as a 3.13 m oscillation.
 Now anchored to the start-line ray, which on a dead-straight scenario IS
 the intended path and is unbounded by lane width.
 
-### 45.2 The brake plant is not modellable [KNOWN]
+### 45.2 Engine braking dominates, and it invalidated the brake-plant fit [CORRECTED]
 
-Measured cleanly, brake authority (achieved decel / brake command) ranges
-**8 to 49**, and varies **2-3x within a single speed band** — the spread at
-8-10 m/s is 18-49. It is not hidden speed dependence that a better fit
-would capture; it is not predictable from speed at all.
+**This section previously read "the brake plant is not modellable",**
+reporting brake authority (achieved decel / brake command) as ranging 8 to
+49 and varying 2-3x *within* a single speed band, and concluded the gain
+was unpredictable. That conclusion was an artifact of the model used to
+derive it, and is retracted.
 
-That killed the whole family of approaches that compute a brake force:
-the PD law, the closed-loop deceleration PI, the scheduled feed-forward.
-No feed-forward survives 3x gain uncertainty, and a feedback loop on
-deceleration has to close around a differentiated, filtered, delayed
-signal. Every one of them hunted: ramp to 0.70, collapse to zero, ramp
-again.
+The fit was `decel = brake * authority`. It omitted engine braking.
+Measured directly — every sample across the runs with throttle AND brake
+both at zero:
+
+| v [km/h] | n | mean coast decel | max |
+|---|---|---|---|
+| 0-7   | 19 | 1.23 | 1.74 |
+| 7-14  | 29 | 2.18 | 3.19 |
+| 14-22 | 12 | 4.08 | 6.93 |
+| 22-29 | 13 | **4.94** | **10.42** |
+| 29-36 |  8 | **5.49** | 7.55 |
+| 36-43 | 12 | 2.62 | 9.21 |
+| 43-50 |  8 | 2.36 | 3.01 |
+
+At 22-29 km/h the vehicle sheds ~4.9 m/s² with no command at all.
+Attributing that to a 0.2 brake command yields an "authority" of ~25 which
+has nothing to do with the brake. That is the entire source of the 8-49
+spread and the within-band variation: a large, speed- and gear-dependent
+term sitting unattributed in the residual.
+
+**Two consequences follow, and they matter more than the retraction.**
+
+*The deceleration peaks were never brake spikes.* Every attempt to bound
+them by capping brake force — brake_scale, the conservative feed-forward,
+the deceleration PI — did nothing because the brake was not producing
+them. One run peaked at 8.37 m/s² with throttle 0.00 and brake 0.00 held
+for the entire event; velocity topic, position-derived speed and
+gap-closure rate all agreed the vehicle really was slowing that hard.
+
+*Releasing the throttle is not a gentle action in this vehicle.* Coasting
+alone exceeds the 5 m/s² R171 ceiling (5.49 mean at 29-36 km/h, peaking
+10.42). A soft deceleration therefore requires holding PARTIAL THROTTLE
+against engine braking. The speed loop applying throttle through 202 of
+238 frames of a stop was doing exactly that, correctly. It was misread as
+a limit cycle and suppressed, which left the vehicle coasting on engine
+braking and stopping **38.6 m short of the target with the brake never
+applied at all** (`verdict: no_reaction`). The suppression is reverted;
+the comment at that site records why.
+
+**So the stack cannot bound deceleration below 5 m/s² by managing the
+brake, because doing nothing already breaches it.** The speed loop's
+throttle authority is part of the deceleration argument, not incidental
+to it — a constraint no amount of brake-side tuning can substitute for.
+
+**Caveat on the numbers.** 10 m/s² of engine braking is not physically
+plausible for a real Dodge Charger; a car coasting in gear sheds perhaps
+1-2 m/s². This is very likely a CARLA powertrain artifact (gear ratios,
+or `manual_gear_shift` / `gear` defaults on `carla.VehicleControl`). Every
+R171 deceleration figure from this simulator inherits that caveat, and it
+should be checked against MORAI, or against a CARLA coast-down with the
+gearbox explicitly configured, before any of it is quoted externally.
+
+*What does survive from the original section:* a feedback loop closing on
+deceleration still has to work through a differentiated, filtered signal,
+and the speed governor (§45.3) is still the right architecture. The reason
+is simply different — deceleration is dominated by a term the controller
+does not command, rather than by an unpredictable brake gain.
 
 ### 45.3 The rewrite — speed governor [DONE]
 
@@ -3723,7 +3775,8 @@ Why this shape:
 
 * Differentiating the profile along the trajectory gives exactly
   `-a_profile`, so **deceleration is set by the plan, not by the brake**.
-  The guarantee moves out of the unpredictable plant and into arithmetic.
+  The guarantee moves out of the brake plant — which does not command most
+  of the deceleration anyway (§45.2) — and into arithmetic.
 * It closes on SPEED — measured directly, at 20 Hz, with no meaningful
   lag — instead of on deceleration.
 * One loop now serves CRUISE and ACC, retiring the
@@ -3828,8 +3881,11 @@ its output reached the vehicle.
 
 Peak deceleration still runs above 5 m/s² on some stops. The reference
 descent is hard-bounded, but the total is reference + the speed loop's
-correction, and the correction's outcome still depends on the plant gain
-that §45.2 showed is unpredictable.
+correction + **engine braking, which the controller does not command and
+which alone exceeds the limit** (§45.2). Bounding deceleration here is not
+a brake-tuning problem; it needs the speed loop to hold partial throttle
+against the powertrain, and it needs the CARLA engine-braking figure
+verified before any of it is quoted as a compliance result.
 
 **Open, in rough priority order:**
 
@@ -3850,3 +3906,188 @@ that §45.2 showed is unpredictable.
 * `acc_control`, `brake_for_decel` and `cruise_control` are called 0x.
   Left in place for comparison against the governor; delete once it proves
   out.
+
+---
+
+## 46. Coast-aware split, the clean coast-down, and why dev_jonas was not merged [DONE / KNOWN]
+
+Continues §45. Everything here was measured against the CARLA charger on
+Town06 spawn 80 at 50 km/h.
+
+### 46.1 A whole afternoon evaluated against a node that was not running [PROCESS]
+
+Runs 152823, 153353 and 153814 behaved near-identically across changes
+that should have altered them materially. The cause was mundane and
+expensive: `colcon build --symlink-install` updates the source the install
+tree points at, but **a running node keeps the code it started with**. The
+controller had been up since before several builds, so the acquisition
+latch, the `a_des <= 0` cap and the tracker seeding were all "tested"
+without ever executing.
+
+Conclusions drawn in that window about latch arming and throttle chatter
+are unreliable and were re-derived afterwards. Restart the node after every
+build, and treat `ros2 topic hz /Car_1/cmd_vel` as the first check of any
+run — a dead controller and a passive one look identical in a trace.
+
+### 46.2 Clean coast-down, and the double peak [MEASURED]
+
+A run where nothing published `cmd_vel` turned out to be the most useful
+measurement of the day: an uncommanded 50 km/h -> standstill coast, 113
+frames with throttle and brake at exactly zero.
+
+| v [m/s] | 0.5 | 1.5 | 2.5 | 3.5 | 4.5 | 5.5 | 7.5 | 8.5 | 9.5 | 10.5 | 11.5 | 12.5 | 13.5 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| decel | 0.81 | 1.36 | 2.18 | 3.29 | 4.40 | **6.57** | 3.72 | 4.60 | **6.41** | 2.79 | 2.94 | 3.16 | 2.73 |
+
+The **double peak** (6.57 at 5.5 m/s, 6.41 at 9.5, dipping to 3.72 between)
+is two gearbox downshifts. It settles a question open since §45.2: the
+non-monotonic shape is real, not sampling noise, which is why it cannot be
+replaced by a smooth drag curve and why deceleration was swinging ~3 m/s²
+for no commanded reason. This table now lives in `COAST_DECEL`.
+
+**Peak uncommanded deceleration is 6.57 m/s², above the R171 ceiling.**
+Confirmed directly rather than inferred. And 6.57 is not plausible for a
+real Charger (1-2 would be), so this is a CARLA powertrain characteristic;
+every deceleration figure from this simulator inherits that caveat.
+
+### 46.3 Coast-aware throttle/brake split [DONE]
+
+`speed_control` used to split at `u = 0`, treating "no command" as "no
+acceleration". In this vehicle releasing the throttle at 25 km/h yields
+~5.2 m/s², so asking for a gentle 2 m/s² still produced a brake command
+which landed on top of that and overshot; the vehicle then fell below the
+reference and the loop opened the throttle to recover. That was the
+0.4-brake-then-throttle-surge pattern — the brake was never too strong in
+itself (0.4 is worth only ~1.7 m/s²), it was added to something
+unaccounted.
+
+The split is now at `a_des + coast_decel(v)`, making the command one
+continuous axis through zero. Below the coast value the loop holds
+THROTTLE to keep deceleration down; it brakes only when coasting is
+genuinely insufficient.
+
+Brake authority, refitted with coast removed and the ~104 ms response lag
+aligned: **4.44 m/s² per unit brake** (n=54). This supersedes §45.2's
+retracted "8 to 49, unpredictable" — that spread was this same regression
+with engine braking left in the residual. The number is lag-sensitive
+(6.60 unaligned) and good to roughly +/-1.
+
+Supporting changes, each of which was a real failure first:
+
+* **Quadratic slew on `a_act`** replaces the two independent linear rate
+  limits that sat on throttle and brake separately. Because they were
+  separate, every crossing of zero collapsed one channel and started the
+  other from scratch — the sawtooth, and why throttle appeared to drop off
+  a cliff rather than taper.
+* **No coast compensation while above the reference.** Cancelling engine
+  braking when the vehicle is already faster than the plan is simply
+  wrong; 53 frames of one run did it, worst case 0.65 throttle at 0.5 km/h
+  too fast, 80 m out.
+* **Minimum brake 0.1 whenever throttle is off.** Coasting is not a
+  decisive action when engine braking varies 2-6 m/s² with gear, so speed
+  hovered at the reference and the two toggled. A definite floor makes the
+  vehicle actually slow and fall clear.
+* **`a_des <= 0` while the stop is latched.** The coast table is coarse and
+  wrong somewhere; where it over-reads, compensation becomes net
+  acceleration. Measured: throttle 0.71 at 4.5 m/s cancelling a modelled
+  3.66 m/s², accelerating 15.7 -> 20.0 km/h while the gap closed 6.5 -> 2.5 m.
+  This is NOT the earlier blanket `throttle = 0`, which starved the loop
+  and stopped the car 38.6 m short.
+
+### 46.4 Tracker damping and seeding [DONE]
+
+The alpha-beta velocity update is `(beta/dt) * residual` = 0.271 * residual
+at 12 Hz perception, so one 10 m staircase step revised velocity by
+2.7 m/s. That state multiplies the 0.25 s prediction AND is the closing
+rate the governor and ratchet run on; the tracker was reducing jitter by
+only 6%. Damped by physics rather than a tuning constant — relative
+acceleration bounded at `AB_MAX_REL_ACCEL`, and `|closing rate| <= v_ego`.
+Replayed on real data: velocity jitter **0.443 -> 0.161 m/s**, sign flips
+3 -> 1.
+
+That damping then delayed acquisition, because from zero it needed ~2.3 s
+to reach a 13.9 m/s closing rate, and the latch cannot arm until it does.
+Velocity is now **seeded from the first interval**, with damping applied
+to everything after.
+
+### 46.5 Early braking [DONE]
+
+`ACC_PROFILE_DECEL: 3.0 -> 1.2`. Counterintuitively a *gentler* profile
+brakes *earlier*, because onset is at `d0 + v^2/(2a)`: 34 m at 3.0 versus
+82 m at 1.2 for 50 km/h. At 3.0 the vehicle held full speed for 35 m after
+seeing the target at 69 m. Deliberately does not rely on the latch, which
+can only arm once the tracker has a closing rate — the fallback now brakes
+early on its own and the latch refines the rate.
+
+Reference descent is bounded by `2 x` the latched plan rather than by
+`DECEL_LIMIT`. At the ceiling the reference chased every downward step in
+the gap estimate, descending at up to 9.43 m/s² — four times the plan — on
+33 of 265 samples, each opening a tracking error the speed loop answered
+with maximum deceleration.
+
+### 46.6 dev_jonas: not merged, and it does not build a working node [KNOWN]
+
+`35bf00e` removes the dead acceleration cascade — the same cleanup done
+here — and describes itself as "Pure removal, no behavioural change".
+
+**It is not.** It also removes `__init__` constants on the grounds that
+only the dead functions read them, but `BRAKE_RATE_DOWN` is read by the
+LIVE `speed_control()`. The node therefore dies the first time it takes
+the brake path:
+
+```
+File "controller_node.py", line 623, in speed_control
+    - self.BRAKE_RATE_DOWN)
+AttributeError: 'ACCNode' object has no attribute 'BRAKE_RATE_DOWN'
+```
+
+Which is every scenario run. Two runs were attributed to "Jonas's
+controller performing badly" before this was found; both were the crash:
+
+* one died at the first brake command, leaving its last published
+  `cmd_vel` (throttle 1.00, from `v_ego` still 0 at startup) latched in
+  the harness — the car held full throttle to impact at 92.4 km/h. Not a
+  control decision, a dead node's last message.
+* one had nothing publishing at all (`acc_mode` empty for 125 frames).
+
+Neither says anything about his governor. **Not merged.** To revive:
+restore `BRAKE_RATE_DOWN` and audit `BRAKE_RATE_UP`,
+`CRUISE_BRAKE_DEADBAND`, `cruise_gain`, `cruise_ki`, `cruise_i_limit`,
+`cruise_throttle_cap` the same way.
+
+Also worth passing back: the commit cites "brake authority varies 8-49x
+unpredictably" as the motivation for the governor rewrite. That figure was
+**retracted** the same day (§45.2) — it was an artifact of fitting
+`decel = brake * authority` with engine braking in the residual. The
+governor is still the right answer; the reason is that engine braking
+dominates deceleration and is not commanded at all.
+
+### 46.7 Dead code removed here [DONE]
+
+`acc_control()`, `brake_for_decel()`, `cruise_control()`,
+`_legacy_cruise_control()`, the PD gains `k_p`/`k_d` and `gain_scale`, and
+17 constants read only by them. **1660 -> 1262 lines.**
+
+Done with a verification the dev_jonas commit lacked: every `self.X` read
+in the remaining source must have an assignment. Note the naive checks are
+misleading and produced three separate false answers before one was
+correct — subscription callbacks are referenced bare rather than called
+(`ego_velocity_callback` looks dead and is not), and `self.simulator ==`
+looks like an assignment to a careless regex, which would have deleted the
+live MORAI branch. The final check plus a smoke test exercising CRUISE,
+the governor, ACC and the braking path is what makes the removal safe.
+
+### 46.8 Where 50 km/h stands
+
+Best behaviour so far: **`pass`, min gap 1.19-1.74 m, peak deceleration
+6.92 m/s²** (run 145947, before the coast-aware split). Peak is dominated
+by engine braking — at the peak, coast alone accounted for 5.82 of 6.92,
+leaving the controller responsible for +1.10.
+
+**Not yet re-measured with the full stack live.** §46.1 means the coast
+split, brake floor and early profile have never all run together in a
+scenario. That is the next run, not a result.
+
+Open: the pinhole range estimate (§45.8) remains published and unused, and
+still measures far better than IPM beyond 30 m (bias +0.19 vs +1.62 m,
+RMS 0.47 vs 1.86, flat with range).

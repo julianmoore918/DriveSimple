@@ -67,12 +67,12 @@ CRUISE_SPEED_KMH = 20.0
 # unvalidated -- start MORAI runs at a crawl until that's tuned. See
 # morai_bridge/control_adapter_node.py.
 CRUISE_SPEED_KMH_MORAI = 5.0
-# ACC's gains (k_p, k_d, cruise-mode throttle/brake gain) were tuned
-# against CARLA's vehicle dynamics. First live MORAI runs saturated
-# throttle to 100% immediately, so MORAI gets its own 10x-softer gain
-# set here -- CARLA's values (k_p=1.2, k_d=0.8, cruise gain=0.3) are
-# untouched. Revisit once MORAI's actual vehicle response is validated.
-ACC_GAIN_SCALE_MORAI = 0.1
+# MORAI gain softening. Applied only to the old PD law's k_p/k_d, which
+# the speed governor replaced, so nothing reads it now -- MORAI-side
+# softening lives in cruise_throttle_cap instead. Kept as a marker that
+# MORAI needed 10x softer gains than CARLA once, in case the speed loop
+# turns out to need the same treatment when MORAI comes back.
+ACC_GAIN_SCALE_MORAI = 0.1   # unused
 
 
 class ACCNode(Node):
@@ -129,7 +129,6 @@ class ACCNode(Node):
         # an outside observer disagrees with the real branch near the
         # boundaries.
         self.mode_pub = self.create_publisher(String, '/ACC/control_mode', 10)
-        self._mode = ''
         # Diagnostics. The gap the controller actually acts on is NOT what
         # /ACC/lead_vehicle_distance carries — it is tracked, predicted to
         # now, and latency-compensated — and the governor's reference speed
@@ -154,7 +153,6 @@ class ACCNode(Node):
         # That matches the "follow at roughly 5 m gap" mental model and
         # gives the controller enough headroom that closing-rate dominates
         # the PD response on a lead deceleration event.
-        gain_scale = ACC_GAIN_SCALE_MORAI if simulator == 'morai' else 1.0
         # Was 0.3 s. Brake onset for a stationary target is
         #     d_brake = d0 + (T_gap + k_d/k_p) * v
         # so T_gap sets how far out the PD law starts decelerating. At
@@ -176,8 +174,6 @@ class ACCNode(Node):
         # detection, so the residual lag there is the ALPHA low-pass
         # settling, not this term.
         self.T_gap             = 1.5
-        self.k_p               = 1.2 * gain_scale       # proportional gain
-        self.k_d               = 0.8 * gain_scale       # derivative gain
         # Cruise-mode's own P-gain (see cruise_control()). Unlike k_p/k_d,
         # this is NOT 10x-softened for MORAI: at gain_scale=0.1 the actual
         # throttle command (~0.042 at the typical ~1.4 m/s standstill
@@ -195,6 +191,72 @@ class ACCNode(Node):
         self.cruise_ki         = 0.2
         self.cruise_i_limit    = 5.0
         self.cruise_integral   = 0.0
+        # Speed error [m/s] beyond which a sign reversal is treated as real
+        # rather than as noise around a tracked reference.
+        self.INTEGRAL_FLIP_DEADBAND = 0.3
+        # Integral shed per tick during a real reversal. 0.5 at 20 Hz
+        # unwinds the ~2.15 cruise bias in ~0.25 s.
+        self.INTEGRAL_FLIP_DECAY = 0.5
+        # ── Powertrain model ─────────────────────────────────────────────
+        # Measured CARLA coast-down: deceleration [m/s^2] with throttle AND
+        # brake at zero, by speed [m/s]. This is NOT a small correction —
+        # at 22-29 km/h the vehicle sheds ~4.9 m/s^2 uncommanded, which
+        # alone exceeds the R171 ceiling. See DEBUG §45.2.
+        # Indexed by band CENTRE. The first version used each band's lower
+        # edge, shifting the whole curve 1 m/s: at 9 m/s it read 4.06 where
+        # the measurement is 6.07, so the loop under-counted engine braking
+        # by ~2 m/s^2 and commanded that much extra brake — right at the
+        # speed where the deceleration peaks were landing.
+        #
+        # Medians, not means: the samples are few per band (8-29) and the
+        # tail is skewed by gear changes. The non-monotonic shape (rising
+        # to 6.07 at 9 m/s, falling to 2.33 at 11) is real and is almost
+        # certainly the gearbox — which is also why this table cannot be
+        # replaced by a smooth drag curve.
+        # Re-measured from a CLEAN coast-down: a full 50 km/h -> standstill
+        # with throttle and brake at zero for all 113 frames, rather than
+        # scraped out of mixed control data. 1 m/s bands.
+        #
+        # The double peak (6.57 at 5.5 m/s, 6.41 at 9.5, dipping to 3.72
+        # between) is two gearbox downshifts. It is real, it is why this
+        # cannot be a smooth drag curve, and it is why deceleration used to
+        # swing by 3 m/s^2 for no commanded reason.
+        #
+        # Note the peak EXCEEDS the 5 m/s^2 R171 ceiling with no command at
+        # all — see §45.2. Also note 6.57 m/s^2 of engine braking is not
+        # plausible for a real Charger (1-2 would be), so this remains a
+        # CARLA powertrain characteristic rather than a vehicle one.
+        self.COAST_DECEL = ((0.5, 0.81), (1.5, 1.36), (2.5, 2.18),
+                            (3.5, 3.29), (4.5, 4.40), (5.5, 6.57),
+                            (7.5, 3.72), (8.5, 4.60), (9.5, 6.41),
+                            (10.5, 2.79), (11.5, 2.94), (12.5, 3.16),
+                            (13.5, 2.73))
+        # Deceleration per unit brake, with coast removed and the response
+        # lag aligned (n=54; best residual at ~104 ms, giving 4.44 — the
+        # unaligned fit gave 6.60, so the number is lag-sensitive and only
+        # good to roughly +/-1). The earlier figure of "8 to 49,
+        # unpredictable" was this same regression with engine braking left
+        # in the residual.
+        self.BRAKE_AUTHORITY = 4.44
+        # Acceleration per unit throttle. Cross-checked against the cruise
+        # trim: ~0.43 throttle holds 50 km/h where coast is ~2.4 m/s^2.
+        self.THROTTLE_AUTHORITY = 6.0
+        # Quadratic slew on the actuator-acceleration command [m/s^2 per
+        # tick]. K sets the curvature, MIN keeps it converging, MAX caps
+        # how violently it may move. At 20 Hz, MAX=0.6 allows a full
+        # 5 m/s^2 swing in ~0.4 s.
+        self.A_ACT_SLEW_K = 0.25
+        self.A_ACT_SLEW_MIN = 0.05
+        self.A_ACT_SLEW_MAX = 0.60
+        self._a_act_prev = 0.0
+        # Speed error [m/s] beyond which coast compensation is withheld.
+        # Small, so it acts as hysteresis at the crossing rather than as a
+        # band in which behaviour changes.
+        self.NO_THROTTLE_DEADBAND = 0.15
+        # Floor on the brake command whenever the loop is not throttling.
+        # 0.1 is worth ~0.44 m/s^2 on top of engine braking — enough to
+        # make the transition decisive without dominating it.
+        self.MIN_BRAKE_NO_THROTTLE = 0.1
         # Even at gain_scale=0.1, cruise throttle still hit 1.0 on first
         # MORAI runs (speed feedback was/may still be unreliable enough
         # that speed_error stays large). Hard-cap MORAI's cruise throttle
@@ -202,43 +264,17 @@ class ACCNode(Node):
         # CARLA keeps its original 1.0 ceiling.
         self.cruise_throttle_cap = 0.8 if simulator == 'morai' else 1.0
         self.a_max             = 3.0       # [m/s²]
-        self.a_min             = -5.0      # [m/s²]
         # Emergency threshold is now a bumper gap, not a camera distance.
         # IPM also saturates near gap ≤ 2 m (bb-bottom clips at frame
         # edge → reported gap drops well below truth) — the saturated
         # value still falls under this 3 m threshold, so saturation
         # itself trips EMERGENCY without any special branch. See §22.
         self.emergency_distance = 1.0      # full brake below this gap [m]
-        self.throttle_scale    = 3.0       # a_max → full throttle
-        # Calibrated so `a` is in real m/s², i.e. brake_scale is the
-        # deceleration CARLA actually delivers at brake = 1.0. Measured
-        # over the scenario traces (2-sample actuation lag, v > 10 km/h,
-        # gap > 1 m, standstill snap and impact excluded):
-        #     brake 0.0 -> 0.38 m/s^2 (drag)   n=187
-        #     brake 1.0 -> 6.27 m/s^2 mean     n=24
-        # so decel ~= 0.38 + 5.89*brake, and 5 m/s^2 needs brake ~= 0.78.
-        #
-        # Was 3.0, which mapped a = -3 to full brake — the whole range
-        # a in [a_min, -3] was saturated, so the "proportional" brake was
-        # not proportional at all. Combined with the D term (k_d*closing
-        # rate = -0.8*v, which alone exceeds a_min for any speed above
-        # 27 km/h against a STATIONARY target), every ACC braking event
-        # commanded brake = 1.0 and achieved 6.3-9.3 m/s^2 even when 3 m/s^2
-        # would have done.
-        #
-        # At 6.4, a_min = -5.0 maps to brake = 0.78 -> ~5 m/s^2, so the ACC
-        # branch now cannot exceed the R171 authority limit. EMERGENCY
-        # still commands brake = 1.0 as the escape hatch. See DEBUG §43.
-        self.brake_scale       = 6.4       # a_min → 0.78 brake ≈ 5 m/s²
         self.prev_throttle     = 0.0
         self.THROTTLE_RATE_LIMIT = 0.05  # max throttle increase per step (20 Hz → 1.0 in ~1 second)
         # Control-loop period, used by the cruise integrator. Must match
         # the create_timer() period at the bottom of __init__.
         self.CRUISE_DT = 0.05
-        # Brake-side deadband, in throttle-equivalent units of the PI
-        # output. Only the brake side keeps a deadband: the throttle side
-        # needs to hold a steady non-zero value to balance drag.
-        self.CRUISE_BRAKE_DEADBAND = 0.05
 
         # ── Distance filter ──────────────────────────────────────────────
         # Low-pass on /ACC/lead_vehicle_distance. ALPHA=0.01 effectively
@@ -271,11 +307,26 @@ class ACCNode(Node):
         # Beta is set from alpha by the standard critically-damped
         # relation b = a^2/(2-a), which avoids the ringing an arbitrary
         # pair produces.
-        self.AB_ALPHA          = 0.45
+        # Lowered 0.45 -> 0.20. The published gap arrives as a staircase
+        # (discrete IPM values, ~5 m steps at range), and at 0.45 the
+        # tracker followed the steps closely enough that the derived
+        # closing rate changed sign on 27% of samples while closing on a
+        # STATIONARY target. That is what releases the ratchet. Heavier
+        # smoothing costs nothing here because the tracker predicts to now
+        # — the usual reason not to smooth is the lag it adds, and the
+        # prediction already removes that.
+        self.AB_ALPHA          = 0.20
+        # Largest relative acceleration between two vehicles that the
+        # tracker will believe [m/s^2]. Anything faster is noise.
+        self.AB_MAX_REL_ACCEL  = 6.0
+        # Slack on the |closing rate| <= v_ego bound, for a lead genuinely
+        # moving toward us or pulling away hard.
+        self.AB_CLOSING_MARGIN = 3.0
         self.AB_BETA           = (self.AB_ALPHA ** 2) / (2.0 - self.AB_ALPHA)
         self.track_d           = None   # estimated gap [m]
         self.track_v           = 0.0    # estimated closing rate [m/s], -ve = closing
         self.track_t           = None   # timestamp of the last tracker update
+        self._track_seeded     = False  # velocity seeded from the first interval
         # Perception transport lag, measured by comparing the published
         # distance against CARLA ground truth: the over-read scaled with
         # speed (+1.95 m at 9.6 m/s, +1.44 m at 5.0 m/s) and collapsed to
@@ -283,7 +334,6 @@ class ACCNode(Node):
         # calibration bias. The tracker predicts forward by this much so
         # the control law sees where the lead is NOW, not where it was.
         self.PERCEPTION_LAG_S  = 0.25
-        self.d_lead_filtered   = None
         # Consecutive no-detection frames bridged before the lead is
         # declared gone. 3 at the perception rate covers the 1-3 frame
         # dropouts measured in the scenario traces without holding a stale
@@ -292,7 +342,6 @@ class ACCNode(Node):
         # on it for up to 3 frames.
         self.LEAD_MISS_TOLERANCE = 3
         self.lead_miss_count   = 0
-        self.last_lead_time    = None
 
         # ── Internal state ───────────────────────────────────────────────
         self.v_ego             = 0.0
@@ -313,39 +362,6 @@ class ACCNode(Node):
         # ~5 as the limit for system-commanded DCAS braking. EMERGENCY is
         # deliberately NOT bound by this — it stays brake = 1.0.
         self.DECEL_LIMIT       = 5.0
-        # PI trim on top of the brake_scale feed-forward, driven by
-        # (target decel − measured decel). This is what actually holds the
-        # vehicle near DECEL_LIMIT instead of merely asking politely.
-        #
-        # Tuned in simulation against the plant measured from the scenario
-        # traces, decel = brake * (16.70 - 0.814*v_ego): brake authority
-        # RISES as speed falls, so a constant brake runs away to 12.6 m/s²
-        # over a stop. Peak deceleration for a 50 km/h stop, target 5.0:
-        #     kp=0    ki=0.6  -> 6.35     (integral alone is too slow)
-        #     kp=0.1  ki=0.6  -> 5.61     <- chosen
-        #     kp=0.2  ki=0.6  -> 5.70, but 12.7 once accel noise is added
-        #     kp=0.4  any     -> unstable (>14)
-        # The proportional term is deliberately small: it acts on a
-        # twice-differentiated signal, so it amplifies noise fastest.
-        #
-        # ~5.6 m/s² peak rather than exactly 5.0 is the honest result. The
-        # residual is transient: the accel estimate lags the real
-        # deceleration by a few ticks, so the loop cannot react before the
-        # first overshoot. Steady-state tracking is at the target. Lowering
-        # the setpoint to force a 5.0 peak would cost ~1 m of stopping
-        # distance, which 50 km/h cannot currently afford.
-        # Retuned once the loop delay was measured. Cross-correlating
-        # brake command against achieved deceleration over a 50 km/h stop
-        # put the brake -> decel -> estimate path at ~208 ms (4 ticks).
-        # The previous kp=0.1/ki=0.6 were tuned against a delay-free model
-        # and hunted badly in the real loop: 0.90, 0.91, 0.10, 0.00, 0.15,
-        # ... 0.84, 0.86, 0.66, 0.38 — ramp, dump, ramp, dump. Re-simulated
-        # WITH the delay, that config peaks at 9.78 m/s^2 (measured: 8.0-9.6),
-        # and these gains bring it to 6.45.
-        self.brake_kp          = 0.05
-        self.brake_ki          = 0.3
-        self.brake_i_limit     = 0.8
-        self.brake_integral    = 0.0
         # Rate limit on the brake RISE (releases stay instant).
         #
         # Without it the first tick of a braking event commands
@@ -365,35 +381,6 @@ class ACCNode(Node):
         # made the hunting asymmetric: the loop would dump 0.91 -> 0.10 in
         # one tick, undershoot, then ramp all the way back up.
         self.BRAKE_RATE_DOWN   = 0.10
-        # Brake authority model: decel [m/s^2] = brake * (A0 - A1*v_ego).
-        #
-        # REFITTED. The first fit used the scenario harness's logged
-        # acceleration, which is an EMA (alpha=0.3) and therefore both
-        # lagged and attenuated — it under-reported a 9.11 m/s^2 peak as
-        # 7.29. Fitting against a lagged signal produced authority values
-        # roughly half the truth, so the feed-forward asked for about
-        # twice the brake actually needed and the PI then had to unwind
-        # it. That is what drove the ramp-to-0.70-then-collapse cycles.
-        #
-        # Re-measured with a centred-window slope of v(t) (lag-free,
-        # noise-robust) over the 50 km/h traces, n=26, rms 1.60:
-        #     decel = brake * (34.2 - 1.84 * v)
-        # vs the old (16.7 - 0.81*v), i.e. 1.6-2.0x too small everywhere.
-        #
-        # Authority varies ~3x across the speed range, which is exactly why
-        # a fixed brake_scale could never work and scheduling is required.
-        #
-        # NOTE the fit is only supported over v ~2-14 m/s (the braking
-        # range of these runs). Extrapolated naively the line reaches zero
-        # near 18.6 m/s, which is unphysical, so it is clamped both ends.
-        # Re-fit before trusting it above ~50 km/h.
-        self.BRAKE_AUTH_A0     = 34.2
-        self.BRAKE_AUTH_A1     = 1.84
-        self.BRAKE_AUTH_MAX    = 30.0
-        # Authority assumed by the brake feed-forward. Deliberately the
-        # strong end of the measured range, not the middle — see
-        # brake_for_decel for why the bias direction matters.
-        self.BRAKE_FF_AUTHORITY = 30.0
         # ── Speed governor ───────────────────────────────────────────────
         # Deceleration the reference profile is designed around. The
         # vehicle decelerates at this rate while it tracks the profile, so
@@ -401,7 +388,28 @@ class ACCNode(Node):
         # Held below DECEL_LIMIT (5.0) so tracking error has somewhere to
         # go before the R171 ceiling is reached: the profile aims for 3.0
         # and the remaining 2.0 is margin for the speed loop's overshoot.
-        self.ACC_PROFILE_DECEL = 3.0
+        # Fallback profile deceleration, used whenever the acquisition
+        # latch is not armed.
+        #
+        # Lowered 3.0 -> 1.2. A gentler profile demands slowing EARLIER,
+        # because braking starts where sqrt(2a(gap-d0)) first falls below
+        # the set speed — d0 + v^2/(2a). At 3.0 that is 34 m at 50 km/h,
+        # so the vehicle held full speed for 35 m after seeing the target
+        # at 69 m. At 1.2 it is 82 m, i.e. the profile is already asking
+        # for a reduction by the time anything is detected, at every speed
+        # in the matrix.
+        #
+        # This deliberately does NOT rely on the latch. The latch computes
+        # the ideal rate from the acquisition gap, but it can only arm once
+        # the tracker has a real closing rate, and anything that delays
+        # that (estimator noise, damping, a late first fix) delays braking
+        # with it. The fallback now brakes early on its own; the latch
+        # refines it rather than being the only thing that triggers it.
+        #
+        # Gentler is also the safer direction: the profile converges to
+        # d_safe as the gap closes regardless of `a`, so a low value costs
+        # a longer, softer approach — not a missed stop.
+        self.ACC_PROFILE_DECEL = 1.2
         # How fast the reference may RISE again. Kept modest so a gap
         # estimate that jumps outward cannot command a throttle surge —
         # the previous run showed v_ref stepping back up 39.9 -> 44.4 km/h
@@ -410,46 +418,28 @@ class ACCNode(Node):
         # Speed band over which the profile deceleration ramps from the
         # comfort value up to DECEL_LIMIT. Below LO nothing changes, so
         # low-speed stops stay as gentle as before.
-        self.ACC_DECEL_V_LO = 10.0   # 36 km/h
-        self.ACC_DECEL_V_HI = 30.0   # 108 km/h
-        # Largest speed error the governor will let build between the
-        # vehicle and its reference [m/s]. With cruise_gain = 0.3 an error
-        # of e produces ~0.3*e of brake, so 0.6 m/s keeps the proportional
-        # contribution near 0.18 — about 5 m/s^2 even at the strong end of
-        # the measured brake authority. Trim down if the late-stop
-        # deceleration is still harsh, up if the stop feels sluggish.
-        self.MAX_TRACK_ERROR_MPS = 0.6
+        # Gentlest profile the latch may choose. Without a floor a very
+        # distant acquisition produces an absurdly slow crawl.
+        self.ACC_PROFILE_DECEL_MIN = 0.7
+        # Slightly gentler than the strictly-required rate, so v_ref starts
+        # just BELOW the current speed and the loop engages at once instead
+        # of sitting exactly on the profile commanding nothing.
+        self.ACC_LATCH_MARGIN = 0.95
+        # Closing speed below which the latch releases — a lead matching our
+        # speed is not something to plan a stop for.
+        self.ACC_LATCH_MIN_CLOSING = 0.8   # m/s
+        # How much faster than the latched plan the reference may descend
+        # when catching up after a gap-estimate step.
+        self.REF_DESCENT_MARGIN = 2.0
+        self.REF_DESCENT_FLOOR = 2.0   # m/s^2
+        self._a_latch = None
         self.v_ref_last        = 0.0
-        self.BRAKE_AUTH_MIN    = 6.0
         # Brake hold across a lost lead: see control_loop's CRUISE branch.
         self.last_acc_brake    = 0.0
         self.last_acc_brake_t  = None
         self.ACC_BRAKE_HOLD_S  = 0.6
         self.prev_acc_brake    = 0.0
-        # Standstill margin used by the kinematic demand below. Smaller
-        # than d0: d0 is the comfort spacing the PD law settles into,
-        # whereas this is "how close may we come before it counts as a
-        # hit", which is what the stopping-distance maths should target.
-        self.d_stop_margin     = 2.0
-        # Only let the kinematic term take over once it is asking for
-        # something meaningful, so a far-away lead doesn't trigger a
-        # permanent light brake.
-        self.KIN_ENGAGE_MPS2   = 1.5
-        # Release well below engage. The gap between the two is what stops
-        # the term chattering as braking bleeds off the very closing speed
-        # that triggered it.
-        self.KIN_RELEASE_MPS2  = 0.4
-        self._kin_latched      = False
-        # Closing rate is a numerical derivative of an already-noisy
-        # distance; the kinematic demand squares it, so it gets its own
-        # low-pass before being used.
-        self.closing_rate_filt = 0.0
-        # CLOSING_ALPHA is vestigial: the alpha-beta tracker estimates the
-        # closing rate directly, so there is nothing left to post-filter.
-        self.CLOSING_ALPHA     = 0.4
         self.d_lead            = None
-        self.prev_d_lead       = None
-        self.prev_time         = None
         self.last_log_time     = 0.0
 
         # ── Control loop @ 20 Hz ─────────────────────────────────────────
@@ -458,7 +448,8 @@ class ACCNode(Node):
         self.get_logger().info(
             f"ACC Node initialized | target={self.target_speed:.1f} m/s | "
             f"d0={self.d0} m | T_gap={self.T_gap} s | "
-            f"k_p={self.k_p} | k_d={self.k_d}"
+            f"profile={self.ACC_PROFILE_DECEL} m/s^2 | "
+            f"limit={self.DECEL_LIMIT} m/s^2"
         )
 
     # ====================================================================
@@ -536,14 +527,62 @@ class ACCNode(Node):
             # ---- alpha-beta update ----
             if self.track_d is None:
                 self.track_d, self.track_v, self.track_t = d, 0.0, now
+                self._track_seeded = False
                 self.d_lead = d
                 return
 
             dt = min(max(now - self.track_t, 1e-3), 0.5)
+
+            if not self._track_seeded:
+                # Seed the velocity from the very first interval instead of
+                # letting it converge from zero.
+                #
+                # The damping clamp limits velocity revisions to
+                # AB_MAX_REL_ACCEL, which is right for rejecting staircase
+                # noise but wrong at acquisition: starting from 0 it takes
+                # ~2.3 s to reach a 13.9 m/s closing rate. During that the
+                # governor sees almost no closing, the latch cannot arm,
+                # and braking is simply late — which is why the throttle
+                # only began dropping ~0.8 s after the target was acquired.
+                self.track_v = max(-(self.v_ego + self.AB_CLOSING_MARGIN),
+                                   min(self.v_ego + self.AB_CLOSING_MARGIN,
+                                       (d - self.track_d) / dt))
+                self.track_d = d
+                self.track_t = now
+                self._track_seeded = True
+                return
             d_pred = self.track_d + self.track_v * dt
             residual = d - d_pred
             self.track_d = d_pred + self.AB_ALPHA * residual
-            self.track_v = self.track_v + (self.AB_BETA / dt) * residual
+
+            # ---- damped velocity update ----
+            # The raw alpha-beta velocity update is (beta/dt) * residual,
+            # which at 12 Hz perception works out at 0.271 * residual. The
+            # published gap arrives as a staircase, so a single 10 m step
+            # kicks the velocity state by 2.7 m/s — and that state is not
+            # a private detail: it multiplies the 0.25 s prediction, and it
+            # IS the closing rate the governor and the ratchet run on.
+            # Measured, the tracker was reducing sample-to-sample jitter by
+            # only 6% (0.449 -> 0.424 m) for exactly this reason.
+            #
+            # Damped by physics rather than by a tuning constant: the
+            # RELATIVE acceleration between two road vehicles cannot exceed
+            # AB_MAX_REL_ACCEL, so a velocity revision implying more than
+            # that over the sample interval is measurement noise, not
+            # motion, and is clipped to what is physically reachable.
+            v_new = self.track_v + (self.AB_BETA / dt) * residual
+            dv_max = self.AB_MAX_REL_ACCEL * dt
+            v_new = max(self.track_v - dv_max,
+                        min(self.track_v + dv_max, v_new))
+
+            # A lead cannot recede faster than we are driving unless it is
+            # genuinely accelerating away, and cannot approach faster than
+            # our own speed unless it is driving at us. Bounding on v_ego
+            # keeps a far-range outlier from inventing a closing rate the
+            # geometry cannot support.
+            self.track_v = max(-(self.v_ego + self.AB_CLOSING_MARGIN),
+                               min(self.v_ego + self.AB_CLOSING_MARGIN,
+                                   v_new))
             self.track_t = now
 
         except Exception as e:
@@ -556,7 +595,10 @@ class ACCNode(Node):
         self.track_d = None
         self.track_v = 0.0
         self.track_t = None
-        self.closing_rate_filt = 0.0
+        self._track_seeded = False
+        # Drop the acquisition latch with the track: the next lead is a new
+        # plan, not a continuation of this one.
+        self._a_latch = None
 
     def _tracked_gap(self):
         """Gap and closing rate predicted to NOW.
@@ -595,182 +637,11 @@ class ACCNode(Node):
     # ACC CONTROL LAW
     # ====================================================================
 
-    def acc_control(self, v_ego: float, d_lead: float) -> float:
-        """
-        PD-based ACC control law.
-
-        Computes a desired longitudinal acceleration based on:
-          - The distance error:  d_lead − d_desired
-          - The closing rate:    taken from the alpha-beta tracker state
-
-        Parameters
-        ----------
-        v_ego  : float – ego vehicle speed [m/s]
-        d_lead : float – distance to lead vehicle [m]
-
-        Returns
-        -------
-        float – desired acceleration [m/s²], clipped to [a_min, a_max]
-        """
-        # Desired following distance: standstill gap + speed-dependent gap.
-        d_desired = self.d0 + self.T_gap * v_ego
-
-        # -- Closing rate comes from the tracker, not a difference quotient --
-        # closing_rate > 0  → gap is increasing  (lead pulls away)
-        # closing_rate < 0  → gap is shrinking    (ego approaches lead)
-        # It used to be (d_lead - prev_d_lead)/dt over the already-low-passed
-        # distance, then low-passed again. Differentiating a filtered noisy
-        # signal is the worst way to get a velocity: on far-range IPM data
-        # (which swung 30+ m between frames) the result flipped sign
-        # repeatedly, dropping the kinematic braking latch mid-stop. The
-        # alpha-beta tracker estimates it as a state instead, so it is both
-        # smoother and free of the extra filter delay.
-        closing_rate = self.track_v
-        self.closing_rate_filt = closing_rate
-
-        # -- PD control --
-        # P-term: positive when too far (accelerate), negative when too
-        #         close (decelerate).
-        # D-term: positive when gap grows (can accelerate), negative when
-        #         gap shrinks (should brake earlier).
-        distance_error = d_lead - d_desired
-        a = self.k_p * distance_error + self.k_d * closing_rate
-
-        # -- Kinematic demand --
-        # The PD output is LINEAR in distance error and closing rate, but
-        # the deceleration physically required to stop is v_close²/(2·s) —
-        # quadratic in closing speed. So the PD law inherently under-reacts
-        # as speed rises: its brake-onset distance grows linearly while the
-        # stopping distance it must cover grows with the square. This term
-        # supplies the missing quadratic, so the higher the approach speed
-        # the sooner the controller reaches maximum deceleration.
-        #
-        # Uses CLOSING speed, not v_ego: against a lead matching our speed
-        # the closing rate is ~0 and this term correctly asks for nothing,
-        # whereas a v_ego-based version would demand hard braking behind
-        # any normally-followed lead.
-        v_close = max(0.0, -self.closing_rate_filt)
-        margin = d_lead - self.d_stop_margin
-        if v_close > 0.1 and margin > 0.1:
-            a_req = (v_close * v_close) / (2.0 * margin)
-            # Latch with hysteresis. A bare `a_req > threshold` test
-            # limit-cycles: braking bleeds off v_close, a_req drops back
-            # under the threshold, the term disengages, and the PD — whose
-            # distance error is large and positive at these gaps, so it
-            # saturates to a_max — immediately commands throttle. Speed
-            # rises, a_req crosses back over, brake again. Measured at
-            # 30 km/h that produced brake pulses of 0.1-0.2 alternating
-            # with a ramping throttle, and the brake never exceeded 0.20
-            # when it should have been holding a steady decel. See §43.
-            #
-            # So: engage on ENGAGE, but stay engaged all the way down to
-            # RELEASE. Braking is a commitment, not a per-tick opinion.
-            if a_req > self.KIN_ENGAGE_MPS2:
-                self._kin_latched = True
-            elif a_req < self.KIN_RELEASE_MPS2 or v_close < 0.5:
-                self._kin_latched = False
-            if self._kin_latched:
-                # Take whichever is more urgent, then let the clip below
-                # bound it at a_min = -DECEL_LIMIT.
-                a = min(a, -a_req)
-        elif margin <= 0.1 and v_close > 0.1:
-            self._kin_latched = True
-            a = min(a, self.a_min)
-        else:
-            self._kin_latched = False
-
-        # Clip to physical limits.
-        a = max(min(a, self.a_max), self.a_min)
-
-        # Deadband: if distance error is small and speed is very low,
-        # suppress tiny throttle commands to prevent creeping.
-        if abs(distance_error) < 1.0 and v_ego < 0.5 and a > 0:
-            a = 0.0
-
-        return a
 
     # ====================================================================
     # CLOSED-LOOP BRAKE (deceleration tracking)
     # ====================================================================
 
-    def brake_for_decel(self, target_decel: float) -> float:
-        """Brake command that makes the vehicle actually decelerate at
-        `target_decel` [m/s², positive magnitude], bounded by DECEL_LIMIT.
-
-        Feed-forward (target/brake_scale) gets us in the neighbourhood;
-        the PI trim closes the gap against the measured deceleration. The
-        feed-forward alone cannot work: brake authority varies strongly
-        with speed, so the same brake = 0.781 measured 5.16 m/s² at
-        44.6 km/h and 9.61 m/s² at 19.4 km/h. Only feedback bounds that.
-
-        Returns a brake in [0, 1]. EMERGENCY does not come through here —
-        it commands brake = 1.0 directly and is intentionally not capped.
-        """
-        target = max(0.0, min(target_decel, self.DECEL_LIMIT))
-
-        # Measured deceleration magnitude (0 while accelerating/coasting).
-        measured = max(0.0, -self.a_ego)
-
-        # PI trim. Anti-windup: stop integrating once the total command is
-        # already outside the actuator range in the direction we're pushing.
-        error = target - measured
-        # Feed-forward deliberately assumes the STRONGEST plausible brake.
-        #
-        # The speed-scheduled model this replaces cannot be trusted: the
-        # same 50 km/h run measured authority 7.6 at 45 km/h and 34.7 at
-        # 21 km/h — a 4.6x swing that no linear fit reproduces (the refit
-        # predicts only 2.1x). With the plant gain uncertain by that much,
-        # the direction of the modelling error decides whether the vehicle
-        # overshoots the deceleration limit or merely takes longer to
-        # reach it, and only one of those is acceptable in a law meant to
-        # BOUND deceleration.
-        #
-        # Assuming a strong brake makes the opening command small, so a
-        # plant that turns out stronger than expected cannot overshoot;
-        # the integrator supplies the rest when it turns out weaker.
-        # Simulated across the measured authority range, target 5 m/s^2:
-        #     ff assumes 8.6  -> peak 5.3 / 10.0 / 13.6   (overshoots badly)
-        #     ff assumes 30   -> peak 5.0 /  5.8 /  6.9   (bounded)
-        # The cost is onset time when the brake really is weak (~1.1 s to
-        # reach target instead of 0.25 s), i.e. stopping distance traded
-        # for a bounded peak. That is the correct trade here: collisions
-        # are already avoided up to ~70 km/h; the limit is what is not met.
-        ff = target / self.BRAKE_FF_AUTHORITY
-
-        # What the loop WANTS this tick, before any actuator limits.
-        requested = ff + self.brake_kp * error + self.brake_integral
-        commanded = max(0.0, min(requested, 1.0))
-        # What the actuator can actually deliver: rising is rate-limited,
-        # releasing is not (backing off must be immediate).
-        applied = min(commanded, self.prev_acc_brake + self.BRAKE_RATE_UP)
-        applied = max(applied, self.prev_acc_brake - self.BRAKE_RATE_DOWN)
-        applied = max(0.0, min(applied, 1.0))
-
-        # ---- anti-windup ----
-        # Integrate ONLY while the actuator is actually following the
-        # request. The previous test (`unsat < 1.0`) let the integrator
-        # keep charging all the way through the rate-limited ramp: during
-        # the ~0.3 s it takes to ramp to the feed-forward value the
-        # measured deceleration is still climbing, so the error stays
-        # positive, and by the time it clears the integrator has added
-        # enough to drive the command far past what was needed. Measured:
-        # the brake ramped to 0.70 where ~0.58 was the feed-forward and
-        # ~0.25 turned out to be enough, then had to unwind to zero —
-        # the ramp/collapse/ramp cycle in the traces.
-        #
-        # This is the standard remedy for an actuator with a rate limit:
-        # a rate-limited actuator is a *saturated* actuator for as long as
-        # it is ramping, and you must not integrate into a saturation.
-        tracking = (abs(applied - commanded) < 1e-9
-                    and 0.0 < applied < 1.0)
-        if tracking:
-            self.brake_integral += self.brake_ki * error * self.CRUISE_DT
-            self.brake_integral = max(min(self.brake_integral,
-                                          self.brake_i_limit),
-                                      -self.brake_i_limit)
-
-        self.prev_acc_brake = applied
-        return applied
 
     # ====================================================================
     # CRUISE CONTROL (fallback when no lead vehicle detected)
@@ -800,14 +671,14 @@ class ACCNode(Node):
            deceleration — differentiated, filtered, and delayed — or fed
            brake forward through a gain we could not predict.
 
-        That gain is the reason for the rewrite. Measured cleanly, brake
-        authority (achieved decel / brake command) ranges 8-49 across the
-        run and varies 2-3x WITHIN a single speed band, so it is not a
-        function of speed we failed to fit — it is not predictable at all.
-        No feed-forward survives that. A speed loop does, because its
-        integrator simply finds whatever brake produces the required
-        speed, and a gain error shows up as a small speed error rather
-        than a deceleration overshoot.
+        Deceleration is the reason for the rewrite, though not for the
+        reason first recorded. Deceleration here is dominated by ENGINE
+        BRAKING, which the controller does not command: coasting sheds
+        ~4.9 m/s² at 22-29 km/h and peaks above 10 (DEBUG §45.2). A law
+        that computes a brake force is therefore controlling the smaller
+        half of the problem. A speed loop closes on the quantity that
+        actually matters — the resulting speed — and its integrator finds
+        whatever throttle or brake delivers it, engine braking included.
 
         The v_lead term generalises it to a moving lead: with the lead
         matching our speed the sqrt term handles the gap error alone, and
@@ -828,23 +699,44 @@ class ACCNode(Node):
         d_safe = self.d0 + self.T_gap * v_lead
         gap_err = gap - d_safe
 
-        # Profile deceleration scales with speed: the faster we are going,
-        # the more of the available budget the profile is allowed to use.
-        # Below ACC_DECEL_V_LO the comfort value is kept unchanged; above
-        # ACC_DECEL_V_HI the profile is allowed the full DECEL_LIMIT.
+        # Profile deceleration: latched at ACQUISITION so braking begins
+        # at first detection rather than at a fixed crossing distance.
         #
-        # Note the onset distance, d0 + v^2/(2a), already grows with the
-        # SQUARE of speed, so braking starts far earlier at speed whatever
-        # `a` is (12.9 m at 30 km/h, ~132 m at 130 km/h). What this adds is
-        # the other half of the request — braking harder, not just sooner —
-        # which matters because at high speed a fixed comfort rate cannot
-        # bring the car down inside the distance perception actually gives.
-        span = max(1e-3, self.ACC_DECEL_V_HI - self.ACC_DECEL_V_LO)
-        frac = (v_ego - self.ACC_DECEL_V_LO) / span
-        frac = max(0.0, min(1.0, frac))
-        a = (self.ACC_PROFILE_DECEL
-             + (self.DECEL_LIMIT - self.ACC_PROFILE_DECEL) * frac)
-
+        # The profile only demands braking once v_ref falls below the set
+        # speed, which for a fixed `a` happens at d0 + v^2/(2a) — about
+        # 30 m at 50 km/h. With detection now reaching ~99 m that wasted
+        # 70 m of sight: the vehicle coasted at full speed, then braked
+        # hard over what was left. Latching `a` to the deceleration that
+        # stops from the ACQUISITION gap makes v_ref start at (just under)
+        # the current speed, so braking begins immediately and the stop is
+        # spread over every metre available:
+        #
+        #     a = v_close^2 / (2 * (gap - d_safe))
+        #
+        # At 99 m and 50 km/h that is ~0.99 m/s^2 — the gentlest stop that
+        # still works, and far under the limit. Acquiring late (34 m at
+        # 70 km/h) yields 5.9 and clamps to DECEL_LIMIT, which is the
+        # honest statement that the sighting was too late for comfort.
+        #
+        # Latched rather than recomputed each tick because the two are not
+        # the same: recomputing gives a == a_needed every tick, so v_ref
+        # tracks v exactly and the loop never asks for anything. The latch
+        # fixes the plan at acquisition; the profile below then converges
+        # to d_safe on its own as the gap closes, so a latch that turns out
+        # slightly optimistic self-corrects rather than compounding.
+        #
+        # Released when the lead is lost or is no longer being closed on,
+        # so a car matching our speed at 200 m does not trigger a stop.
+        v_close_now = max(0.0, -closing_rate)
+        if v_close_now < self.ACC_LATCH_MIN_CLOSING:
+            self._a_latch = None
+        elif self._a_latch is None and gap_err > 0.5:
+            self._a_latch = max(self.ACC_PROFILE_DECEL_MIN,
+                                min(self.DECEL_LIMIT,
+                                    self.ACC_LATCH_MARGIN
+                                    * v_close_now * v_close_now
+                                    / (2.0 * gap_err)))
+        a = self._a_latch if self._a_latch is not None else self.ACC_PROFILE_DECEL
         if gap_err >= 0.0:
             v_ref = v_lead + math.sqrt(2.0 * a * gap_err)
         else:
@@ -865,7 +757,8 @@ class ACCNode(Node):
         # profile, bounding the reference's rate of change bounds the
         # commanded deceleration DIRECTLY — no matter how noisy the gap
         # estimate is. This is what actually makes the limit hold: it moves
-        # the guarantee out of the (unpredictable) brake plant and into the
+        # the guarantee out of the brake plant — which does not command
+        # most of the deceleration anyway (§45.2) — and into the
         # trajectory, where it is arithmetic.
         # Rate-limit the DESCENT at the hard limit, not the comfort target.
         #
@@ -884,7 +777,26 @@ class ACCNode(Node):
         # estimator noise would otherwise demand something absurd. Placing
         # it at DECEL_LIMIT keeps the R171 guarantee intact while leaving
         # the authority to actually stop.
-        dv_down = self.DECEL_LIMIT * self.CRUISE_DT
+        # Descent is bounded by the PLAN, not by the ceiling.
+        #
+        # DECEL_LIMIT was the wrong bound here. The latched plan asks for
+        # ~1.3 m/s^2 on a 72 m acquisition, but at a 5.0 limit the
+        # reference was free to chase every downward step in the gap
+        # estimate — measured, it descended at up to 9.43 m/s^2, four
+        # times the plan, on 33 of 265 samples. Each of those opened a
+        # tracking error (the vehicle ran 7 km/h above the reference)
+        # which the speed loop then answered with maximum deceleration.
+        #
+        # Bounding it at a multiple of the latched rate lets the reference
+        # catch up after a genuine step without letting estimator noise
+        # dictate the deceleration. The floor keeps a plan that latched
+        # very gently from becoming unable to respond at all — the failure
+        # mode from limiting descent to a fixed comfort rate, which left
+        # the vehicle at 23.5 km/h with 2 m of gap left.
+        plan = self._a_latch if self._a_latch is not None else self.ACC_PROFILE_DECEL
+        dv_down = min(self.DECEL_LIMIT,
+                      max(self.REF_DESCENT_FLOOR,
+                          self.REF_DESCENT_MARGIN * plan)) * self.CRUISE_DT
         dv_up = self.ACC_PROFILE_ACCEL * self.CRUISE_DT
         v_ref = max(v_ref, self.v_ref_last - dv_down)
         # Ratchet. While the gap is CLOSING the reference may fall but not
@@ -916,6 +828,50 @@ class ACCNode(Node):
         # speed loop's, via the integral handover in speed_control.
         return max(0.0, v_ref)
 
+    def _slew_a_act(self, target: float) -> float:
+        """Move the actuator-acceleration command toward `target` on a
+        quadratic profile, and return the new value.
+
+        Replaces the two independent LINEAR rate limits that used to sit on
+        throttle and brake separately. Because those were separate, every
+        crossing of zero collapsed one channel and started the other from
+        scratch — the sawtooth in the command trace, and the reason the
+        throttle appeared to drop off a cliff rather than taper.
+
+        `a_act` is a single continuous axis through zero (positive =
+        throttle, negative = brake), so limiting it once removes the
+        discontinuity by construction: near the crossing the step is small,
+        so the vehicle eases through it instead of switching.
+
+        Quadratic rather than linear: step magnitude grows with the SQUARE
+        of the distance still to cover, so a large correction starts fast
+        and settles gently, which is what a linear ramp cannot do — it
+        arrives at full slope and stops dead. A linear floor is kept
+        underneath so the approach still converges in finite time rather
+        than asymptoting.
+        """
+        err = target - self._a_act_prev
+        mag = abs(err)
+        step = min(self.A_ACT_SLEW_MAX,
+                   max(self.A_ACT_SLEW_K * mag * mag,
+                       self.A_ACT_SLEW_MIN))
+        if step > mag:
+            step = mag
+        self._a_act_prev += math.copysign(step, err)
+        return self._a_act_prev
+
+    def coast_decel(self, v_mps: float) -> float:
+        """Deceleration the powertrain applies with no throttle and no
+        brake, interpolated from the measured coast-down table."""
+        tbl = self.COAST_DECEL
+        if v_mps <= tbl[0][0]:
+            return tbl[0][1]
+        for (v0, d0), (v1, d1) in zip(tbl, tbl[1:]):
+            if v0 <= v_mps <= v1:
+                f = (v_mps - v0) / (v1 - v0) if v1 > v0 else 0.0
+                return d0 + f * (d1 - d0)
+        return tbl[-1][1]
+
     def speed_control(self, v_target: float, integrate: bool = True,
                       brake_cap: float = 1.0) -> tuple:
         """PI speed tracking. Shared by CRUISE and ACC.
@@ -938,10 +894,30 @@ class ACCNode(Node):
         # Once the required action reverses sign the stored term is no
         # longer the right answer, so dropping it costs nothing and
         # removes a multi-second delay before the brake is reached.
-        if speed_error < 0.0 and self.cruise_integral > 0.0:
-            self.cruise_integral = 0.0
-        elif speed_error > 0.0 and self.cruise_integral < 0.0:
-            self.cruise_integral = 0.0
+        # Only a MEANINGFUL reversal counts, and the term is bled down
+        # rather than dropped.
+        #
+        # The first version zeroed the integrator on any sign change. That
+        # fixed the real bug (a cruise bias of ~2.15 held throttle into a
+        # stationary target for ~12 s) but created another: while tracking
+        # a descending reference the error sits near zero and crosses sign
+        # constantly, so the integrator was wiped repeatedly. Measured,
+        # that collapsed throttle 0.36 -> 0.00 in one tick on an error of
+        # -0.02 m/s, six times in a single stop — the throttle sawtooth.
+        # The step came entirely from the reset; the proportional term was
+        # worth 0.007 there.
+        #
+        # The deadband keeps noise-level crossings out of it; the decay
+        # unwinds a genuine bias in ~0.25 s — fast enough that it cannot
+        # hold throttle into a braking event, smooth enough to taper.
+        if (speed_error < -self.INTEGRAL_FLIP_DEADBAND
+                and self.cruise_integral > 0.0):
+            self.cruise_integral = max(0.0, self.cruise_integral
+                                       - self.INTEGRAL_FLIP_DECAY)
+        elif (speed_error > self.INTEGRAL_FLIP_DEADBAND
+                and self.cruise_integral < 0.0):
+            self.cruise_integral = min(0.0, self.cruise_integral
+                                       + self.INTEGRAL_FLIP_DECAY)
 
         u_p = self.cruise_gain * speed_error
         if integrate:
@@ -953,9 +929,77 @@ class ACCNode(Node):
                                            -self.cruise_i_limit)
         u = u_p + self.cruise_ki * self.cruise_integral
 
-        if u > 0.0:
-            self.prev_acc_brake = 0.0
-            return (min(u, self.cruise_throttle_cap), 0.0)
+        # ---- coast-aware split ----
+        # `u` is a desired ACCELERATION in disguise, so convert it and add
+        # back what the powertrain is already doing. Zero command is not
+        # zero acceleration in this vehicle: releasing the throttle at
+        # 25 km/h yields ~5.2 m/s^2 of engine braking on its own.
+        #
+        # Splitting at u = 0, as before, therefore mis-attributed the whole
+        # coast term. Asking for a gentle 2 m/s^2 produced a brake command
+        # anyway, which landed on top of 5.2 and overshot; the vehicle then
+        # fell below the reference and the loop opened the throttle to
+        # recover. That is the 0.4-brake-then-throttle-surge pattern in the
+        # traces — the brake was not too strong in itself (0.4 is worth
+        # only 1.74 m/s^2), it was simply added to something unaccounted.
+        #
+        # Splitting at `a_des + coast` instead makes the command one
+        # CONTINUOUS axis through zero: as the demand softens, brake falls
+        # to zero and throttle takes over smoothly to hold the deceleration
+        # UP at the requested value rather than letting it run away. No
+        # discontinuity, and no brake at all unless coasting is genuinely
+        # insufficient.
+        a_des = max(-self.DECEL_LIMIT,
+                    min(u * self.THROTTLE_AUTHORITY, self.a_max))
+
+        # Coast compensation may cancel engine braking, never exceed it.
+        #
+        # Holding throttle against the powertrain is the whole point of the
+        # split, but it is only ever meant to SOFTEN a deceleration. The
+        # coast table is measured, coarse (8-29 samples per band) and
+        # certainly wrong somewhere; where it over-reads, the compensation
+        # becomes net acceleration. Measured: at 4.5 m/s the loop commanded
+        # throttle 0.71 to cancel a modelled 3.66 m/s^2, and the vehicle
+        # accelerated 15.7 -> 20.0 km/h while the gap closed from 6.5 m to
+        # 2.5 m, arriving at the target under power.
+        #
+        # Capping a_des at zero while the stop is latched bounds throttle
+        # at exactly the coast value, so the worst a table error can do is
+        # hold speed — never gain it. This is NOT the earlier blanket
+        # `throttle = 0` (which starved the loop and stopped the car 38 m
+        # short); throttle is still free to cancel engine braking in full.
+        if self._a_latch is not None:
+            a_des = min(a_des, 0.0)
+        a_act_target = a_des + self.coast_decel(self.v_ego)
+
+        # No throttle while already above the reference.
+        #
+        # Coast compensation exists to stop engine braking overshooting a
+        # planned deceleration. It has no business running while the
+        # vehicle is FASTER than the plan — there, engine braking is doing
+        # exactly what is wanted and cancelling it is simply wrong.
+        # Measured over one stop: 53 frames applied throttle while above
+        # the reference, worst case 0.65 throttle at 0.5 km/h too fast,
+        # 80 m out. The run ended in contact.
+        #
+        # Note this is conditioned on the SPEED ERROR, not on the latch.
+        # An earlier attempt suppressed throttle whenever a stop was
+        # latched, which also suppressed it below the reference and left
+        # the vehicle coasting to a halt 38.6 m short. Here, falling under
+        # the reference restores throttle immediately, so the loop can
+        # still hold the profile up — it just cannot fight a deceleration
+        # it is already behind on.
+        if speed_error < -self.NO_THROTTLE_DEADBAND:
+            a_act_target = min(a_act_target, 0.0)
+
+        a_act = self._slew_a_act(a_act_target)
+
+        if a_act >= 0.0:
+            throttle = min(a_act / self.THROTTLE_AUTHORITY,
+                           self.cruise_throttle_cap)
+            self.prev_acc_brake = max(0.0, self.prev_acc_brake
+                                      - self.BRAKE_RATE_DOWN)
+            return (throttle, 0.0)
 
         if self.simulator == 'morai':
             # MORAI's brake leaves the vehicle stuck rather than
@@ -963,118 +1007,29 @@ class ACCNode(Node):
             self.prev_acc_brake = 0.0
             return (0.0, 0.0)
 
-        if u > -self.CRUISE_BRAKE_DEADBAND:
-            self.prev_acc_brake = max(0.0, self.prev_acc_brake
-                                      - self.BRAKE_RATE_DOWN)
-            return (0.0, self.prev_acc_brake)
+        brake = min(-a_act / self.BRAKE_AUTHORITY, brake_cap)
 
-        brake = min(-u, brake_cap)
-        # Rate-limit both directions. Rising slowly keeps the loop from
-        # slamming the brake before the speed response is visible; falling
-        # slowly stops the release/re-apply chatter seen in earlier runs.
+        # Minimum brake whenever the throttle is off.
+        #
+        # Coasting is not a decisive action: engine braking varies 2-6 m/s²
+        # with gear, so "throttle to zero" can mean almost anything. That
+        # left the speed hovering around the reference, and with coast
+        # compensation gated on the speed error the two toggled against
+        # each other — one run showed 14 throttle jumps against 1 before,
+        # with peak deceleration rising 8.00 -> 8.32.
+        #
+        # A small definite brake on the no-throttle side gives the
+        # transition a floor: the vehicle actually slows, falls clear of
+        # the reference, and throttle returns cleanly instead of the two
+        # chattering at the boundary.
+        if brake < self.MIN_BRAKE_NO_THROTTLE:
+            brake = self.MIN_BRAKE_NO_THROTTLE
         brake = min(brake, self.prev_acc_brake + self.BRAKE_RATE_UP)
         brake = max(brake, self.prev_acc_brake - self.BRAKE_RATE_DOWN)
         brake = max(0.0, min(brake, brake_cap))
         self.prev_acc_brake = brake
         return (0.0, brake)
 
-    def cruise_control(self, integrate: bool = True) -> tuple:
-        """
-        PI speed controller for cruising.
-
-        Was P-only with a ±0.5 m/s deadband, which could not hold a set
-        speed at all: inside the deadband it commanded throttle = 0, the
-        car coasted down on drag until the error left the deadband, and
-        outside it the throttle settled wherever `gain * error` happened
-        to equal drag. That put steady state a fixed distance BELOW
-        setpoint — measured at 4.3-5.0 km/h low across 30, 50 and 130 km/h
-        (setpoint 30 settled at 24.8; 50 at 44.8; 130 at 125.5). The
-        droop is exactly throttle/cruise_gain, which is why a 30 km/h
-        setpoint looked like it was "falling back to CRUISE_SPEED_KMH=25".
-
-        The integral term removes that droop, so CRUISE_SPEED_KMH no
-        longer needs the +5 km/h offset that used to compensate for it.
-
-        `integrate` is False when called from the ACC branch. That branch
-        calls this every tick purely to take min(acc_throttle,
-        cruise_throttle) / max(acc_brake, cruise_brake) as a set-speed
-        cap. During an ACC braking event v_ego falls far below the set
-        speed, so a running integrator would wind up to full throttle and
-        slam it on the moment ACC released authority.
-
-        Returns (throttle, brake).
-        """
-        speed_error = self.target_speed - self.v_ego  # +ve = need to speed up
-
-        # PI. Anti-windup: only accumulate while the unsaturated command
-        # is still inside the actuator range, and only when this branch
-        # actually owns the vehicle.
-        # Bumpless handover between accelerating and braking. The
-        # integrator holds whatever throttle sustained the PREVIOUS
-        # setpoint, and that bias survives into a braking event — it is
-        # what kept throttle at 0.43 while closing on a stationary target.
-        # Once the required action reverses sign the stored term is no
-        # longer the right answer, so dropping it costs nothing and
-        # removes a multi-second delay before the brake is reached.
-        if speed_error < 0.0 and self.cruise_integral > 0.0:
-            self.cruise_integral = 0.0
-        elif speed_error > 0.0 and self.cruise_integral < 0.0:
-            self.cruise_integral = 0.0
-
-        u_p = self.cruise_gain * speed_error
-        if integrate:
-            u_unsat = u_p + self.cruise_ki * self.cruise_integral
-            if -1.0 < u_unsat < self.cruise_throttle_cap:
-                self.cruise_integral += speed_error * self.CRUISE_DT
-                self.cruise_integral = max(min(self.cruise_integral,
-                                               self.cruise_i_limit),
-                                           -self.cruise_i_limit)
-        u = u_p + self.cruise_ki * self.cruise_integral
-
-        if u > 0.0:
-            # No deadband on the throttle side any more — holding a
-            # steady speed requires a steady non-zero throttle to balance
-            # drag, which the old deadband made impossible.
-            return (min(u, self.cruise_throttle_cap), 0.0)
-
-        if self.simulator == 'morai':
-            # MORAI's brake leaves the vehicle stuck/unresponsive rather
-            # than decelerating smoothly (see DEBUG.md) — coast instead.
-            return (0.0, 0.0)
-
-        # Small deadband on the brake side only, so a few cm/s of
-        # overshoot doesn't chatter the brake against the throttle.
-        if u > -self.CRUISE_BRAKE_DEADBAND:
-            return (0.0, 0.0)
-        return (0.0, min(-u, 0.6))
-
-    def _legacy_cruise_control(self) -> tuple:
-        """Kept for reference: the P-only law described above."""
-        speed_error = self.target_speed - self.v_ego  # +ve = need to speed up
-
-        if speed_error > 0.5:
-            throttle = min(speed_error * self.cruise_gain, self.cruise_throttle_cap)
-            brake    = 0.0
-        elif speed_error < -0.5:
-            if self.simulator == 'morai':
-                # MORAI's brake appears to leave the vehicle stuck/
-                # unresponsive rather than just decelerating smoothly
-                # (unlike CARLA's, which this branch was originally
-                # tuned against) -- see DEBUG.md. Coast instead of
-                # actively braking to bleed off overshoot for MORAI;
-                # CARLA keeps the original proportional-brake behaviour.
-                throttle = 0.0
-                brake    = 0.0
-            else:
-                # Same gain shape on the brake side, capped a touch
-                # higher (0.6) so we can actually arrest a large overshoot.
-                throttle = 0.0
-                brake    = min(-speed_error * self.cruise_gain, 0.6)
-        else:
-            throttle = 0.0
-            brake    = 0.0
-
-        return throttle, brake
 
     # ====================================================================
     # MAIN CONTROL LOOP  (called at 20 Hz)
@@ -1112,7 +1067,6 @@ class ACCNode(Node):
         # would just fight the sim's own rest state for no reason.
         if not (self.yolo_ready and self.ufld_ready):
             self.cruise_integral = 0.0
-            self.brake_integral = 0.0
             self.prev_acc_brake = 0.0
             self.v_ref_last = self.v_ego
             self._publish_mode('GATE')
@@ -1137,7 +1091,6 @@ class ACCNode(Node):
         if self.v_ego < 0.5 and self.d_lead is not None and self.d_lead < self.d0 + 2.0:
             control_msg.linear.y = 0.05  # light hold brake
             self.cruise_integral = 0.0
-            self.brake_integral = 0.0
             self.prev_acc_brake = 0.0
             self.v_ref_last = self.v_ego
             self._publish_mode('STANDSTILL')
@@ -1180,7 +1133,6 @@ class ACCNode(Node):
 
             control_msg.linear.x = throttle
             control_msg.linear.y = brake
-            self.brake_integral = 0.0
             self.v_ref_last = self.v_ego
             self._publish_mode('CRUISE')
             self.control_pub.publish(control_msg)
@@ -1197,7 +1149,6 @@ class ACCNode(Node):
             control_msg.linear.x = 0.0
             control_msg.linear.y = 1.0  # full brake — no rate limit on braking
             self.cruise_integral = 0.0
-            self.brake_integral = 0.0
             self.prev_acc_brake = 0.0
             self.v_ref_last = self.v_ego
             self._publish_mode('EMERGENCY')
@@ -1212,7 +1163,8 @@ class ACCNode(Node):
         # tracks it. Deceleration is set by the shape of the profile rather
         # than by a brake command, so it is bounded by design instead of by
         # calibration — which matters because brake authority here is not
-        # predictable (8-49, and 2-3x within a single speed band).
+        # the only thing acting on the vehicle — engine braking alone
+        # sheds 4.9 m/s^2 at 22-29 km/h and peaks above 10 (§45.2).
         #
         # This also retires the old min(acc_throttle, cruise_throttle) /
         # max(acc_brake, cruise_brake) combination: the governor already
@@ -1223,6 +1175,25 @@ class ACCNode(Node):
         self.v_ref_last = v_ref
         throttle, brake = self.speed_control(v_ref)
 
+        # NOTE: an earlier version forced `throttle = 0` here whenever the
+        # acquisition latch was set, on the reasoning that a vehicle
+        # committed to a stop should never accelerate. That was wrong, and
+        # wrong in an instructive way.
+        #
+        # Measured coast-down in CARLA with throttle AND brake at zero:
+        #     22-29 km/h   mean 4.94 m/s^2, peaking 10.42
+        #     29-36 km/h   mean 5.49 m/s^2
+        # Releasing the throttle in this vehicle is not gentle — it exceeds
+        # the 5 m/s^2 limit on its own. Partial throttle is therefore how a
+        # SOFT deceleration is produced, and the speed loop applying it
+        # through a stop (202 of 238 frames in one run) was doing the right
+        # thing, not hunting. Suppressing it left the car coasting on engine
+        # braking, which stopped it 38.6 m short of the target with the
+        # brake never used at all (verdict: no_reaction).
+        #
+        # The corollary is uncomfortable and belongs in the record: this
+        # stack cannot bound deceleration below 5 m/s^2 by managing the
+        # brake alone, because doing nothing already breaches it.
         if brake > 0.0:
             self.last_acc_brake = brake
             self.last_acc_brake_t = self.get_clock().now().nanoseconds / 1e9
@@ -1252,7 +1223,6 @@ class ACCNode(Node):
         arms a run long after this node started) would otherwise see
         nothing until the next transition.
         """
-        self._mode = mode
         self.mode_pub.publish(String(data=mode))
 
     def _log_throttled(self, mode: str, throttle: float, brake: float):
