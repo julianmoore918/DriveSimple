@@ -319,9 +319,7 @@ otherwise has to be done by hand.
 
 ![UI running on CARLA](figures/Screenshot%20from%202026-07-30%2014-08-02.png)
 
-![UI running on MORAI](docs/ui_morai.png)
-
-_TODO: insert `docs/ui_morai.png` (screenshot of UI driving MORAI)._
+![UI running on MORAI](figures/MORAI_UI.png)
 
 ### What the UI does
 
