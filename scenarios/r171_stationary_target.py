@@ -93,36 +93,30 @@ result, and `a_req_at_brake_onset_mps2` is the column that confirms it.
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import math
 import os
-import signal
-import subprocess
 import sys
-import threading
 import time
-from dataclasses import dataclass, asdict, field, replace
-from datetime import datetime
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Bool, Float32, Float64, String
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sim_adapter import ADAPTERS, CollisionEvent  # noqa: E402
+from sim_adapter import ADAPTERS, CollisionEvent  # noqa: E402,F401
+from scenario_common import (  # noqa: E402
+    LOG_HZ, DECEL_VALID_GAP_M, DECEL_VALID_SPEED_MPS, DECEL_PLAUSIBLE_MAX,
+    DECEL_PHYSICAL_MAX, CameraPump, LaneHold, ScenarioBridge, SpeedHold,
+    check_no_bridge_conflict, fmt_decel, install_sigterm_handler,
+    make_out_dir, peak_decel_from_trace, required_decel, start_bridge,
+    wait_for_stack, write_outputs, write_trace)
 
-
-CONTROL_HZ = 20.0
-LOG_HZ = 20.0
 
 # A run ends when one of these trips.
 STOP_SPEED_MPS = 0.3          # "stopped" threshold
 STOP_HOLD_S = 1.0             # ...held this long
+# While the controller is still asking for forward speed after the stop it
+# is closing the last metres to d0, not finished. See the stop test below.
+STOP_CREEP_VREF_KMH = 0.5
+STOP_CREEP_TIMEOUT_S = 6.0    # hard bound so a stuck creep cannot hang a run
 PASS_MARGIN_M = -5.0          # gap this negative = VUT has passed the target
 TIMEOUT_MARGIN_S = 25.0       # on top of the nominal approach duration
 
@@ -133,82 +127,6 @@ BRAKE_ONSET_THRESHOLD = 0.10  # cmd_vel brake above this = the stack reacted
 # intervention. A run is only a clean pass if the collision was avoided
 # AND the deceleration demanded to do so stayed under this.
 DECEL_LIMIT_MPS2 = 5.0
-
-# Deceleration is differentiated from speed, so the collision impulse
-# itself shows up as a several-hundred-m/s^2 spike. Ignore samples inside
-# this gap, and clamp what remains to something a tyre can actually do.
-DECEL_VALID_GAP_M = 0.3
-DECEL_PLAUSIBLE_MAX = 15.0
-# The last tick before standstill drops the speed to zero in one step,
-# which differentiates to ~16 m/s^2 and inflated the achieved figure to
-# 11.75 m/s^2 on a 30 km/h stop that physically peaked near 6. Braking
-# performance is only meaningful while the vehicle is actually moving.
-DECEL_VALID_SPEED_MPS = 1.0
-
-# Beyond roughly 0.9 g on dry asphalt no tyre can deliver the demand, so
-# once a_req crosses this the collision is already locked in and the exact
-# figure stops carrying meaning (braking 1 m from the target at 130 km/h
-# "requires" 700 m/s^2). Recorded raw in the CSV, but flagged so the
-# summary can say "unavoidable" instead of quoting a nonsense number.
-DECEL_PHYSICAL_MAX = 9.0
-
-
-def _peak_decel_from_trace(samples: list, half_window_s: float = 0.12):
-    """Peak deceleration [m/s^2] from a run trace, measured offline.
-
-    Fits v(t) by least squares over a window centred on each sample and
-    takes the steepest negative slope. Centred means no group delay, and
-    fitting over a window rather than differencing adjacent samples means
-    single-sample speed noise cannot masquerade as 20 m/s^2.
-
-    Excludes the same regions the online metric does — the standstill snap
-    and the collision impulse — since neither is braking performance.
-
-    Restricted to the MEASURE phase. The approach phase is flown by the
-    scenario itself and opens with a kinematic snap to the test speed,
-    which differentiates to ~12 m/s^2 at t≈1 s. Including it reported that
-    snap as the run's peak deceleration and attributed the harness's own
-    setup transient to the system under test.
-    """
-    pts = [(s['t'], s['v_kmh'] / 3.6, s['gap_gt_m'])
-           for s in samples if s.get('phase') == 'measure']
-    if len(pts) < 3:
-        return None
-    peak = None
-    for i, (ti, _, _) in enumerate(pts):
-        win = [(t, v) for (t, v, _) in pts if abs(t - ti) <= half_window_s]
-        if len(win) < 3:
-            continue
-        n = len(win)
-        mt = sum(t for t, _ in win) / n
-        mv = sum(v for _, v in win) / n
-        den = sum((t - mt) ** 2 for t, _ in win)
-        if den <= 0:
-            continue
-        slope = sum((t - mt) * (v - mv) for t, v in win) / den
-        _, v_i, gap_i = pts[i]
-        if (v_i > DECEL_VALID_SPEED_MPS and gap_i > DECEL_VALID_GAP_M
-                and -slope <= DECEL_PLAUSIBLE_MAX):
-            peak = -slope if peak is None else max(peak, -slope)
-    return peak
-
-
-def required_decel(speed_mps: float, gap_m: float) -> float:
-    """Constant deceleration needed to stop in the remaining gap [m/s^2].
-
-    a_req = v^2 / (2 * gap). This is the criticality measure the whole
-    test hangs on: at the handover point gap = ttc * v, so a_req reduces
-    to v / (2 * ttc) — the demand the scenario *hands* the system. Every
-    metre the system spends not braking after that drives a_req up, and
-    the run is judged on whether it crossed DECEL_LIMIT_MPS2 before the
-    stack reacted.
-    """
-    if gap_m <= 0.0:
-        return float('inf')
-    if speed_mps <= 0.0:
-        return 0.0
-    return (speed_mps ** 2) / (2.0 * gap_m)
-
 
 # ---------------------------------------------------------------------------
 # Scenario definition
@@ -265,269 +183,6 @@ def build_matrix() -> list[ScenarioPoint]:
                 continue          # already covered by Block A at offset 0
             points.append(ScenarioPoint(v, NOMINAL_OFFSET_M, ttc, block='B'))
     return points
-
-
-# ---------------------------------------------------------------------------
-# ROS bridge — simulator-agnostic
-# ---------------------------------------------------------------------------
-class ScenarioBridge(Node):
-    """Publishes what the ADAS stack consumes, and captures what it emits.
-
-    Deliberately does NOT apply control to the simulator — the scenario
-    director decides each tick whether the stack or the scenario owns the
-    longitudinal channel, then calls the adapter itself. That gate is the
-    whole point of the harness.
-    """
-
-    def __init__(self):
-        super().__init__('r171_scenario_bridge', namespace='Car_1')
-
-        self.camera_pub = self.create_publisher(
-            CompressedImage, '/Car_1/camera/front/compressed', 10)
-        self.speed_pub = self.create_publisher(
-            Float64, '/Car_1/vehicle/speed', 10)
-        # The perception nodes default to False, but publish it anyway so a
-        # stale True latched by a previous carlaAccSimTown.py session can't
-        # leave lane detection paused.
-        self.junction_pub = self.create_publisher(Bool, '/Car_1/in_junction', 1)
-        # ACC's cruise law caps throttle at its set speed and brakes above
-        # it. Left at the 25 km/h default it would fight every approach
-        # above 25 km/h, so the scenario tells it the test speed.
-        self.target_speed_pub = self.create_publisher(
-            Float32, '/ACC/target_speed', 10)
-
-        self.create_subscription(Twist, '/Car_1/cmd_vel', self._on_cmd_vel, 20)
-        self.create_subscription(Float32, '/Car_1/cmd_steer',
-                                 self._on_cmd_steer, 20)
-        self.create_subscription(Float32, '/ACC/lead_vehicle_distance',
-                                 self._on_lead_distance, 20)
-        # Which branch of controller_node's decision hierarchy is driving.
-        # Taken from the node itself rather than inferred from the distance
-        # topic: the controller low-passes that signal before thresholding,
-        # so an outside reconstruction disagrees near the boundaries.
-        self.create_subscription(String, '/ACC/control_mode',
-                                 self._on_control_mode, 10)
-        # The gap the controller acts on (tracked + latency-compensated)
-        # and the governor's reference speed. Neither is derivable from
-        # outside, and both were guesswork when debugging earlier runs.
-        self.create_subscription(Float32, '/ACC/tracked_gap',
-                                 self._on_tracked_gap, 10)
-        self.create_subscription(Float32, '/ACC/speed_reference',
-                                 self._on_speed_ref, 10)
-        # Parallel bb-height range estimate, for scoring against the IPM
-        # value and ground truth. Diagnostic only.
-        self.create_subscription(Float32, '/ACC/lead_distance_pinhole',
-                                 self._on_pinhole, 10)
-
-        ready_qos = QoSProfile(depth=1,
-                               durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                               reliability=ReliabilityPolicy.RELIABLE)
-        self.yolo_ready = False
-        self.ufld_ready = False
-        self.create_subscription(Bool, '/ACC/perception/model_ready',
-                                 self._on_yolo_ready, ready_qos)
-        self.create_subscription(Bool, '/LKAS/perception/model_ready',
-                                 self._on_ufld_ready, ready_qos)
-
-        self.stack_throttle = 0.0
-        self.stack_brake = 0.0
-        self.stack_steer = 0.0
-        # Event-driven steer application. The original bridge
-        # (custom_ROS_pub_sub.CarlaAVT._cmd_steer_cb) called apply_control
-        # the instant a steer message landed. This harness replaced that
-        # with a polled read once per director iteration (~19 Hz), which
-        # silently added up to 52 ms of latency to the LATERAL loop — 1.0 m
-        # of travel at 70 km/h, and pure phase lag to a controller that has
-        # to close around it. Stanley held 70 km/h lanes before and drifted
-        # out of them after, so the latency is restored to zero here.
-        #
-        # `_control_sink` is set by the director only in --lateral-mode lkas;
-        # in locked mode the scenario owns steer and this path stays off.
-        self._control_sink = None
-        self._longitudinal = (0.0, 0.0)
-        self._sink_lock = threading.Lock()
-        self.stack_cmd_vel_seen = False
-        self.lead_distance: float | None = None
-        self.lead_distance_stamp = 0.0
-        self.acc_mode: str = ''
-        self.tracked_gap: float | None = None
-        self.speed_ref: float | None = None
-        self.pinhole_gap: float | None = None
-
-    # -- inbound from the stack --------------------------------------------
-    def _on_cmd_vel(self, msg: Twist) -> None:
-        self.stack_throttle = float(min(max(msg.linear.x, 0.0), 1.0))
-        self.stack_brake = float(min(max(msg.linear.y, 0.0), 1.0))
-        self.stack_cmd_vel_seen = True
-
-    def _on_cmd_steer(self, msg: Float32) -> None:
-        self.stack_steer = float(min(max(msg.data, -1.0), 1.0))
-        sink = self._control_sink
-        if sink is not None:
-            # Same pattern the original bridge used: apply immediately with
-            # the most recent longitudinal command. The lock serialises this
-            # against the director's own apply_control so the two never
-            # interleave a simulator RPC.
-            with self._sink_lock:
-                thr, brk = self._longitudinal
-                sink(thr, brk, self.stack_steer)
-
-    def set_control_sink(self, fn) -> None:
-        self._control_sink = fn
-
-    def set_longitudinal(self, throttle: float, brake: float) -> None:
-        self._longitudinal = (throttle, brake)
-
-    def _on_lead_distance(self, msg: Float32) -> None:
-        d = float(msg.data)
-        if d == float('inf') or d <= 0.0:
-            self.lead_distance = None
-        else:
-            self.lead_distance = d
-            self.lead_distance_stamp = time.monotonic()
-
-    def _on_control_mode(self, msg: String) -> None:
-        self.acc_mode = msg.data
-
-    def _on_tracked_gap(self, msg: Float32) -> None:
-        self.tracked_gap = float(msg.data)
-
-    def _on_speed_ref(self, msg: Float32) -> None:
-        self.speed_ref = float(msg.data)
-
-    def _on_pinhole(self, msg: Float32) -> None:
-        d = float(msg.data)
-        self.pinhole_gap = None if d == float('inf') or d <= 0.0 else d
-
-    def _on_yolo_ready(self, msg: Bool) -> None:
-        self.yolo_ready = self.yolo_ready or bool(msg.data)
-
-    def _on_ufld_ready(self, msg: Bool) -> None:
-        self.ufld_ready = self.ufld_ready or bool(msg.data)
-
-    # -- outbound to the stack ---------------------------------------------
-    def publish_frame(self, jpeg: bytes) -> None:
-        msg = CompressedImage()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'Car_1/camera/front'
-        msg.format = 'jpeg'
-        msg.data = jpeg
-        self.camera_pub.publish(msg)
-
-    def publish_speed(self, speed_mps: float) -> None:
-        self.speed_pub.publish(Float64(data=float(speed_mps)))
-
-    def publish_target_speed(self, kmh: float) -> None:
-        self.target_speed_pub.publish(Float32(data=float(kmh)))
-
-    def publish_not_in_junction(self) -> None:
-        self.junction_pub.publish(Bool(data=False))
-
-
-class CameraPump(threading.Thread):
-    """Encodes and publishes camera frames off the control loop's thread.
-
-    Doing this inline cost ~35 ms per iteration (JPEG encode of a 1280x720
-    frame) and dragged the control loop from 20 Hz to 11.6 Hz. That
-    starved the perception nodes of frames at exactly the moment they
-    matter — a 130 km/h approach covers 3.1 m per iteration at 11.6 Hz —
-    and coarsened the handover trigger by the same factor. The adapter's
-    frame queue is a queue.Queue and encoding touches no simulator RPC, so
-    this is safe to run concurrently with the director.
-    """
-
-    def __init__(self, adapter, bridge: ScenarioBridge, hz: float = 25.0):
-        super().__init__(daemon=True)
-        self.adapter = adapter
-        self.bridge = bridge
-        self.period = 1.0 / hz
-        # NOT `self._stop` — threading.Thread uses that name internally for
-        # a method that join() calls, and shadowing it makes join() raise
-        # "'Event' object is not callable" and abort the interpreter.
-        self._stop_evt = threading.Event()
-        self.frames_published = 0
-
-    def run(self) -> None:
-        while not self._stop_evt.is_set():
-            try:
-                frame = self.adapter.poll_camera()
-                if frame is not None:
-                    self.bridge.publish_frame(frame)
-                    self.frames_published += 1
-            except Exception:
-                pass
-            time.sleep(self.period)
-
-    def stop(self) -> None:
-        self._stop_evt.set()
-
-
-# ---------------------------------------------------------------------------
-# Scenario-owned controllers (approach phase only)
-# ---------------------------------------------------------------------------
-class SpeedHold:
-    """PI throttle/brake hold, used to fly the VUT at the approach speed
-    until the DCAS trigger point."""
-
-    def __init__(self, kp=0.8, ki=0.5, i_limit=3.0):
-        self.kp, self.ki, self.i_limit = kp, ki, i_limit
-        self.integral = 0.0
-
-    def reset(self, seed_throttle: float = 0.0) -> None:
-        """`seed_throttle` pre-loads the integral with an estimate of the
-        throttle needed to hold the test speed. Starting from cold, the
-        integral took longer than the whole settle window to wind up and
-        the VUT arrived at the trigger point ~4% slow — which biases every
-        downstream a_req figure. Seeding removes the droop."""
-        self.integral = (seed_throttle / self.ki) if self.ki else 0.0
-        self.integral = max(min(self.integral, self.i_limit), -self.i_limit)
-
-    def step(self, target_mps: float, actual_mps: float,
-             dt: float) -> tuple[float, float]:
-        err = target_mps - actual_mps
-        u_p = self.kp * err
-        # Anti-windup: only integrate while the unsaturated command is in
-        # range, otherwise a long approach at 130 km/h winds up a huge
-        # integral that overshoots the moment drag drops.
-        if abs(u_p + self.ki * self.integral) < 1.0:
-            self.integral = max(min(self.integral + err * dt,
-                                    self.i_limit), -self.i_limit)
-        u = u_p + self.ki * self.integral
-        return (max(u, 0.0), max(-u, 0.0))
-
-    @staticmethod
-    def drag_throttle_estimate(speed_mps: float) -> float:
-        """Rough steady-state throttle for a charger_2020 in CARLA.
-        Aerodynamic drag dominates, so it grows with v^2; the constant was
-        fitted to hold 30-130 km/h within about a km/h. Only ever a seed —
-        the PI trims whatever it gets wrong."""
-        return min(0.12 + 0.00022 * speed_mps ** 2, 0.9)
-
-
-class LaneHold:
-    """Stanley-form lane-centreline hold for `--lateral-mode locked`.
-
-    Keeps the VUT dead centre so the longitudinal measurement is not
-    polluted by lateral wander. Steer is rate-limited because at 130 km/h
-    an unfiltered correction is enough to unsettle the car.
-    """
-
-    def __init__(self, k_cte=0.6, k_heading=1.0, rate_limit=0.05):
-        self.k_cte, self.k_heading = k_cte, k_heading
-        self.rate_limit = rate_limit
-        self.prev = 0.0
-
-    def reset(self) -> None:
-        self.prev = 0.0
-
-    def step(self, cte: float, heading_err: float, speed: float) -> float:
-        # +cte = ego right of centre -> steer left (negative).
-        cte_term = -math.atan2(self.k_cte * cte, max(speed, 1.0))
-        raw = self.k_heading * heading_err + cte_term
-        steer = max(min(raw, 1.0), -1.0)
-        delta = max(min(steer - self.prev, self.rate_limit), -self.rate_limit)
-        self.prev += delta
-        return self.prev
 
 
 # ---------------------------------------------------------------------------
@@ -785,10 +440,33 @@ class ScenarioRunner:
                 m.impact_speed_kmh = collision.impact_speed * 3.6
                 m.outcome = 'collision'
                 break
+            # "Stopped" means the vehicle is at rest AND the controller has
+            # stopped asking it to move.
+            #
+            # Speed alone was not enough. CARLA snaps a vehicle's velocity
+            # to zero from ~5 km/h, so a stop finishes wherever that snap
+            # lands — measured, 3.46 m against a d0 of 2.0 — and the
+            # controller then creeps the remainder. Ending the run 1.0 s
+            # after the speed threshold cut that creep off at 2.75 m and
+            # recorded a final gap the controller had not finished
+            # producing. The creep needs ~2.0 s from 3.5 m.
+            #
+            # Gating on the reference as well ends the run when the
+            # manoeuvre is actually over, rather than at a fixed timeout
+            # after the wheels first stop. STOP_CREEP_TIMEOUT_S bounds it
+            # so a controller that never settles cannot hang the matrix.
+            creeping = (speed_ref is not None
+                        and speed_ref * 3.6 > STOP_CREEP_VREF_KMH
+                        and acc_mode != 'STANDSTILL')
             if ego.speed < STOP_SPEED_MPS and handed_over:
                 stopped_since = stopped_since if stopped_since else t
-                if t - stopped_since >= STOP_HOLD_S:
+                held = t - stopped_since
+                if held >= STOP_HOLD_S and (not creeping
+                                            or held >= STOP_CREEP_TIMEOUT_S):
                     m.outcome = 'stopped'
+                    if creeping:
+                        m.note = (m.note or '') + ' (creep did not settle '
+                        m.note += f'within {STOP_CREEP_TIMEOUT_S:.0f} s)'
                     break
             else:
                 stopped_since = None
@@ -812,7 +490,7 @@ class ScenarioRunner:
         # definition, so the KPI has no reason to inherit the online
         # estimator's lag. Raw sample-to-sample differencing is not an
         # option either: it peaks at 23 m/s^2 on single-sample noise.
-        peak = _peak_decel_from_trace(samples)
+        peak = peak_decel_from_trace(samples)
         if peak is not None:
             m.peak_decel_achieved_mps2 = peak
 
@@ -843,12 +521,7 @@ class ScenarioRunner:
         else:
             m.verdict = 'pass'
 
-        trace_path = out_dir / f"{point.run_id}.csv"
-        if samples:
-            with open(trace_path, 'w', newline='') as fh:
-                w = csv.DictWriter(fh, fieldnames=list(samples[0].keys()))
-                w.writeheader()
-                w.writerows(samples)
+        write_trace(out_dir, point.run_id, samples)
 
         self.adapter.disarm()
         return m, asdict(geometry)
@@ -982,63 +655,12 @@ def print_matrix(points: list[ScenarioPoint], settle_time: float) -> None:
           f"(settle {settle_time:g} s + TTC).")
 
 
-def check_no_bridge_conflict() -> None:
-    """carlaAccSimTown.py also owns /Car_1/cmd_vel and the ego's
-    apply_control. Two writers per physics tick means the last one wins at
-    random — exactly the race documented in DEBUG.md for the duplicate
-    MORAI adapters. Refuse rather than produce quietly corrupt runs."""
-    try:
-        out = subprocess.run(['pgrep', '-af', 'carlaAccSimTown'],
-                             capture_output=True, text=True, timeout=5)
-    except Exception:
-        return
-    hits = [ln for ln in out.stdout.splitlines() if 'pgrep' not in ln]
-    if hits:
-        raise SystemExit(
-            "carlaAccSimTown.py is running — it would fight this script "
-            "over /Car_1/cmd_vel and the ego's control.\n  "
-            + "\n  ".join(hits)
-            + "\nStop the bridge (UI: Stop Bridge) and re-run.")
-
-
-def wait_for_stack(bridge: ScenarioBridge, timeout: float,
-                   verbose: bool) -> bool:
-    """The ACC holds throttle at 0 until YOLO and UFLD both report ready
-    (controller_node's model-load gate). Handing over before that means
-    measuring the gate, not the controller."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if bridge.yolo_ready and bridge.ufld_ready:
-            print("[stack] YOLO + UFLD ready", flush=True)
-            return True
-        waiting = [n for n, ok in (('YOLO', bridge.yolo_ready),
-                                   ('UFLD', bridge.ufld_ready)) if not ok]
-        print(f"[stack] waiting on: {', '.join(waiting)}", flush=True)
-        time.sleep(2.0)
-    return False
-
-
 SUMMARY_FIELDS = list(RunMetrics().__dict__.keys())
-
-
-def _install_sigterm_handler() -> None:
-    """Turn SIGTERM into KeyboardInterrupt.
-
-    UI.py's Stop button calls os.killpg(SIGTERM). Without this the harness
-    dies where it stands: no summary.csv for the points that already
-    completed, and the ego/target/camera left in the world for the next
-    session to trip over. Routing it into the existing abort path writes
-    the partial results and destroys the actors.
-    """
-    def _on_sigterm(signum, frame):
-        raise KeyboardInterrupt()
-
-    signal.signal(signal.SIGTERM, _on_sigterm)
 
 
 def main(argv=None) -> int:
     global DECEL_LIMIT_MPS2
-    _install_sigterm_handler()
+    install_sigterm_handler()
     args = parse_args(argv)
     DECEL_LIMIT_MPS2 = args.decel_limit
     points = resolve_points(args)
@@ -1054,11 +676,7 @@ def main(argv=None) -> int:
     if args.sim == 'carla':
         check_no_bridge_conflict()
 
-    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    name = f"{stamp}_{args.tag}" if args.tag else stamp
-    out_dir = Path(args.out_dir) if args.out_dir else (
-        Path(__file__).resolve().parent / 'results' / name)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = make_out_dir(__file__, args.tag, args.out_dir)
     print(f"[out] {out_dir}", flush=True)
 
     adapter_cls = ADAPTERS[args.sim]
@@ -1068,12 +686,7 @@ def main(argv=None) -> int:
                           weather=args.weather, sync=args.sync,
                           clean_start=not args.keep_existing_actors)
 
-    rclpy.init()
-    bridge = ScenarioBridge()
-    executor = rclpy.executors.SingleThreadedExecutor()
-    executor.add_node(bridge)
-    spin = threading.Thread(target=executor.spin, daemon=True)
-    spin.start()
+    bridge, shutdown_ros = start_bridge('r171_scenario_bridge')
 
     results: list[RunMetrics] = []
     geometry: dict = {}
@@ -1101,7 +714,7 @@ def main(argv=None) -> int:
             bridge.publish_speed(adapter.ego_state().speed)
 
         if not args.no_stack_check:
-            if not wait_for_stack(bridge, args.stack_timeout, args.verbose):
+            if not wait_for_stack(bridge, args.stack_timeout):
                 raise SystemExit(
                     f"the ADAS stack never reported ready within "
                     f"{args.stack_timeout:g} s. Start it with "
@@ -1132,8 +745,8 @@ def main(argv=None) -> int:
                    else f"{m.gap_at_first_detection_m:.0f} m")
             onset = ('never' if math.isnan(m.brake_onset_gap_m)
                      else f"{m.brake_onset_gap_m:.0f} m")
-            a_trig = _fmt(m.a_req_at_trigger_mps2)
-            a_onset = _fmt(m.a_req_at_brake_onset_mps2)
+            a_trig = fmt_decel(m.a_req_at_trigger_mps2)
+            a_onset = fmt_decel(m.a_req_at_brake_onset_mps2)
             flag = ('  <-- UNAVOIDABLE BY THEN' if m.unavoidable_at_onset
                     else '  <-- OVER LIMIT' if m.exceeded_decel_limit else '')
             print(f"    -> {m.verdict.upper():<15} "
@@ -1145,7 +758,7 @@ def main(argv=None) -> int:
                   f"onset={onset}  impact={m.impact_speed_kmh:.1f} km/h",
                   flush=True)
 
-            _write_outputs(out_dir, results, geometry, args)
+            _write_r171_outputs(out_dir, results, geometry, args)
             if i < len(points):
                 deadline = time.time() + args.settle_between_runs
                 while time.time() < deadline:
@@ -1156,51 +769,23 @@ def main(argv=None) -> int:
         print("\n[abort] interrupted — writing what completed", flush=True)
         exit_code = 130
     finally:
-        _write_outputs(out_dir, results, geometry, args)
+        _write_r171_outputs(out_dir, results, geometry, args)
         if camera_pump is not None:
             camera_pump.stop()
             camera_pump.join(timeout=2.0)
         adapter.close()
-        executor.shutdown()
-        spin.join(timeout=2.0)
-        if rclpy.ok():
-            rclpy.shutdown()
+        shutdown_ros()
 
     _print_report(results)
     print(f"\n[out] {out_dir}", flush=True)
     return exit_code
 
 
-def _write_outputs(out_dir: Path, results: list[RunMetrics],
-                   geometry: dict, args) -> None:
-    if not results:
-        return
-    with open(out_dir / 'summary.csv', 'w', newline='') as fh:
-        w = csv.DictWriter(fh, fieldnames=SUMMARY_FIELDS)
-        w.writeheader()
-        for m in results:
-            w.writerow(asdict(m))
-    with open(out_dir / 'manifest.json', 'w') as fh:
-        json.dump(dict(
-            scenario='UN R171 Annex 4 4.2.5.2.1 — stationary vehicle ahead, '
-                     'straight road',
-            generated=datetime.now().isoformat(timespec='seconds'),
-            args=vars(args),
-            geometry=geometry,
-            runs=[asdict(m) for m in results],
-        ), fh, indent=2, default=str)
-
-
-def _fmt(x: float, width: int = 0, nd: int = 2) -> str:
-    if x is None or not math.isfinite(x):
-        s = '-'
-    elif x > DECEL_PHYSICAL_MAX:
-        # Past tyre capability the figure is arithmetically true but
-        # physically meaningless; say so rather than quoting "710.08".
-        s = f">{DECEL_PHYSICAL_MAX:g}"
-    else:
-        s = f"{x:.{nd}f}"
-    return f"{s:>{width}}" if width else s
+def _write_r171_outputs(out_dir: Path, results: list[RunMetrics],
+                        geometry: dict, args) -> None:
+    write_outputs(out_dir, results, SUMMARY_FIELDS,
+                  'UN R171 Annex 4 4.2.5.2.1 — stationary vehicle ahead, '
+                  'straight road', args, extra=dict(geometry=geometry))
 
 
 def _print_report(results: list[RunMetrics]) -> None:
@@ -1219,8 +804,8 @@ def _print_report(results: list[RunMetrics]) -> None:
                else f"{m.gap_at_first_detection_m:.0f}")
         star = '*' if m.exceeded_decel_limit else ' '
         print(f"{m.run_id:<26} {m.verdict:<16} "
-              f"{_fmt(m.a_req_at_trigger_mps2, 11)} "
-              f"{_fmt(m.a_req_at_brake_onset_mps2, 11)}{star} "
+              f"{fmt_decel(m.a_req_at_trigger_mps2, 11)} "
+              f"{fmt_decel(m.a_req_at_brake_onset_mps2, 11)}{star} "
               f"{m.peak_decel_achieved_mps2:>9.2f} "
               f"{m.min_gap_m:>8.1f} {det:>7}")
     print("-" * w)

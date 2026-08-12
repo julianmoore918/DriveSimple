@@ -11,17 +11,24 @@ Buttons:
   * Stop ADAS Stack              — kills start_adas.sh + any orphan ADAS nodes
   * ACC: ON/OFF                  — toggles perception_node + controller_node
   * LKAS: ON/OFF                 — toggles lane_detection_node + stanley_node
+  * Scenario boxes               — UN R171 stationary / UN R171 curved /
+                                   UN R79 lane keeping. Each one IS the
+                                   CARLA<->ROS bridge while it runs, so
+                                   they share a process slot with the
+                                   bridge and with each other.
 
 The right side of the window renders the live camera feed by subscribing
 to /Car_1/camera/front/compressed (rclpy, runs in a background thread).
 
 Run with system Python 3.10 (ROS-sourceable, has rclpy + PIL + cv2 + numpy).
 """
+import math
 import os
 import re
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -89,6 +96,41 @@ BRIDGE_SCRIPT = BRIDGE_DIR / 'carlaAccSimTown.py'
 # once means two writers on /Car_1/cmd_vel and the ego's apply_control.
 SCENARIO_DIR    = ADAS_WK / 'scenarios'
 SCENARIO_SCRIPT = SCENARIO_DIR / 'r171_stationary_target.py'
+# R171 Annex 4 §4.2.5.2.2 and R79 Annex 8 §3.2. Same mutual exclusion as
+# above: all three are the bridge while they run, and they share
+# self.scenario_proc so only one can be up at a time.
+SCENARIO_CURVE_SCRIPT = SCENARIO_DIR / 'r171_curved_target.py'
+SCENARIO_LKA_SCRIPT   = SCENARIO_DIR / 'r79_lka_validation.py'
+
+# The curve site table and R79's speed derivation are imported rather than
+# duplicated: the site radii and the 80-90 %/+0.4/+0.25 windows are
+# regulation-derived numbers, and a second copy here would be a second
+# thing to get wrong. Import failure is not fatal — the panels fall back
+# to launching with whatever is typed, and only the previews go away.
+try:
+    if str(SCENARIO_DIR) not in sys.path:
+        sys.path.insert(0, str(SCENARIO_DIR))
+    from curve_adapter import SITES as CURVE_SITES, DEFAULT_SITE as CURVE_SITE_DEFAULT
+    from r79_lka_validation import (TESTS as LKA_TESTS,
+                                    speed_for as lka_speed_for,
+                                    parse_declaration as lka_parse_declaration)
+    SCENARIO_META_OK = True
+    _scenario_meta_err = None
+except Exception as _e:            # noqa: BLE001 — UI must still start
+    CURVE_SITES = {}
+    CURVE_SITE_DEFAULT = 't04_r199'
+    LKA_TESTS = ('lane_keeping', 'max_lateral_accel', 'lane_crossing_warning')
+    lka_speed_for = lka_parse_declaration = None
+    SCENARIO_META_OK = False
+    _scenario_meta_err = str(_e)
+
+# R171 §5.3.7.1.2 caps the lateral acceleration an M1 DCAS may induce.
+# The curved panel refuses a speed/site pair above it rather than letting
+# the run start and fail per-point — same check as
+# r171_curved_target.AY_CEILING_MPS2, applied early enough to be useful.
+CURVE_AY_CEILING = 3.0
+# R79 §3.2's default declaration; see r79_lka_validation --declared-ay.
+LKA_DECLARED_AY_DEFAULT = '60:1.5,100:3.0,130:3.0'
 START_ADAS_SH  = ADAS_WK / 'start_adas.sh'
 ROS_SETUP     = '/opt/ros/humble/setup.bash'
 
@@ -911,6 +953,157 @@ class ADASUI:
                    command=self.stop_scenario).grid(
             row=7, column=0, columnspan=3, sticky='ew', pady=2)
 
+        # ── Scenario harness (UN R171 Annex 4 §4.2.5.2.2) ────────────────
+        # Same target and same KPI as the panel above, round a bend. The
+        # site — a surveyed constant-radius arc, see scenarios/README.md —
+        # is what makes the run different, so it is the first control.
+        # Lateral mode is deliberately NOT repeated: the selector in the
+        # stationary panel governs both R171 scripts, because the two
+        # results are only comparable if that choice matches.
+        curve = ttk.LabelFrame(rightcol, text='Scenario — UN R171 curved '
+                                              'target', padding=6)
+        curve.grid(row=2, column=0, sticky='new', pady=(8, 0))
+        curve.columnconfigure(1, weight=1)
+
+        site_names = self._curve_site_names()
+        ttk.Label(curve, text='Curve site:').grid(
+            row=0, column=0, sticky='w', pady=2)
+        self.curve_site_var = tk.StringVar(
+            value=CURVE_SITE_DEFAULT if CURVE_SITE_DEFAULT in site_names
+            else (site_names[0] if site_names else ''))
+        site_box = ttk.Combobox(curve, textvariable=self.curve_site_var,
+                                values=site_names, state='readonly', width=10)
+        site_box.grid(row=0, column=1, columnspan=2, sticky='ew', pady=2)
+        site_box.bind('<<ComboboxSelected>>',
+                      lambda _e: self._update_curve_note())
+
+        ttk.Label(curve, text='Approach speed:').grid(
+            row=1, column=0, sticky='w', pady=2)
+        self.curve_speed_var = tk.StringVar(value='50')
+        speed_box = ttk.Combobox(curve, textvariable=self.curve_speed_var,
+                                 values=['30', '50', '70', '90', '110', '130'],
+                                 width=7)
+        speed_box.grid(row=1, column=1, sticky='ew', pady=2)
+        speed_box.bind('<<ComboboxSelected>>',
+                       lambda _e: self._update_curve_note())
+        ttk.Label(curve, text='km/h').grid(row=1, column=2, sticky='w',
+                                           padx=(4, 0))
+
+        ttk.Label(curve, text='TTC margin:').grid(
+            row=2, column=0, sticky='w', pady=2)
+        self.curve_ttc_var = tk.StringVar(value='6.0')
+        ttk.Combobox(curve, textvariable=self.curve_ttc_var,
+                     values=['4.5', '6.0', '10.0'],
+                     width=7).grid(row=2, column=1, sticky='ew', pady=2)
+        ttk.Label(curve, text='s').grid(row=2, column=2, sticky='w',
+                                        padx=(4, 0))
+
+        # §4.2.5.2.2.1.1 fixes the target within 0.5 m of the lane centre,
+        # so the straight matrix's 1.0 m option does not exist here.
+        ttk.Label(curve, text='Lateral offset:').grid(
+            row=3, column=0, sticky='w', pady=2)
+        self.curve_offset_var = tk.StringVar(value='0.0')
+        ttk.Combobox(curve, textvariable=self.curve_offset_var,
+                     values=['0.0', '0.5'],
+                     width=7).grid(row=3, column=1, sticky='ew', pady=2)
+        ttk.Label(curve, text='m').grid(row=3, column=2, sticky='w',
+                                        padx=(4, 0))
+
+        # wraplength keeps a long geometry line inside the panel. Without
+        # it the label sets the column's width, which both widens the
+        # window and makes this box wider than the stationary one above
+        # it; with it, all three scenario boxes take the column width the
+        # BEV already defines.
+        self.curve_note = ttk.Label(curve, text='', foreground='#666666',
+                                    justify='left', wraplength=BEV_W - 60)
+        self.curve_note.grid(row=4, column=0, columnspan=3, sticky='w',
+                             pady=(4, 4))
+
+        ttk.Button(curve, text='Run single point',
+                   command=self.start_curve_single).grid(
+            row=5, column=0, columnspan=3, sticky='ew', pady=2)
+        curve_btns = ttk.Frame(curve)
+        curve_btns.grid(row=6, column=0, columnspan=3, sticky='ew', pady=2)
+        curve_btns.columnconfigure(0, weight=1)
+        curve_btns.columnconfigure(1, weight=1)
+        ttk.Button(curve_btns, text='Matrix (this site)',
+                   command=self.start_curve_matrix).grid(
+            row=0, column=0, sticky='ew')
+        ttk.Button(curve_btns, text='Stop',
+                   command=self.stop_scenario).grid(
+            row=0, column=1, sticky='ew', padx=(4, 0))
+
+        # ── Scenario harness (UN R79 Annex 8 §3.2) ───────────────────────
+        # Lane keeping with no target. There is no speed control: R79
+        # derives the test speed from the site radius and the declared
+        # aysmax so the demand lands in the window the paragraph specifies
+        # (see scenarios/README.md). The note below previews what that
+        # works out to before anything is launched.
+        lka = ttk.LabelFrame(rightcol, text='Scenario — UN R79 lane keeping',
+                             padding=6)
+        lka.grid(row=3, column=0, sticky='new', pady=(8, 0))
+        lka.columnconfigure(1, weight=1)
+
+        ttk.Label(lka, text='Curve site:').grid(
+            row=0, column=0, sticky='w', pady=2)
+        self.lka_site_var = tk.StringVar(
+            value=CURVE_SITE_DEFAULT if CURVE_SITE_DEFAULT in site_names
+            else (site_names[0] if site_names else ''))
+        lka_site_box = ttk.Combobox(lka, textvariable=self.lka_site_var,
+                                    values=site_names, state='readonly',
+                                    width=10)
+        lka_site_box.grid(row=0, column=1, sticky='ew', pady=2)
+        lka_site_box.bind('<<ComboboxSelected>>',
+                          lambda _e: self._update_lka_note())
+
+        ttk.Label(lka, text='Test:').grid(row=1, column=0, sticky='w', pady=2)
+        self.lka_test_var = tk.StringVar(value=LKA_TESTS[0])
+        lka_test_box = ttk.Combobox(lka, textvariable=self.lka_test_var,
+                                    values=list(LKA_TESTS), state='readonly',
+                                    width=10)
+        lka_test_box.grid(row=1, column=1, sticky='ew', pady=2)
+        lka_test_box.bind('<<ComboboxSelected>>',
+                          lambda _e: self._update_lka_note())
+
+        ttk.Label(lka, text='Declared aysmax:').grid(
+            row=2, column=0, sticky='w', pady=2)
+        self.lka_ay_var = tk.StringVar(value=LKA_DECLARED_AY_DEFAULT)
+        ay_entry = ttk.Entry(lka, textvariable=self.lka_ay_var, width=10)
+        ay_entry.grid(row=2, column=1, sticky='ew', pady=2)
+        ay_entry.bind('<FocusOut>', lambda _e: self._update_lka_note())
+        ay_entry.bind('<Return>', lambda _e: self._update_lka_note())
+
+        self.lka_note = ttk.Label(lka, text='', foreground='#666666',
+                                  justify='left', wraplength=BEV_W - 60)
+        self.lka_note.grid(row=3, column=0, columnspan=2, sticky='w',
+                           pady=(4, 4))
+
+        ttk.Button(lka, text='Run single test',
+                   command=self.start_lka_single).grid(
+            row=4, column=0, columnspan=2, sticky='ew', pady=2)
+        lka_btns = ttk.Frame(lka)
+        lka_btns.grid(row=5, column=0, columnspan=2, sticky='ew', pady=2)
+        for col in (0, 1, 2):
+            lka_btns.columnconfigure(col, weight=1)
+        ttk.Button(lka_btns, text='Matrix',
+                   command=self.start_lka_matrix).grid(
+            row=0, column=0, sticky='ew')
+        # The sweep is the radius x speed grid, judged on kept_lane —
+        # the engineering view next to the compliance one.
+        ttk.Button(lka_btns, text='Sweep R×v',
+                   command=self.start_lka_sweep).grid(
+            row=0, column=1, sticky='ew', padx=(4, 0))
+        ttk.Button(lka_btns, text='Stop',
+                   command=self.stop_scenario).grid(
+            row=0, column=2, sticky='ew', padx=(4, 0))
+
+        self._update_curve_note()
+        self._update_lka_note()
+        if not SCENARIO_META_OK:
+            self._log(f'[ui] curve site table unavailable '
+                      f'({_scenario_meta_err}) — the curved and R79 panels '
+                      f'will still launch, but without geometry previews')
+
     # --------------------------------------------------------------------
     # Logging
     # --------------------------------------------------------------------
@@ -1385,21 +1578,200 @@ class ADASUI:
             self.status_var.set('Scenario: invalid parameters')
             return
         self._start_scenario(
+            SCENARIO_SCRIPT,
             ['--speed-kmh', str(speed),
              '--offset-m', str(offset),
-             '--ttc-s', str(ttc)],
+             '--ttc-s', str(ttc),
+             '--lateral-mode', self.scen_lateral_var.get()],
             f'{speed:g} km/h, offset {offset:g} m, TTC {ttc:g} s '
             f'(handover at {ttc * speed / 3.6:.0f} m)')
 
     def start_scenario_matrix(self, block=None):
         """Block A (18), Block B (12), or the full 30-point matrix."""
-        extra = ['--matrix']
+        extra = ['--matrix', '--lateral-mode', self.scen_lateral_var.get()]
         if block:
             extra += ['--block', block]
         label = f'Block {block}' if block else 'full 30-point matrix'
-        self._start_scenario(extra, label)
+        self._start_scenario(SCENARIO_SCRIPT, extra, label)
 
-    def _start_scenario(self, extra_args, label):
+    # -- curved road (R171 Annex 4 §4.2.5.2.2) ---------------------------
+    @staticmethod
+    def _curve_site_names() -> list[str]:
+        """Sites biggest-radius first — that is the order they matter in,
+        since radius sets both the severity and the speed ceiling."""
+        return [name for name, _ in
+                sorted(CURVE_SITES.items(), key=lambda kv: -kv[1].radius_m)]
+
+    def _curve_site(self):
+        return CURVE_SITES.get(self.curve_site_var.get())
+
+    def _update_curve_note(self):
+        """Show the selected site's geometry and what the chosen speed
+        would demand of the lateral controller."""
+        site = self._curve_site()
+        if site is None:
+            self.curve_note.config(
+                text='site table unavailable — run curve_survey.py',
+                foreground='#993333')
+            return
+        try:
+            v = float(self.curve_speed_var.get()) / 3.6
+        except ValueError:
+            v = 0.0
+        ay = v ** 2 / site.radius_m
+        v_max = math.sqrt(CURVE_AY_CEILING * site.radius_m) * 3.6
+        over = ay > CURVE_AY_CEILING
+        self.curve_note.config(
+            text=(f'{site.town}  R={site.radius_m:.0f} m {site.direction}, '
+                  f'arc {site.arc_m:.0f} m, lead-in {site.lead_in_m:.0f} m\n'
+                  f'demands {ay:.2f} m/s² · ceiling {CURVE_AY_CEILING:g} '
+                  f'→ max {v_max:.0f} km/h\n'
+                  f'lateral mode: from the panel above'),
+            foreground='#993333' if over else '#666666')
+
+    def start_curve_single(self):
+        """One curved-road point. Refuses a speed the site cannot carry."""
+        site = self._curve_site()
+        if site is None:
+            self._log('[ui] no curve site selected — is curve_adapter.py '
+                      'importable?')
+            return
+        try:
+            speed = float(self.curve_speed_var.get())
+            offset = float(self.curve_offset_var.get())
+            ttc = float(self.curve_ttc_var.get())
+        except ValueError:
+            self._log('[ui] curved scenario: speed / offset / TTC must be '
+                      'numbers')
+            self.status_var.set('Scenario: invalid parameters')
+            return
+        # Caught here rather than per-point inside the run: the script
+        # refuses the same combination, and finding that out after a world
+        # load costs a minute for nothing.
+        ay = (speed / 3.6) ** 2 / site.radius_m
+        if ay > CURVE_AY_CEILING:
+            v_max = math.sqrt(CURVE_AY_CEILING * site.radius_m) * 3.6
+            self._log(f'[ui] {speed:g} km/h on {site.name} (R='
+                      f'{site.radius_m:.0f} m) demands {ay:.2f} m/s² of '
+                      f'lateral acceleration, over the '
+                      f'{CURVE_AY_CEILING:g} m/s² R171 §5.3.7.1.2 allows. '
+                      f'Max for this site is {v_max:.0f} km/h.')
+            self.status_var.set('Scenario: over the lateral limit')
+            return
+        self._start_scenario(
+            SCENARIO_CURVE_SCRIPT,
+            ['--site', site.name,
+             '--speed-kmh', str(speed),
+             '--offset-m', str(offset),
+             '--ttc-s', str(ttc),
+             '--lateral-mode', self.scen_lateral_var.get()],
+            f'curve {site.name} (R={site.radius_m:.0f} m), {speed:g} km/h, '
+            f'offset {offset:g} m, TTC {ttc:g} s')
+
+    def start_curve_matrix(self):
+        """The speed x offset x TTC matrix on the selected site only.
+
+        Deliberately not the script's default two-site matrix: that one
+        spans Town12, which costs minutes of world loading, and a UI
+        button should do what the panel above it says.
+        """
+        site = self._curve_site()
+        if site is None:
+            self._log('[ui] no curve site selected')
+            return
+        self._start_scenario(
+            SCENARIO_CURVE_SCRIPT,
+            ['--matrix', '--matrix-sites', site.name,
+             '--lateral-mode', self.scen_lateral_var.get()],
+            f'curve matrix on {site.name} (R={site.radius_m:.0f} m)')
+
+    # -- lane keeping (R79 Annex 8 §3.2) ---------------------------------
+    def _update_lka_note(self):
+        """Preview the speed R79 derives for this site and test.
+
+        The speed is not a free parameter: it is whatever puts the lateral
+        demand in the paragraph's window. Showing it here means an
+        out-of-band combination is visible before a world is loaded, not
+        after the run comes back `invalid_window`.
+        """
+        site = CURVE_SITES.get(self.lka_site_var.get())
+        if site is None or lka_speed_for is None:
+            self.lka_note.config(
+                text='site table unavailable — the run will still start',
+                foreground='#993333')
+            return
+        try:
+            bands = lka_parse_declaration(self.lka_ay_var.get(), False)
+        except SystemExit as exc:
+            self.lka_note.config(text=f'declaration rejected: {exc}',
+                                 foreground='#993333')
+            return
+        except Exception:
+            self.lka_note.config(text='declaration must look like '
+                                      '"60:1.5,100:3.0,130:3.0"',
+                                 foreground='#993333')
+            return
+
+        test = self.lka_test_var.get()
+        hit = None
+        for band in bands:
+            v, ay = lka_speed_for(test, band.ay_max, site.radius_m)
+            if band.contains(v):
+                hit = (band, v, ay)
+                break
+        if hit is None:
+            self.lka_note.config(
+                text=(f'R={site.radius_m:.0f} m: no declared band whose own '
+                      f'speed range contains the derived speed — this run '
+                      f'would be invalid_window'),
+                foreground='#993333')
+            return
+        band, v, ay = hit
+        self.lka_note.config(
+            text=(f'{site.town}  R={site.radius_m:.0f} m, arc '
+                  f'{site.arc_m:.0f} m\n'
+                  f'derived {v:.1f} km/h → {ay:.2f} m/s² '
+                  f'(band {band.label}, aysmax {band.ay_max:g})'),
+            foreground='#666666')
+
+    def start_lka_single(self):
+        site = CURVE_SITES.get(self.lka_site_var.get())
+        name = site.name if site else self.lka_site_var.get()
+        if not name:
+            self._log('[ui] no curve site selected')
+            return
+        self._start_scenario(
+            SCENARIO_LKA_SCRIPT,
+            ['--site', name,
+             '--test', self.lka_test_var.get(),
+             '--declared-ay', self.lka_ay_var.get()],
+            f'R79 {self.lka_test_var.get()} on {name}')
+
+    def start_lka_sweep(self):
+        """radius x speed over every sweep site, judged on kept_lane.
+
+        Speeds and sites come from the script's own defaults rather than
+        the panel: the panel picks ONE site, and a sweep that ran only
+        that row would not be a sweep.
+        """
+        self._start_scenario(
+            SCENARIO_LKA_SCRIPT,
+            ['--sweep', '--declared-ay', self.lka_ay_var.get()],
+            'R79 lane-keeping sweep (radius × speed)')
+
+    def start_lka_matrix(self):
+        """Every (site, band, test) whose derived speed is legal.
+
+        Spans several maps, so it reloads the world between site groups —
+        expect it to take a while, and expect Town12 sites to dominate
+        that time.
+        """
+        self._start_scenario(
+            SCENARIO_LKA_SCRIPT,
+            ['--matrix', '--declared-ay', self.lka_ay_var.get()],
+            'R79 lane-keeping matrix (all sites)')
+
+    def _start_scenario(self, script, extra_args, label):
         if self.scenario_proc and self.scenario_proc.poll() is None:
             self._log('[ui] scenario already running — Stop scenario first')
             return
@@ -1413,9 +1785,9 @@ class ADASUI:
             self.stop_bridge()
             time.sleep(1.0)
 
-        cmd = [str(CARLA_PYTHON), str(SCENARIO_SCRIPT),
-               '--lateral-mode', self.scen_lateral_var.get()]
-        cmd += extra_args
+        # --lateral-mode is added by the callers that have one: the R79
+        # script owns steer unconditionally and does not accept the flag.
+        cmd = [str(CARLA_PYTHON), str(script)] + list(extra_args)
         self._log(f'$ (source ROS && cd {SCENARIO_DIR} && {" ".join(cmd)})')
         # source_workspace=True: unlike the bridge, the harness imports the
         # workspace's message types for the topics it publishes.
@@ -1737,6 +2109,14 @@ def main():
     # keeps its previous size — the new width is added, not redistributed.
     root.geometry('1720x820')
     app = ADASUI(root)
+    # The right column now stacks three scenario panels under the BEV, so
+    # a fixed height clips the bottom one. Ask Tk what the layout needs
+    # and grant it, bounded by the screen — 820 stays the floor so a small
+    # display still gets the previous window.
+    root.update_idletasks()
+    _sw, _sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f'{min(max(1720, root.winfo_reqwidth()), _sw - 60)}'
+                  f'x{min(max(820, root.winfo_reqheight()), _sh - 100)}')
 
     def on_close():
         # Tear down what we own, in reverse-start order. Flush any in-flight

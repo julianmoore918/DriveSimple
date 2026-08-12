@@ -90,7 +90,7 @@ LANE_FALLBACK_HALF_W = 1.5
 # published distance to it — or blending, IPM close where boxes clip and
 # pinhole far — is the obvious next step and would make this cap generous
 # rather than load-bearing.
-MAX_IPM_TRUST_M = 80.0
+MAX_IPM_TRUST_M = 150.0
 # Real-world heights [m] for the pinhole range estimate, d = f*H/bb_height.
 # This is the pre-IPM approach, reinstated as a PARALLEL diagnostic rather
 # than a replacement — see the pinhole publisher in estimateLeadDist.

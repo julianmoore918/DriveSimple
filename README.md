@@ -149,9 +149,14 @@ bound by `DECEL_LIMIT`.
 | `ACC_PROFILE_ACCEL` | Max reference rise rate | 1.0 m/s² |
 | `REF_DESCENT_MARGIN` / `_FLOOR` | Reference may descend at this multiple of the latched plan | 2.0× / 2.0 m/s² |
 | `ACC_LATCH_MARGIN` | Acquisition latch: `a = margin · v_close²/(2·gap_err)` | 0.95 |
-| `COAST_DECEL` | Measured engine-braking table, 0.5–13.5 m/s (§46.2) | 0.81 … **6.57** … 2.73 m/s² |
-| `BRAKE_AUTHORITY` | Deceleration per unit brake, coast removed, lag aligned | 4.44 m/s² |
+| `COAST_DECEL` | Measured off-throttle drag table, 0.5–19.5 m/s. **Re-derived in §50.3** after the plant fix; the old 0.81…6.57…2.73 measured CARLA's stock damping | 0.15 … 0.85 … 0.61 m/s² |
+| `ZERO_THROTTLE_DAMPING` | `damping_rate_zero_throttle_clutch_engaged` applied to the VUT at spawn, replacing CARLA's default 2.0 (§50.2) | 0.4 |
+| `BRAKE_AUTHORITY` | Deceleration per unit brake, coast removed, lag aligned. **Re-fitted in §50.7**; the old 4.44 had stock engine braking in its residual | 5.69 m/s² |
 | `THROTTLE_AUTHORITY` | Acceleration per unit throttle | 6.0 m/s² |
+| `ACC_BRAKE_CAP` | Ceiling on ACC service brake — 2.28 m/s² before coast (§50.8). EMERGENCY is not capped | 0.40 |
+| `CREEP_SPEED` | Below this the set-speed throttle cap is lifted so the vehicle can close the last metres to `d0`; the cap is 0.105 and will not launch from rest (§52.2) | 2.0 m/s |
+| `MIN_BRAKE_NO_THROTTLE` suppression | The brake floor is lifted whenever the governor asks for more speed than the vehicle has, so it cannot hold a stopped car away from `d0` (§53) | — |
+| `STANDSTILL_WINDOW` | Tolerance on `d0` for latching the standstill hold. Was effectively 2.0 m, which set the final gap instead of `d0` (§50.8) | 0.5 m |
 | `MIN_BRAKE_NO_THROTTLE` | Brake floor whenever throttle is off | 0.10 |
 | `cruise_gain` / `cruise_ki` | Speed-loop PI gains | 0.3 / 0.2 |
 | `AB_ALPHA` | α-β tracker gain (β = α²/(2−α)) | 0.20 |
@@ -163,10 +168,21 @@ bound by `DECEL_LIMIT`.
 | `MAX_IPM_TRUST_M` | Max range at which a distance is published | 25 m |
 | `LANE_FALLBACK_HALF_W` | Ego-lane corridor when no UFLD centerline reaches the detection | 1.5 m |
 
-**Deceleration is not commanded by the brake alone.** Engine braking in
-CARLA reaches 6.57 m/s² with nothing pressed — above the R171 ceiling — so
-holding *partial throttle* is how a soft deceleration is produced. See
-DEBUG §45.2 / §46.2.
+While a lead is tracked, throttle is capped at
+`coast_decel(target_speed)/THROTTLE_AUTHORITY` — the throttle that merely
+*holds* the set speed (0.455 at 50 km/h). The `a_des ≤ 0` cap alone rises
+as the vehicle slows, permitting 1.00 at 34 km/h; see DEBUG §48.5.
+
+**Deceleration is not commanded by the brake alone** — but far less so
+since DEBUG §50. CARLA's stock `damping_rate_zero_throttle_clutch_engaged`
+of 2.0 shed up to 8.38 m/s² with nothing pressed and stopped the car from
+50 km/h in 34 m; the adapter now sets 0.4, giving 4.73 m/s² peak and 154 m.
+Constants tuned before that change (`THROTTLE_AUTHORITY`,
+`BRAKE_AUTHORITY`, the §48.5 throttle cap) were fitted against the old
+plant and are listed for re-derivation in §50.4. The brake inhibit that
+went with it was **removed** in §50.6 — it held the brake off until the
+last fifth of the approach, which was defensible when coasting stopped the
+car in 34 m and became the dominant fault at 154 m.
 
 The PD cascade (`acc_control`, `brake_for_decel`, `cruise_control`) and its
 `k_p`/`k_d` gains were removed in full once the governor proved out.
@@ -177,7 +193,8 @@ change the cruise target on the fly.
 ## LKA — Lane-Keeping Assist
 
 **lane_detection_node.py** runs UFLD-V2 inference on the same camera
-feed (at 5 Hz — every 4th camera frame, see DEBUG.md §33a), extracts
+feed (at ~20 Hz — every camera frame on CARLA since DEBUG.md §49.4;
+was 5 Hz / every 4th, see §33a), extracts
 per-row anchor points for the ego-left and ego-right lanes, projects
 them into the vehicle frame via IPM, fits a quadratic
 `y(x) = a x² + b x + c` per side, and feeds each frame's coefficients
@@ -230,9 +247,11 @@ positive-right steering convention.
   F1 = 0.87 on a held-out CARLA validation set. See
   `02_UFLD_V2/DEBUG.md` §3.3 for the training recipe.
 - **Runtime.** 288 × 800 input resolution; row+column hybrid anchors;
-  ~20–30 ms per forward pass on CUDA. Inference is throttled to
-  every 4th camera frame (5 Hz) to leave CPU headroom for the rest of
-  the stack.
+  ~20–30 ms per forward pass on CUDA. On CARLA it now runs on every
+  camera frame (~20 Hz): at 5 Hz the lane estimate was up to 7.2 m
+  stale at 130 km/h, which is the suspected cause of the lateral
+  departures above 50 km/h in the 30-point matrix (DEBUG §49.3–49.4).
+  MORAI stays at every 2nd frame for GPU contention.
 - **Confidence.** Per-lane soft confidence
   `exist_prob × pos_peak_prob` (mean across valid rows) is used by
   the KF's acceptance gate.
@@ -261,7 +280,8 @@ Joseph form for symmetric-PD stability at the tuned q values.
 |---|---|---|
 | `q_a`, `q_b`, `q_c` | CWNA process-noise PSDs (curvature, heading, offset) | 0.5, 5.0, 5.0 |
 | `KF_CONF_THRESHOLD` | Minimum UFLD per-lane confidence to enter update | 0.15 |
-| `KF_MAX_COAST_TICKS` | Coast ticks before RST (≈ 4 s at 5 Hz) | 20 |
+| `KF_R_REFERENCE_HZ` | Rate at which `R` from the polyfit is taken at face value; above it `R` is inflated by `infer_hz / this`, since consecutive UFLD frames are not independent (§51) | 5.0 Hz → ×4.0 at skip_n=1 |
+| `KF_COAST_SECONDS` / `KF_REJECT_SECONDS` | Coast / reject windows before RST, specified as **durations** and converted to ticks from the live inference rate (§49.4) | 4.0 s each → 80 ticks at 20 Hz |
 | `γ` | χ²(3, 0.95) validation gate | 7.815 |
 | `KF_LOG_EVERY` | Steady-state log heartbeat cadence | 40 frames |
 
@@ -355,6 +375,22 @@ otherwise has to be done by hand.
   (see DEBUG.md §33g).
 - **Rosbag recording.** Optional `--record` toggle passed through to
   the bridge.
+
+## Runtime overrides
+
+- `-p simulator:=<carla|morai>` on all ROS 2 nodes — picks the right
+  speed-message type, camera extrinsics, Stanley gains, and cruise
+  target.
+- `-p model_filename:=<file>` on `perception_node` /
+  `lane_detection_node` — resolves relative to
+  `share/perception/models/` if not absolute.
+- `-p enable_kalman:=<true|false>` on `lane_detection_node` — turns
+  the KF and the coeff channel off, forcing Stanley into its
+  path-based fallback for A/B comparison.
+- `-p kf_q_a:=`, `-p kf_q_b:=`, `-p kf_q_c:=` — live-tunable KF PSDs
+  via the perception node's `SetParametersCallback`.
+- `-p inference_skip_n:=<n>` on `lane_detection_node` — every Nth
+  camera frame gets an UFLD pass. Default 4 (5 Hz).
 
 ## Further reading
 

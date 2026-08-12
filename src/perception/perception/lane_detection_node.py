@@ -175,6 +175,12 @@ class UFLDInference:
             polylines[key] = pts
         return polylines['ego_left'], polylines['ego_right'], left_conf, right_conf
 
+
+# Both simulators publish camera frames at ~20 Hz (CARLA default; MORAI
+# under Fixed 20fps timestep). Used to convert duration-specified KF
+# constants into detector ticks — see KF_COAST_SECONDS.
+NOMINAL_CAMERA_HZ = 20.0
+
 class LaneDetectionNode(Node):
     def __init__(self):
         super().__init__('Lane_Detection_Node', namespace='LKAS')
@@ -199,8 +205,23 @@ class LaneDetectionNode(Node):
         self.declare_parameter('cam_x_offset',
             DEFAULT_CAM_X_OFFSET_MORAI if simulator == 'morai' else DEFAULT_CAM_X_OFFSET)
 
-        # Run UFLD on every Nth camera frame. CARLA publishes at ~20 Hz;
-        # N=4 gives ~5 Hz inference, plenty at the 20 km/h target. MORAI
+        # Run UFLD on every Nth camera frame. CARLA publishes at ~20 Hz.
+        #
+        # N=4 (~5 Hz) was chosen when the target was 20 km/h, where 5 Hz is
+        # ample: 1.1 m of travel between lane updates. The R171 matrix runs
+        # to 130 km/h, where the same 0.2 s interval is 7.2 m — the lane
+        # estimate is a fifth of a second stale at every Stanley tick, and
+        # the KF is extrapolating across it. That is the suspected cause of
+        # the lateral departures above 50 km/h in the 30-point matrix
+        # (§49). N=1 puts inference back on every frame, ~20 Hz / 0.7 m at
+        # 130 km/h.
+        #
+        # The cost is GPU contention with YOLO — the same trade-off that
+        # drove MORAI to N=2 below (RTF sagged to ~0.56 at N=1). Watch the
+        # control-loop rate and YOLO's frame drops after this change; if
+        # they suffer, N=2 (~10 Hz, 3.6 m at 130 km/h) is the fallback
+        # rather than going back to 4.
+        # MORAI
         # was set to N=1 (every frame) because its camera rate used to be
         # inconsistent/sparse under Variable-timestep mode, and skipping
         # frames on top of an already-sparse feed starved UFLD further.
@@ -210,7 +231,7 @@ class LaneDetectionNode(Node):
         # same GPU -- observed RTF sagging to ~0.56. N=2 halves UFLD's
         # load; trade-off is coarser Kalman tracking between updates,
         # not usually noticeable at typical driving speeds.
-        self.declare_parameter('inference_skip_n', 2 if simulator == 'morai' else 4)
+        self.declare_parameter('inference_skip_n', 2 if simulator == 'morai' else 1)
         self.declare_parameter('enable_kalman', True)
 
         ufld_repo   = self.get_parameter('ufld_repo').value
@@ -224,9 +245,59 @@ class LaneDetectionNode(Node):
         self.cam_x_off  = self.get_parameter('cam_x_offset').value
         self.skip_n     = max(1, int(self.get_parameter('inference_skip_n').value))
 
+        # Detector tick rate = camera rate / skip_n. Constants specified as
+        # a duration are converted here so they keep meaning their duration
+        # when skip_n changes (§49.4).
+        infer_hz = NOMINAL_CAMERA_HZ / self.skip_n
+
+        # Inflate R with the inference rate.
+        #
+        # R comes from np.polyfit(..., cov=True) — the WITHIN-frame fit
+        # covariance. It describes how well a quadratic fits that frame's
+        # anchor points, and says nothing about frame-to-frame
+        # independence. The KF treats every update as an independent draw.
+        #
+        # At 5 Hz that was roughly true. At 20 Hz consecutive UFLD
+        # detections run on nearly-identical images, so their errors are
+        # strongly correlated — four of them carry little more information
+        # than one. Treated as four independent draws, P shrinks about 4x
+        # faster per second than the data warrants. An overconfident P
+        # makes S = HPH' + R too small, the chi-square gate (7.815) starts
+        # rejecting genuine lane changes, and the filter coasts on a stale
+        # prior while reporting high confidence.
+        #
+        # That is the signature seen in run 20260812_120816: steer grew to
+        # -0.257 while the true cross-track error was ~0, i.e. the
+        # controller was tracking a lane estimate that had stopped
+        # following the road. cte then ran to 7.50 m. The companion run
+        # 120117 held 0.22 m on identical code, so this is intermittent —
+        # consistent with a gate that only bites when the lane genuinely
+        # moves.
+        #
+        # Scaling R by (infer_hz / 5) makes the filter extract the same
+        # information per SECOND at any rate, which is the right invariant
+        # when the extra samples are not independent. It is exactly 1.0 at
+        # skip_n = 4, so the validated 5 Hz tuning (q = 0.5/5/5) is
+        # preserved unchanged and only faster rates are affected.
+        #
+        # HYPOTHESIS, not yet confirmed by a run. If lateral still departs
+        # at skip_n = 1, fall back to 2 before touching q — q was validated
+        # against real data and this scaling was not.
+        self.KF_R_REFERENCE_HZ = 5.0
+        self.kf_R_scale = max(1.0, infer_hz / self.KF_R_REFERENCE_HZ)
+        self.KF_MAX_COAST_TICKS  = max(1, round(self.KF_COAST_SECONDS  * infer_hz))
+        self.KF_MAX_REJECT_TICKS = max(1, round(self.KF_REJECT_SECONDS * infer_hz))
+        self.get_logger().info(
+            f"[lane] UFLD every {self.skip_n} frame(s) ~{infer_hz:.0f} Hz; "
+            f"KF coast {self.KF_MAX_COAST_TICKS} ticks "
+            f"({self.KF_COAST_SECONDS:.0f} s), "
+            f"reject {self.KF_MAX_REJECT_TICKS} ticks; "
+            f"R x{self.kf_R_scale:.1f}")
+
         # ── Kalman filter (per-lane polynomial-coefficient smoother) ──
-        # dt = 0.2 s at construction matches the nominal detector rate
-        # (5 Hz effective). Actual dt per tick is recomputed from the
+        # dt = 0.2 s at construction; the nominal detector rate is now
+        # ~20 Hz on CARLA (skip_n = 1), so this initial value is merely a
+        # seed. Actual dt per tick is recomputed from the
         # message header inside camera_callback so the filter tolerates
         # skipped frames / junction-exit gaps correctly.
         self.kalman_on = bool(self.get_parameter('enable_kalman').value)
@@ -451,7 +522,14 @@ class LaneDetectionNode(Node):
     # sustained low-conf windows in curves. RST clears initialization
     # which drops the sample() output → operator sees the projection
     # blink out. Longer coast keeps the last good prior visible.
-    KF_MAX_COAST_TICKS = 20
+    #
+    # Expressed as a TIME, converted to ticks in __init__ from the actual
+    # inference rate. It was a tick count until §49.4 changed skip_n 4 → 1,
+    # which would silently have cut this window 4 s → 1 s — reinstating the
+    # curve RSTs that raising it from 5 was meant to stop. Any constant
+    # counted in detector ticks has to move when the detector rate moves.
+    KF_COAST_SECONDS = 4.0
+    KF_MAX_COAST_TICKS = 20        # default; recomputed per rate below
     # Every N frames, print a "steady <REASON>" line even if the reason
     # hasn't changed, so a stall isn't invisible in the log.
     KF_LOG_EVERY = 40
@@ -463,10 +541,12 @@ class LaneDetectionNode(Node):
     # with no coast/RST path to recover since REJ != missing/weak data.
     # Force a reset so the next good measurement re-seeds the filter from
     # scratch instead of being rejected forever. Same order of magnitude
-    # as KF_MAX_COAST_TICKS (~4 s at 5 Hz). Found via n_rej=1665 stuck on
+    # as KF_MAX_COAST_TICKS (~4 s). Rate-derived for the same reason —
+    # see KF_COAST_SECONDS. Found via n_rej=1665 stuck on
     # MORAI's right lane while UFLD's raw detections tracked the road
     # fine the whole time -- see DEBUG.md.
-    KF_MAX_REJECT_TICKS = 20
+    KF_REJECT_SECONDS = 4.0
+    KF_MAX_REJECT_TICKS = 20       # default; recomputed per rate below
 
     def _kf_smooth(self, kf, veh_points, conf, dt, side: str = ''):
         """Fit → step → resample. Returns empty (== HOLD signal
@@ -508,7 +588,7 @@ class LaneDetectionNode(Node):
             return []
         z = np.array([coeffs[0], coeffs[1], coeffs[2]])
         n_rej_before = kf.n_rejected
-        kf.step(z, R=cov, dt=dt)
+        kf.step(z, R=cov * self.kf_R_scale, dt=dt)
         # If n_rejected went up, the χ² gate ate this measurement.
         if kf.n_rejected > n_rej_before:
             reason = 'REJ'

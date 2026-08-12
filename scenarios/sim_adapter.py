@@ -158,6 +158,11 @@ class CarlaAdapter(SimAdapter):
     # and the physical bound any single sample is clamped to.
     ACCEL_MIN_DT = 0.05
     ACCEL_CLAMP = 12.0
+    # RPC timeout. Generous because load_world() runs inside it: the stock
+    # maps take seconds, but CARLA's Large Maps (Town11-15) take minutes,
+    # and a client that gives up mid-load leaves the server streaming
+    # tiles for a map nobody is waiting for. Subclasses raise it per map.
+    RPC_TIMEOUT_S = 120.0
 
     def __init__(self, *, host='localhost', port=2000, town='Town06',
                  spawn_index=80, ego_bp='vehicle.dodge.charger_2020',
@@ -202,7 +207,7 @@ class CarlaAdapter(SimAdapter):
     def connect(self) -> None:
         carla = self._carla
         self.client = carla.Client(self.host, self.port)
-        self.client.set_timeout(120.0)
+        self.client.set_timeout(self.RPC_TIMEOUT_S)
         version = self.client.get_server_version()
 
         loaded = self.client.get_world().get_map().name
@@ -285,6 +290,63 @@ class CarlaAdapter(SimAdapter):
                 self.wait_for_tick()
         return killed
 
+    # CARLA's default off-throttle driveline drag, and what we use instead.
+    #
+    # Measured by open-loop coast-down (scenarios/coastdown.py) in sync
+    # mode at fixed_delta = 0.01, nothing commanded: the stock 2.0 gives a
+    # dodge charger_2020 a peak of 8.38 m/s^2 (centred +/-0.12 s) and a
+    # 34.4 m stop from 50 km/h with no brake applied at all. That is above
+    # the R171 5 m/s^2 ceiling before the controller has done anything,
+    # and it is why every stop in the 30-point matrix completed on coast
+    # alone. The peaks are gearbox downshifts, not measurement noise --
+    # they reproduce at fixed speeds (2->1 at ~23 km/h, 3->2 at ~32) and
+    # survive 100 Hz evenly-spaced sampling. See DEBUG.md §50.
+    #
+    # 0.4 is in the range corresponding to realistic off-throttle drag.
+    # This is a plant correction, not a tuning knob: leave it alone unless
+    # re-measuring, and re-derive the controller's COAST_DECEL table if it
+    # changes -- that table IS this parameter's fingerprint.
+    ZERO_THROTTLE_DAMPING = 0.4
+    # Server ticks to allow the physics write to land before failing.
+    PHYSICS_APPLY_MAX_TICKS = 10
+
+    def _apply_powertrain_fix(self, actor) -> None:
+        """Replace CARLA's default off-throttle driveline drag.
+
+        Applied to the VUT only. The target is stationary, so its drag is
+        irrelevant, and leaving it stock keeps the change to one actor.
+        """
+        pc = actor.get_physics_control()
+        was = pc.damping_rate_zero_throttle_clutch_engaged
+        pc.damping_rate_zero_throttle_clutch_engaged = self.ZERO_THROTTLE_DAMPING
+        actor.apply_physics_control(pc)
+
+        # Verify rather than assume: apply_physics_control is a
+        # fire-and-forget RPC, and a silently-ignored write would look
+        # exactly like a controller regression.
+        #
+        # The read-back RACES the write in async mode. Measured over six
+        # back-to-back spawn/apply/read cycles against a live server, 2 of
+        # 6 still read the stock 2.0 immediately after applying; one tick
+        # was enough in every one of those. It is not a deterministic
+        # "needs N ticks" — it is a race, so retry rather than sleep. The
+        # sync coast-down never hit it because it ticks before reading,
+        # which is why this only showed up in the harness.
+        for _ in range(self.PHYSICS_APPLY_MAX_TICKS):
+            if self.sync:
+                self.world.tick()
+            else:
+                self.world.wait_for_tick()
+            got = (actor.get_physics_control()
+                   .damping_rate_zero_throttle_clutch_engaged)
+            if abs(got - self.ZERO_THROTTLE_DAMPING) <= 1e-3:
+                print(f"[carla] off-throttle damping {was} -> {got}")
+                return
+        raise RuntimeError(
+            "damping_rate_zero_throttle_clutch_engaged did not take after "
+            f"{self.PHYSICS_APPLY_MAX_TICKS} ticks: "
+            f"asked {self.ZERO_THROTTLE_DAMPING}, read {got}")
+
     def spawn_ego(self) -> None:
         carla = self._carla
         bp_lib = self.world.get_blueprint_library()
@@ -319,6 +381,8 @@ class CarlaAdapter(SimAdapter):
         cam_bp.set_attribute('fov', str(self.cam_fov))
         cam_bp.set_attribute('sensor_tick', str(self.cam_tick))
         cam_bp.set_attribute('ros_name', 'front_camera')
+        self._apply_powertrain_fix(self.ego)
+
         self.camera = self.world.spawn_actor(
             cam_bp,
             carla.Transform(carla.Location(x=0.6, y=0.0, z=1.35)),

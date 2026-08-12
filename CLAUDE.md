@@ -43,7 +43,7 @@ If a change makes a README section wrong, fixing it is part of the change.
 src/perception/        YOLO lead detection, UFLD lanes, IPM, debug images
 src/controller/        ACC longitudinal (controller_node), Stanley lateral
 src/morai_bridge/      MORAI <-> /Car_1/* adapters
-scenarios/             UN R171 harness — see scenarios/README.md
+scenarios/             UN R171 + R79 harness — see scenarios/README.md
 scenarios/results/     run output; plot_run.py renders traces
 UI.py                  orchestration + telemetry
 start_adas.sh          launches the stack (carla | morai)
@@ -63,7 +63,9 @@ CARLA must be up, then:
 CARLA<->ROS bridge for the duration — running `carlaAccSimTown.py` as well
 puts two writers on `/Car_1/cmd_vel` and the ego's `apply_control`.
 
-Plot afterwards with `python3 scenarios/results/plot_run.py`.
+Plot afterwards with `python3 scenarios/results/plot_run.py`. On the deceleration
+panel, samples the KPI excludes (below `DECEL_VALID_SPEED_MPS`, where the
+sim's standstill snap lives) are drawn in grey, not hidden — DEBUG §54.
 
 ## Things that have bitten us more than once
 

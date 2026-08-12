@@ -4091,3 +4091,1171 @@ scenario. That is the next run, not a result.
 Open: the pinhole range estimate (§45.8) remains published and unused, and
 still measures far better than IPM beyond 30 m (bias +0.19 vs +1.62 m,
 RMS 0.47 vs 1.86, flat with range).
+
+---
+
+## 47. `dev_jonas` review notes — verbatim, with editorial replies [REFERENCE]
+
+Copied verbatim from `origin/dev_jonas`'s DEBUG.md (commit `35bf00e`,
+Jonas Freyer) rather than merged — see §46.6 for why the branch was not
+taken. His code change is superseded by §46.7, but the Stage 4 / Layer 2
+KPI numbers are external evidence we have no other source for, and his
+§47.3 review found a live bug. Editorial replies are marked **[reply]**
+and are the only text added.
+
+Landed on `dev_jonas`, branched from `5ee607f` (this section's own §45.3
+governor rewrite), not yet merged to `main`.
+
+### 47.1 Why this branch exists
+
+Independent of this rework: the Stage 4 / Layer 2 CARLA KPI evaluation in
+the KIT-IPEK MORAI Simulation Handbook repo
+(`notebooks/acc_kpi_evaluation.ipynb`, run against the controller as of
+commit `2ca2c47`, i.e. one commit before §45's governor rewrite) measured
+achieved peak deceleration of **6.31 m/s² (v30 run) and 7.89 m/s² (v50
+run)** against the 5.0 m/s² `DECEL_LIMIT` target — both over the R171
+ceiling, and the v30 case notably over-braked relative to what was even
+kinematically required (1.64 m/s² required vs. 6.31 achieved). That
+matches this section's own §45.2 finding (brake authority varying 8-49x)
+and was independently about to be patched (rate-limiting the old `a`
+command, tightening `a_min`) when `5ee607f` landed and replaced the whole
+acceleration-feedback cascade with the speed governor instead. The governor
+is the better fix — it bounds deceleration by construction (reference-rate
+limit) rather than by feedback on a ~208 ms-lagged, unpredictable-gain
+plant — so the planned patch was dropped in favour of it.
+
+### 47.2 What's actually in this branch
+
+Purely mechanical: removed the now-dead `acc_control()`, `brake_for_decel()`,
+`cruise_control()`, `_legacy_cruise_control()` and every `__init__` constant
+that only they read (`k_p`, `k_d`, `a_min`, `a_max`, `throttle_scale`,
+`brake_scale`, `a_ego`/`ACCEL_ALPHA`/`ACCEL_MIN_DT`/`prev_v_ego`/`prev_v_time`,
+`brake_kp`/`brake_ki`/`brake_i_limit`/`brake_integral`, `BRAKE_AUTH_A0`/`A1`/
+`MAX`/`MIN`/`FF_AUTHORITY`, `d_stop_margin`, `KIN_ENGAGE_MPS2`,
+`KIN_RELEASE_MPS2`, `_kin_latched`, `closing_rate_filt`, `CLOSING_ALPHA`,
+`prev_d_lead`, `MAX_TRACK_ERROR_MPS`, `d_lead_filtered`, `gain_scale`,
+`ACC_GAIN_SCALE_MORAI`) — confirmed dead by grepping for call sites, cross-
+checked against this file's own §45.8 "called 0x" note above. `ego_velocity_callback`
+simplified to drop the now-pointless acceleration estimate. Module docstring's
+stale `Control law: a = k_p*(...)` updated to describe the governor instead.
+
+No behavioural change: `control_loop()`'s MODE 2/4 branches, `speed_reference()`
+and `speed_control()` are untouched. 848 lines vs. 1330 before (-482).
+
+### 47.3 Not changed, flagged instead
+
+Reviewed `speed_reference()`/`speed_control()` for the same class of bug
+(deceleration overshoot) rather than assuming the rewrite is bug-free.
+Two things worth a second pair of eyes, not fixed here since neither is
+verifiable without a CARLA run:
+
+* `speed_control()`'s brake output (`min(-u, brake_cap)`) has no direct
+  bound tied to `DECEL_LIMIT` — the limit only holds if the vehicle tracks
+  `v_ref` closely enough that the PI's `-u` stays small, since §45.2's
+  8-49x authority swing still applies to however much brake the PI *does*
+  ask for. Re-running the Stage 4/Layer 2 CARLA KPIs against this branch's
+  governor (no `ACC_Morai/` data exists yet either, see that notebook's
+  section 6) would confirm whether achieved deceleration is actually
+  staying under 5.0 m/s² now, rather than assuming the rewrite fixes it.
+* `speed_reference()`'s rise/hold ratchet keys off the *sign* of
+  `closing_rate` (`if closing_rate < 0.0: v_ref = min(v_ref, v_ref_last)`).
+  With a lead at matched speed, `closing_rate` hovers near zero and can
+  flicker negative on tracker noise even though the true situation is
+  stable — each flicker ratchets `v_ref` down and it cannot rise again
+  until `closing_rate` goes positive. Possibly harmless in practice (the
+  alpha-beta tracker is smoother than the old derivative), but the
+  condition arguably belongs on `gap_err`'s sign, not `closing_rate`'s.
+  Worth watching for a "reference lags below set speed while steadily
+  following a matched-speed lead" symptom.
+
+
+### 47.4 Editorial replies
+
+**[reply] on §47.1 — the 8-49x authority figure is retracted.** It appears
+twice above (§47.1 and §47.3) as the justification for the governor. It was
+mine, and it was wrong: the regression fitted `decel = brake * authority`
+with engine braking left in the residual. Measured with coast removed and
+the response lag aligned, brake authority is a stable **4.44 m/s² per unit
+brake** (§46.3). The governor is still the right architecture — the actual
+reason is that engine braking dominates deceleration and is not commanded
+at all, reaching **6.57 m/s² uncommanded** (§46.2), which is itself above
+the R171 ceiling. Conclusion unchanged, reasoning replaced.
+
+**[reply] on §47.1 — the KPI numbers corroborate §46.2.** 6.31 m/s²
+achieved against 1.64 required on the v30 run is exactly the signature of
+uncommanded engine braking: at 30 km/h the coast table gives ~2.8-6.4 m/s²
+depending on gear. The "over-braking" was substantially not the
+controller.
+
+**[reply] on §47.3 first point — correct, and still true.** `speed_control`'s
+brake output has no bound tied to `DECEL_LIMIT`, and cannot have a useful
+one, because the brake is not what sets deceleration here. The bound now
+lives in the reference-rate limit (§46.5) and in the coast-aware split
+(§46.3), which caps `a_des` at zero while a stop is latched. Achieved
+deceleration under the current build is **not yet re-measured** — see
+§46.8.
+
+**[reply] on §47.3 second point — this is a real bug and it is still
+present.** The ratchet keys off `closing_rate`'s sign:
+
+```python
+if closing_rate < 0.0:
+    v_ref = min(v_ref, self.v_ref_last)     # controller_node.py:813
+```
+
+Behind a matched-speed lead `closing_rate` sits near zero, so tracker noise
+flickers it negative and each flicker ratchets `v_ref` down permanently —
+it cannot recover until the sign goes positive. The stationary-target
+scenario never exposes this (closing rate is a solid -13.9 m/s), which is
+why it has gone unnoticed; a following scenario would show it as "reference
+drifts below set speed while steadily following". Jonas's suggested fix —
+key the condition on `gap_err`'s sign instead — looks right. **Not fixed
+here**, because it needs a moving-lead scenario to verify and the harness
+only implements the stationary case (§43).
+
+---
+
+## 48. Throttle-cap fix kept; acquisition/lift rework tried and reverted; brake reserved for the last 20% [FIXED / REVERTED]
+
+Three runs at 50 km/h, all `pass`:
+
+| run | peak | min gap | lift duration | first brake |
+|---|---|---|---|---|
+| `165626` | 8.41 | 1.55 m | 2.38 s | 37.9 m = **52%** of acq |
+| `170323` | **8.38** | **1.67 m** | 2.13 s | 42.4 m = **58%** of acq |
+| `171238` | 9.44 | 1.05 m | 1.57 s | 31.0 m = 44% of acq |
+
+### 48.1 Throttle capped at the set-speed hold value [FIXED — kept]
+
+Approach throttle was a steady 0.445, but during the stop it spiked to
+**0.83**, with 31 of 250 measure-phase frames above 0.45.
+
+The `a_des <= 0` cap was supposed to prevent this and does bound throttle —
+at `coast(v)/THROTTLE_AUTHORITY` for the **current** speed. Engine braking
+peaks mid-range (§46.2), so that ceiling *rises as the vehicle slows*:
+
+| v | old ceiling | now |
+|---|---|---|
+| 50 km/h | 0.46 | 0.46 |
+| 34 km/h | **1.00** | 0.46 |
+| 20 km/h | **1.00** | 0.46 |
+
+Capped instead at `coast_decel(target_speed)/THROTTLE_AUTHORITY` whenever a
+lead is tracked — the throttle needed to *hold* the set speed, 0.455 at
+50 km/h. That the measured cruise value was 0.445 is independent
+corroboration of the coast table at that speed; other speeds are not
+cross-checked that way. Only while tracking a lead: free CRUISE still needs
+full authority to reach set speed at all. Confirmed on `170323`.
+
+### 48.2 Acquisition seed and lift shaping — tried, made it worse, reverted [REVERTED]
+
+`165626` spent 24 m at full throttle after a 76.6 m acquisition, then
+compressed the whole lift into 0.45 s. Three plausible causes were found
+and all three were fixed together:
+
+* **The seed fired on the second callback, not on real travel.**
+  Perception republishes an unchanged distance when a frame drops — 76.6 m
+  repeated for 0.44 s at acquisition — so the seed divided a zero
+  displacement and seeded `v = 0`, the exact case it was written to
+  prevent. With `track_v ~ 0` the governor believed it was behind a
+  speed-matched car and held `v_ref` at the set speed.
+* **One perception interval is not a velocity measurement.** Seed error is
+  `sigma_d*sqrt(2)/dt` — at 12 Hz with ~1.5 m of IPM noise, ~25 m/s of
+  noise on a 13.9 m/s estimate, which the latch then squares. Replaced with
+  an 8 m baseline.
+* **The lift used the quadratic ease-out**, which steps fastest at the
+  instant a release begins. Replaced with a ramp-in.
+
+In replay against a Gaussian noise model this looked unambiguous: latch
+spread tightened 0.70–2.08 -> 1.00–1.60 m/s^2, and descent onset moved from
+t+0.10…**t+2.80** s to t+0.30…t+0.90 s across 24 realisations, with no late
+outliers.
+
+**On the vehicle it regressed.** `171238`: peak **9.44** m/s^2 (worst of the
+three) and min gap **1.05 m** (smallest). The lift came out *faster*
+(1.57 s), not slower, which the release ramp alone cannot do — so at least
+one of the three interacted with the governor in a way the replay did not
+model. All three reverted to the `170323` state.
+
+The lesson is the model, not the changes: the replay used Gaussian noise on
+a regular staircase. Real IPM noise is neither, and the seed and latch are
+both **nonlinear** in it (one divides by `dt`, the other squares the
+result). A noise model that wrong cannot validate a change whose whole
+purpose is noise robustness. Any retry needs the recorded gap trace from a
+real run as the input, not a generator.
+
+### 48.3 Service brake reserved for the last 20% of the approach [FIXED]
+
+Across all three runs the brake came on at **44-58% of the acquisition
+gap** — roughly 40 m out, and every application was adding deceleration on
+top of a coast that was already more than sufficient. Coasting alone, from
+the measured `COAST_DECEL` table:
+
+| v | coasts to rest in | available from a 73 m acquisition |
+|---|---|---|
+| 30 km/h | 9.2 m | 63.8 m spare |
+| 50 km/h | 27.6 m | 45.4 m spare |
+| 70 km/h | 61.5 m | 11.5 m spare |
+| 90 km/h | 106.7 m | **short by 33.7 m** |
+
+So up to ~70 km/h the brake is not needed for the deceleration at all, only
+for where the vehicle ends up. `_brake_allowed()` now holds it off until
+the gap has closed to `BRAKE_INHIBIT_FRAC` (0.20) of the gap at which the
+plan latched, making the brake a trim on the stopping point rather than a
+participant in the peak. The `MIN_BRAKE_NO_THROTTLE` floor is suppressed in
+the same window, or "no brake" would not be true.
+
+**EMERGENCY is not gated by this.** It is a separate branch in
+`control_loop` that returns before `speed_control` is reached. The inhibit
+is an authority policy, not a safety interlock, and must never stand
+between a collision and the brake.
+
+### 48.4 Open
+
+* The 90 km/h row above is the case this policy does not cover: coasting
+  from a 73 m acquisition falls 33.7 m short, so the brake gets released at
+  14.6 m with real speed still on the car. Untested — 90 km/h has not been
+  run since the longitudinal rework. Expect `BRAKE_INHIBIT_FRAC` to need to
+  scale with `v^2/(2*gap)` rather than stay a constant fraction.
+* Peak deceleration is still dominated by the powertrain, not the
+  controller (§46.2). §48.3 removes brake *on top of* coast, which should
+  help; it does nothing about the 6.57 m/s^2 uncommanded coast term, which
+  remains the binding problem for the R171 ceiling.
+* §48.2's diagnosis of the seed bug still looks correct on its own terms —
+  the zero-displacement path is real and reachable. It was reverted because
+  the fix package regressed, not because the bug was disproved.
+
+---
+
+## 49. First full 30-point matrix — brake inhibit confirmed working, lateral control is the wall above 50 km/h [DONE / KNOWN]
+
+Run `20260812_104249`, all 30 points of §43's matrix. Headline: **2 pass**.
+That number is misleading in both directions and the detail matters more.
+
+### 49.1 The brake inhibit (§48.3) does what it was asked to [CONFIRMED]
+
+14 of 30 runs never commanded the service brake at all. Where it came on,
+it came on at **3-9% of the detection gap** — comfortably inside the 20%
+window, since the inhibit is keyed to the gap at which the *plan latched*,
+not to first detection.
+
+| speed | max brake | brake frames | first brake | % of det. gap |
+|---|---|---|---|---|
+| 30 km/h | 0.10 | ~20 | 2.1-2.3 m | 4-5% |
+| 50 km/h | 0.10-0.51 | 19-33 | 1.9-3.5 m | 3-5% |
+
+Two runs show brake 1.00 (`A_v70_off0`, `B_v70_off0_ttc4.5`) — that is
+EMERGENCY, which is correctly not gated.
+
+**And the vehicle still stopped.** At 30 and 50 km/h min gap was 1.9-2.3 m
+with zero impact speed, on coast alone. That is the §46.2 claim confirmed
+end-to-end: the powertrain, not the brake, does the stopping.
+
+It also confirms the cost. Peak deceleration at those speeds was still
+**7.3-8.3 m/s²** with the brake essentially absent. Removing brake from
+the equation did not move the peak, because the peak was never the brake's.
+Everything above 5 m/s² here is engine braking.
+
+### 49.2 `no_reaction` is now a lying verdict [KNOWN — harness bug]
+
+10 runs are labelled `no_reaction`, including 30 and 50 km/h points that
+stopped cleanly at 2.2 m. The harness derives reaction from **brake
+onset**, and §48.3 deliberately removed the brake. `brake_onset_gap_m`,
+`reaction_latency_s` and `brake_onset_ttc_s` are all `nan` for a run that
+reacted correctly.
+
+The verdict must key on **deceleration onset** — the first sustained
+departure from the approach speed — not on a brake command. Until that is
+fixed the summary's verdict column cannot be read at face value on any run
+where the inhibit was active. Not fixed here.
+
+### 49.3 The real wall is lateral, and it is sharp [KNOWN]
+
+Peak `|cte|` by speed, across all 30 points:
+
+| speed | runs | max \|cte\| | departed (>1.5 m) |
+|---|---|---|---|
+| 30 km/h | 5 | 0.02-0.07 m (+1 outlier 8.66) | 1 of 5 |
+| 50 km/h | 5 | **0.05-0.14 m** | **0 of 5** |
+| 70 km/h | 5 | 0.19-8.20 m | 4 of 5 |
+| 90 km/h | 5 | 4.13-8.88 m | **5 of 5** |
+| 110 km/h | 5 | 0.24-7.58 m | 4 of 5 |
+| 130 km/h | 4 | 4.39-8.49 m | 4 of 4 |
+
+Below 50 km/h lateral tracking is essentially perfect. At and above 70 it
+fails in 17 of 24 runs, with errors of 4-9 m — the vehicle has left the
+road, not wandered within the lane.
+
+**This invalidates most of the longitudinal results above 50 km/h.** A run
+that departs takes its target out of the camera frame, so `min_gap_m`
+becomes meaningless: `A_v130_off0_ttc6` reports a 324.83 m minimum gap and
+`fail_collision` simultaneously, and `A_v110_off1_ttc6` reports 147.11 m.
+Those are not longitudinal failures being measured — they are a departed
+vehicle being measured against a target it drove away from. The high-speed
+half of this matrix has to be re-run once lateral holds.
+
+### 49.4 UFLD moved from every 4th frame to every frame [CHANGED — untested]
+
+`inference_skip_n` was 4 on CARLA (~5 Hz), chosen when the target speed was
+20 km/h. At 20 km/h a 0.2 s inference interval is 1.1 m of travel; at
+130 km/h it is **7.2 m**. Every Stanley tick was acting on a lane estimate
+up to a fifth of a second old, with the KF extrapolating across the gap —
+which is the shape of the failure in §49.3 and matches the observed break
+point.
+
+Now `skip_n = 1` on CARLA: ~20 Hz, 0.7 m at 130 km/h. MORAI stays at 2 for
+the GPU-contention reason already recorded there.
+
+Changing the rate silently changed two other things. `KF_MAX_COAST_TICKS`
+and `KF_MAX_REJECT_TICKS` were both **20 ticks, chosen as "≈4 s at 5 Hz"**.
+At 20 Hz they become 1 s — which reinstates exactly the failure that
+raising the coast window from 5 to 20 was meant to fix ("we don't RST
+during sustained low-conf windows in curves"). The lane projection would
+have started blinking out in curves, and it would have looked like a UFLD
+regression rather than a units problem.
+
+Both are now specified as durations (`KF_COAST_SECONDS`,
+`KF_REJECT_SECONDS`) and converted to ticks in `__init__` from
+`NOMINAL_CAMERA_HZ / skip_n`. The conversion reproduces the original 20
+ticks at 5 Hz exactly, and gives 80 at 20 Hz / 40 at 10 Hz — 4.0 s in every
+case. The KF's own dynamics were already safe: `dt` is recomputed per tick
+from the message header, so only the tick-counted windows were exposed.
+
+**Any constant counted in detector ticks has to move when the detector rate
+moves.** These two were found by grep; the class was not audited for others
+beyond `KF_LOG_EVERY`, which only affects log cadence.
+
+**Untested.** The risk is the same contention that pushed MORAI to N=2 —
+UFLD at a sustained 20 Hz competes with YOLO for the GPU, and MORAI's RTF
+sagged to ~0.56 when it was tried there. If the control-loop rate or YOLO's
+frame drops get worse, N=2 (~10 Hz, 3.6 m at 130 km/h) is the fallback
+rather than a return to 4. Check both before reading the next matrix.
+
+### 49.5 Open
+
+* `A_v130_off0_ttc6.csv` contains no measure rows at all. Not diagnosed.
+* `B_v30_off0_ttc4.5` departed (8.66 m) where every other 30 km/h run held
+  to 0.07 m. Suspect the 4.5 s trigger puts the start line somewhere
+  different rather than anything speed-related; not diagnosed.
+* §48.4's prediction stands untested: at 90 km/h+ coasting cannot stop from
+  a 73 m acquisition, so `BRAKE_INHIBIT_FRAC` likely needs to scale with
+  `v²/(2·gap)`. No usable high-speed longitudinal data yet (§49.3).
+
+---
+
+## 50. CARLA's default off-throttle damping was the deceleration problem [FIXED]
+
+Every peak this project has chased — 8.38, 8.41, 9.44 — was the powertrain
+model, not the controller. Confirmed by open-loop coast-down
+(`scenarios/coastdown.py`, new): sync mode, `fixed_delta = 0.01`, 16
+substeps, no ACC, no ROS, no lead, `throttle = 0 brake = 0`.
+
+### 50.1 The metric was not the problem, and it was worth proving [MEASURED]
+
+The natural suspicion is differentiation artifact — jittered `dt`, dropped
+or duplicated ticks, `get_acceleration`, sampling either side of a tick.
+The harness runs **async with no `fixed_delta`** (`--sync` is off by
+default, DEBUG §4), so this was a live hypothesis.
+
+It is wrong. With nothing commanded, at 100 Hz evenly-spaced sync sampling:
+
+| window | stock damping (2.0) |
+|---|---|
+| ±0.05 s | 10.51 |
+| **±0.12 s** (the KPI's window) | **8.38** |
+| ±0.25 s | 6.36 |
+| ±0.50 s | 4.95 |
+| mean over the coast | 2.11 (from 30), 2.50 (from 50) |
+
+**8.38 is exactly what the matrix reported** (8.38, 8.41). The needles
+survive clean sampling, so they are the vehicle. Velocity was also
+cross-checked against the logged path: 7.551 m of x/y travel against
+7.601 m from integrating reported speed over the peak window, 0.7% apart.
+Nothing uses `get_acceleration` (`sim_adapter.py` differentiates
+`get_velocity` deliberately).
+
+**The needles are gearbox downshifts.** With gear logged:
+
+```
+30 km/h coast:  7.65 m/s^2 at gear 2->1, 23.2 km/h
+50 km/h coast:  7.96 m/s^2 at gear 2->1, 22.9 km/h
+                5.47 m/s^2 at gear 3->2, 32.4 km/h
+```
+
+which matches an independent finding from the matrix traces: samples above
+6 m/s² cluster in two speed bands, ~21 and ~33 km/h, and the 30 km/h runs
+show only the lower band because they never reach 33. Ratio 33/21 = 1.57,
+a gear step.
+
+### 50.2 `damping_rate_zero_throttle_clutch_engaged` [FIXED]
+
+`get_physics_control()` on `vehicle.dodge.charger_2020`:
+
+```
+mass                                          1920.0   (correct, not a default)
+moi                                              1.0
+damping_rate_zero_throttle_clutch_engaged        2.0   <- CARLA default
+damping_rate_zero_throttle_clutch_disengaged    0.35
+damping_rate_full_throttle                      0.05
+wheel damping_rate (x4)                         0.25
+final_ratio 3.08, 8 forward gears, autobox on, gear_switch_time 0.1
+```
+
+`CarlaAdapter._apply_powertrain_fix()` now sets **0.4** on the VUT at
+spawn, and verifies the write by reading it back — `apply_physics_control`
+is fire-and-forget, and a silently-ignored write would look exactly like a
+controller regression. The target keeps stock physics; it is stationary.
+
+Effect, same coast-down:
+
+| | stock 2.0 | fixed 0.4 |
+|---|---|---|
+| peak ±0.12 s | 8.38 | **4.73** |
+| peak ±0.05 s | 10.51 | 6.62 |
+| mean over coast | 2.50 | 0.55 |
+| **distance to rest from 50 km/h** | **34.4 m** | **154.1 m** |
+| distance to rest from 70 km/h | — | 313.9 m |
+
+The 34.4 m figure is the whole explanation for §49.1: the vehicle stopped
+from 50 km/h with no brake because it could not do otherwise.
+
+### 50.3 `COAST_DECEL` re-derived — the old table measured a plant that no longer exists [FIXED]
+
+The controller's coast map was a fingerprint of the stock damping. Every
+entry is now wrong by 3-8x:
+
+| v | old | new |
+|---|---|---|
+| 20 km/h | 6.00 | **0.79** |
+| 30 km/h | 4.45 | **0.74** |
+| 50 km/h | 2.73 | **0.63** |
+| 70 km/h | 3.00 | **0.61** |
+
+Re-measured from a 70 km/h coast-down, median per 1 m/s bin. The 5.5 and
+8.5 m/s entries are **interpolated, not measured**: those are the 2->1 and
+3->2 downshift speeds and the vehicle dwells in those bins while shifting,
+so the raw bins read 2.81 and 2.51 against ~0.75 either side. Median does
+not reject it — the transient is most of the bin. This table feeds a
+feed-forward, so a shift transient in it would over-throttle at every pass
+through those speeds.
+
+### 50.4 What this invalidates [OPEN — do not skip]
+
+The plant changed, so every constant tuned against it is now unjustified:
+
+* **`THROTTLE_AUTHORITY = 6.0`** was cross-checked as "~0.43 throttle holds
+  50 km/h where coast is ~2.4 m/s²". Both halves came from the stock
+  vehicle. Needs re-measuring from a steady cruise trim.
+* **The set-speed throttle cap (§48.5)** is `coast(v_set)/THROTTLE_AUTHORITY`
+  and moves with the table: **0.455 -> ~0.105** at 50 km/h, 0.742 -> 0.124
+  at 30. Whether that is still the right ceiling depends on
+  `THROTTLE_AUTHORITY` being right, which it is not yet known to be.
+* **`BRAKE_INHIBIT_FRAC = 0.20` (§48.3) is now indefensible.** It was
+  justified by coasting overrunning the available distance — true at 34 m,
+  false at 154 m. The brake is now genuinely required and must come back.
+* **`BRAKE_AUTHORITY = 4.44`** was fitted with coast removed using the old
+  coast values, so the residual it was fitted against was wrong.
+* Every gain tuned across §45-§48 was tuned against 2-8x too much drag.
+
+**Do not read the next matrix as a controller comparison against the last
+one.** The plant is different; only same-plant runs are comparable.
+
+### 50.5 Rollout — two bugs the change introduced [FIXED]
+
+**`KF_REJECT_SECONDS` was never defined.** §49.4's edit converting the KF
+tick windows to durations landed for `KF_COAST_SECONDS` and not for its
+sibling, because the anchor text began mid-line in the real file and the
+pattern assumed a line start. Every other replacement in that batch was
+asserted; that one was not, so it failed silently and left `__init__`
+reading an attribute that did not exist. `lane_detection_node` then crashed
+on construction and the UI showed no lanes at all.
+
+Now verified by AST rather than by eye: every `self.<CONST>` read in the
+class has an assignment. **Assert on every scripted replacement — a silent
+no-op inside a batch that otherwise succeeds is the worst case, because
+the build passes and the failure surfaces somewhere unrelated.**
+
+**`apply_physics_control` races the read-back.** §50.2's verification read
+the damping value straight after writing it and aborted the run with
+"asked 0.4, read 2.0". The first guess — that the write needs a server tick
+— was wrong: an isolated test read 0.4 immediately. Reproducing the
+harness's exact back-to-back spawn/apply/read against a live server, **2 of
+6 trials** still read the stock 2.0, and one tick sufficed in every failing
+case. It is a race, not a fixed latency, so the fix is retry (up to
+`PHYSICS_APPLY_MAX_TICKS`), not sleep. The sync coast-down never hit it
+because it ticks before reading.
+
+Worth noting the verification earned its place: without the read-back the
+run would have completed and produced numbers for the stock vehicle.
+
+### 50.6 Brake inhibit removed — it became the dominant fault [FIXED]
+
+First run on the corrected plant (`20260812_115103`, 50 km/h): `pass`,
+final gap 3.41 m, but **peak 9.37 m/s²** — worse than anything before it.
+
+The trace shows why, and it is not subtle:
+
+```
+   dt      v     gap   thr   brk   v_ref
++1.93   47.5   45.61  0.00  0.00   44.4
++2.88   44.8   33.41  0.00  0.00   27.2
++3.85   42.1   21.72  0.00  0.00   18.1
++4.18   41.2   17.95  0.00  0.00   16.1
++4.50   39.5   14.25  0.00  0.50   14.0   <- inhibit releases
++4.82   34.4   10.96  0.00  0.99   11.9
+```
+
+For 2.5 s and 30 m the vehicle ran up to **25 km/h above its own
+reference** with both actuators idle. The governor was asking for the stop
+correctly the whole time; `BRAKE_INHIBIT_FRAC = 0.20` forbade the only
+actuator that could deliver it, until 14.25 m — exactly 20% of the latch
+gap — at which point the loop did the only thing left and slammed 0.99.
+
+The inhibit was sound against the stock powertrain, which stopped the car
+in 34 m unaided (§48.3). At 154 m it inverted: what had been a way to keep
+surplus deceleration out of the peak became the cause of the peak.
+
+Removed entirely — constant, gate and `_brake_allowed()`. Braking is set by
+the shape of the governor's profile again, which is where §45 put it.
+
+Replayed through the recorded run with controller state carried forward,
+first real brake application moves **16.1 m -> 45.0 m, 28.9 m earlier.**
+That replay is open-loop and pessimistic: it feeds the recorded speed
+(which never slowed, because nothing was braking) against the recorded
+reference, so it shows the brake saturating at 1.00 for 1.5 s. In closed
+loop the vehicle will actually decelerate and the error will close. **The
+peak is not predicted by this — only a run will say.**
+
+### 50.7 `BRAKE_AUTHORITY` re-fitted, and the peak was the standstill snap [FIXED]
+
+Run `20260812_115623` — first with the brake actually available. Brake
+onset moved to 45.8 m (from 16.1) and the reported peak fell 9.37 -> 8.06.
+Two separate problems remained, and only one of them was the controller.
+
+**The brake was 28% too strong.** `BRAKE_AUTHORITY = 4.44` was fitted with
+the *stock* coast values in the residual, so it absorbed 2-8x too much
+engine braking and came out low. The controller divides demanded
+deceleration by it, so a number that small inflates every brake command.
+Measured consequence: the loop reached 0.77 brake, overshot to **4.4 km/h
+BELOW its own reference**, then sat at 16 km/h for 2 s and 9 m recovering.
+
+Refit over the same run — braking samples only, throttle off, coast removed
+with the corrected table, scanning response lag:
+
+| lag | BA | resid RMS |
+|---|---|---|
+| 0 ms | 5.70 | 0.92 |
+| **25 ms** | **5.69** | **0.88** |
+| 100 ms | 5.79 | 1.05 |
+| 300 ms | 5.54 | 1.41 |
+
+n = 37. **5.69**, and unlike the old fit it is not lag-sensitive — 5.54 to
+5.79 across the whole 0-300 ms scan. The old comment conceded 4.44 was
+"only good to roughly +/-1"; this one does not need that caveat.
+
+Effect at 40 km/h: a 4 m/s² demand now commands 0.60 brake instead of 0.77.
+
+**The headline peak was CARLA zeroing the velocity.** 8.06 m/s² occurred at
+**4.9 km/h with the brake at 0.10** — which is ~0.6 m/s² of commanded
+deceleration. The vehicle went 5.6 km/h -> 0 within one 0.26 s sample at
+the end of the stop.
+
+`_peak_decel_from_trace` already claims to exclude the standstill snap; its
+guard was simply set below where the snap happens. Raised
+`DECEL_VALID_SPEED_MPS` 1.0 -> 2.0.
+
+This is *not* the "widen it until it passes" move, and the evidence is that
+the result does not depend on the choice:
+
+| speed floor | peak | at | brake there |
+|---|---|---|---|
+| 1.0 m/s | 8.06 | 4.9 km/h | 0.10 |
+| **2.0 m/s** | **6.67** | 29.2 km/h | 0.68 |
+| 3.0 m/s | 6.67 | 29.2 km/h | 0.68 |
+| 4.0 m/s | 6.67 | 29.2 km/h | 0.68 |
+| 5.0 m/s | 6.67 | 29.2 km/h | 0.68 |
+
+Anywhere from 2 to 5 m/s gives the same answer. Only 1.0 admits the snap.
+The real braking peak is **6.67 m/s²** — still over the limit, and 29.2 km/h
+sits in the 3->2 downshift band, so some of that is likely a shift
+transient rather than the brake.
+
+### 50.8 Brake ceiling, and the 4 m stop that was never d0 [FIXED]
+
+**ACC brake capped at 0.4.** `0.4 * 5.69 = 2.28 m/s²` plus coast, so the
+loop cannot command much over 2.9 m/s² whatever the profile asks. It costs
+nothing nominally — a 99 m acquisition needs 1.0 m/s² and the latched plan
+asks ~1.3, both far under it.
+
+When the cap binds, the loop holds the brake **longer**, not harder: the
+speed error persists, so the command stays saturated until the profile is
+caught. That is what "brake more often" produces here. Explicitly *not*
+pulsed braking — cycling the command would add jerk without adding
+retardation, since mean force is what stops the car.
+
+EMERGENCY is a separate branch and is not capped.
+
+**The 4 m standstill gap was `STANDSTILL_WINDOW`, not `d0`.** Runs kept
+finishing at 3.4-3.5 m with `d0 = 2.0`, which looked like the governor
+targeting the wrong gap. It was not: `d_safe = d0 + T_gap*v_lead` = 2.0 for
+a stationary lead, correctly, and the tracked gap was accurate to
+**-0.24 m mean inside 25 m**, so perception was not biasing it either.
+
+The actual mechanism is two things meeting:
+
+1. CARLA snaps velocity to zero from ~6 km/h (§50.7). Measured, 6.1 km/h at
+   3.93 m gap -> 0.0 at 3.54 m in one sample.
+2. `control_loop`'s standstill branch accepted anything inside `d0 + 2.0`
+   = **4.0 m** and stopped controlling.
+
+So the final gap was set by wherever the sim's snap caught the vehicle, and
+the 4 m window ratified it. Now `d0 + STANDSTILL_WINDOW` = 2.5 m; outside
+that the governor keeps control and closes in on its own profile
+(`v_ref = sqrt(2a(gap - d0))`, ~7 km/h at 3.5 m, zero exactly at d0).
+
+**The plot now blanks the snap too.** `plot_run.py` recomputed
+deceleration without the harness's speed guard, so the trace kept showing
+an 8 m/s² needle at the end that the summary no longer counted. A plot
+that contradicts the number beside it is worse than either alone — 33 of
+227 samples in that run, all at or below 7.2 km/h.
+
+### 50.9 Open
+
+* 0.4 sits at the low end of realistic. The resulting drag (0.5-0.85 m/s²
+  across the range) behaves more like coasting in neutral than in gear; a
+  real car in gear at 50 km/h sheds nearer 1.0-1.5. If in-gear realism
+  matters more than headroom, ~0.8-1.0 damping is the number to try, and
+  `COAST_DECEL` must be re-derived again if it changes.
+* The harness still runs async with no `fixed_delta`. It is not the cause
+  of anything here, but sync at 0.01 is the right way to run a compliance
+  measurement and the coast-down proves the setup works.
+* Downshift needles are reduced but not gone (6.62 at ±0.05 s). Whether a
+  60 ms shift transient should count against the R171 ceiling is a
+  definitional question that still needs the regulation text.
+* `BRAKE_AUTHORITY = 4.44` is still the pre-fix figure (§50.4). With the
+  brake now doing real work it matters directly: `a_des` is clamped to
+  `-DECEL_LIMIT`, so brake ~0.98 is *meant* to be exactly 5 m/s², and that
+  mapping is only as good as the authority number. Re-fit it from the next
+  run before reading the peak as a compliance result.
+* `THROTTLE_AUTHORITY` and the §48.5 throttle cap remain unverified against
+  the corrected plant. The cap is now ~0.105 at a 50 km/h set speed, down
+  from 0.455, and the last run held 0.10-0.14 on approach — consistent, but
+  that is one data point, not a calibration.
+
+---
+
+## 51. LKAS regression after the UFLD rate change — the KF's R does not know about sampling rate [FIXED — unconfirmed]
+
+§49.4 moved UFLD from every 4th camera frame (5 Hz) to every frame (20 Hz)
+to cut lane staleness at speed. Lateral got worse, not better.
+
+### 51.1 The evidence, and how weak it is [MEASURED]
+
+| run | skip_n | \|cte\| max | \|cte\| RMS | steer max |
+|---|---|---|---|---|
+| matrix `104249`, 5x 50 km/h | 4 | **0.05 - 0.14 m** | — | — |
+| `120117` | 1 | 0.22 m | 0.068 | 0.049 |
+| `120816` | 1 | **7.50 m** | 2.787 | **0.545** |
+
+Two runs at the new rate, on identical code: one fine, one departed. That
+is not a lot to go on, and it is stated plainly because the fix below is a
+hypothesis, not a demonstrated cause. What *is* new is a departure at
+50 km/h — the 5 Hz matrix never departed at that speed (§49.3), it only
+failed from 70 upward.
+
+Ruled out first:
+
+* **Loop rate.** 18.9-19.2 Hz median in every run, worst-case sample gap
+  64-75 ms. No sign of the GPU contention §49.4 warned about.
+* **Throttle > 1 in the logs** (max 2.98). Present in the 5 Hz matrix too
+  (max 4.10) — a pre-existing approach-phase logging artifact, not new and
+  not lateral.
+* **KF dynamics.** `LaneKalmanFilter._rebuild_matrices` rebuilds both `F`
+  and the CWNA `Q` from the actual `dt` each step, and the CWNA
+  discretisation is exact, so accumulated process covariance over a given
+  wall-clock interval is rate-invariant. Q is *not* mis-scaled.
+
+### 51.2 The mechanism: R is a within-frame number used as a between-frame one [FIXED]
+
+`R` is `np.polyfit(xs, ys, deg=2, cov=True)[1]` — how well a quadratic fits
+*that frame's* anchor points. It carries no information about frame-to-frame
+independence, and the KF treats every update as an independent draw.
+
+At 5 Hz that is roughly true. At 20 Hz consecutive UFLD detections run on
+nearly-identical images, so their errors are strongly correlated: four of
+them carry little more information than one. Treated as four independent
+draws, `P` shrinks about 4x faster per second than the data warrants. An
+overconfident `P` makes `S = HPH' + R` too small, the chi-square gate
+(γ = 7.815) begins rejecting genuine lane changes, `n_rejected` climbs, and
+the filter coasts on a stale prior while reporting high confidence.
+
+The trace matches that signature exactly. In `120816`, before the
+departure:
+
+```
+   t     cte    steer
+ 3.87   -0.38  -0.202
+ 4.08   -0.09  -0.248
+ 4.28   -0.29  -0.257
+ 4.72   -2.47  -0.458
+ 4.94   -4.46  -0.500
+```
+
+Steer grew steadily left while the true cross-track error was ~0, then the
+error followed it out. The controller was tracking a lane estimate that had
+stopped following the road — not over-reacting to an error, which is what a
+gain problem looks like.
+
+It also explains the intermittency: the gate only bites when the lane
+genuinely moves, so a run that stays straight is unaffected.
+
+### 51.3 The fix
+
+Scale `R` by `infer_hz / 5`, so the filter extracts the same information
+per **second** at any rate — the right invariant when the extra samples are
+not independent.
+
+| skip_n | rate | R scale |
+|---|---|---|
+| 4 | 5 Hz | **1.0** |
+| 2 | 10 Hz | 2.0 |
+| 1 | 20 Hz | 4.0 |
+
+Exactly 1.0 at skip_n = 4, so the validated 5 Hz tuning (q = 0.5/5/5) is
+preserved untouched and only the faster rates change. The node now logs the
+scale at startup alongside the tick windows.
+
+### 51.4 Open
+
+* **Unconfirmed.** This needs a run at skip_n = 1 that holds lane at
+  50 km/h, and ideally several — one good run proves nothing given 120117
+  was already good.
+* **If it still departs, fall back to skip_n = 2 before touching `q`.** The
+  q values were validated against real data; this scaling was not. Changing
+  the validated thing to compensate for an unvalidated one is the wrong
+  order.
+* The scaling assumes the detector's decorrelation time is ~0.2 s, which is
+  where the reference 5 Hz comes from. That number is inherited from the
+  original tuning, not measured. Measuring the actual frame-to-frame error
+  correlation of UFLD would replace a plausible constant with a real one.
+* §49.3's finding stands independently: even at 5 Hz, lateral failed in 17
+  of 24 runs at 70 km/h and above. Whatever fixes 50 km/h here does not
+  automatically fix that.
+
+---
+
+## 52. Run 20260812_122114 — brake cap and R scaling both hold; the last metre was the throttle cap [FIXED]
+
+First run with §50.8's brake ceiling and §51's R scaling together.
+
+| | before | this run |
+|---|---|---|
+| peak decel | 8.06 | **5.96** |
+| brake max | 0.77 | **0.40** (at the cap) |
+| \|cte\| max | 7.50 (departed) | **0.078** |
+| \|cte\| RMS | 2.787 | 0.027 |
+| verdict | pass | pass |
+
+### 52.1 What is left of the peak is the gearbox [KNOWN]
+
+5.96 m/s² occurs at **28.9 km/h with the brake at exactly 0.40**, its
+ceiling. Decomposed:
+
+```
+  commanded by brake : 0.40 * 5.69 = 2.28 m/s^2
+  remainder          :               3.68 m/s^2
+```
+
+28.9 km/h sits in the 3->2 downshift band (~32 km/h, §50.1). The controller
+is now commanding less than half the peak it is charged with, and the
+excess is the powertrain, as it has been since §46.2. Lowering
+`ACC_BRAKE_CAP` further would not move this number much — 0.30 would trade
+2.28 for 1.71 and leave 3.68 untouched.
+
+### 52.2 The throttle cap prevented the last 1.4 m [FIXED]
+
+The run finished at **3.38 m against a `d0` of 2.0** — §50.8's
+`STANDSTILL_WINDOW` fix worked (the hold did *not* latch at 3.38, which the
+old 4.0 m window would have done), and the governor correctly kept asking
+for more: `v_ref` sat at 4.7 km/h for four seconds. The vehicle twitched
+between 0.00 and 0.27 km/h and never moved.
+
+Cause: §48.5's set-speed throttle cap,
+`coast_decel(target_speed)/THROTTLE_AUTHORITY`. On the corrected plant
+(§50.3) that is **0.105** at a 50 km/h set speed, and 0.105 will not launch
+1920 kg from rest. The cap is a bound on how hard the loop may accelerate
+*toward a lead at road speed*; applying it at standstill was never its
+intent and it silently became a handbrake.
+
+Lifted below `CREEP_SPEED = 2.0 m/s`. Nothing else bounds the loop there
+except the governor itself, which is the right bound:
+`v_ref = sqrt(2a(gap - d0))` is ~5 km/h at 3.4 m and reaches zero exactly
+at `d0`, so full authority cannot run away. EMERGENCY still backstops at
+1.0 m.
+
+Simulated from the gap this run actually ended at: 3.38 -> 1.80 m, hold
+latched. **The 1.80 is 0.2 m inside `d0` and comes from a crude plant
+model** — worth watching on the next run, but not worth tuning against a
+model this rough.
+
+### 52.3 Two things that look like faults and are not
+
+* **Deceleration "cut off" at the end of the plot.** That is §50.8's
+  `DECEL_VALID_SPEED_MPS = 2.0` guard blanking samples below 7.2 km/h,
+  where CARLA's standstill snap otherwise reports ~8 m/s² the controller
+  never commanded. Intentional, and the harness and plot now agree.
+* **Throttle sitting at 0.10 during the approach.** That is the set-speed
+  cap doing its job — 0.105 is genuinely what holds 50 km/h on the
+  corrected plant, down from 0.455 on the old one. It is only wrong at
+  standstill (§52.2).
+
+### 52.4 Open
+
+* §51's R scaling is **still one good run**. 120117 was also good before
+  it. Two consecutive clean runs at 50 km/h would be weak evidence; the
+  useful test is 70 km/h and above, where 5 Hz failed 17 of 24 (§49.3).
+* `THROTTLE_AUTHORITY = 6.0` remains unverified on the corrected plant
+  (§50.4). The approach held 0.10-0.14 against a predicted 0.105, which is
+  consistent, but that is one operating point.
+* Whether a 3->2 downshift transient should count against the R171 ceiling
+  is still open and still needs the regulation text (§50.9).
+
+---
+
+## 53. The 3.5 m stop was three separate blockers, not one [FIXED]
+
+`STANDSTILL_WINDOW` (§50.8) was the original cause and is fixed — run
+`20260812_122638` shows the mode column containing only `ACC` and `CRUISE`,
+with **`STANDSTILL` never appearing at all**, because the vehicle sits at
+3.46 m and the window is now `d0 + 0.5` = 2.5 m. The old `d0 + 2.0` = 4.0 m
+would have latched there. That the mode disappeared is the fix working, not
+a new fault.
+
+What it exposed is that the vehicle could not close the last 1.4 m. Three
+things blocked it, each hiding the next:
+
+1. **The set-speed throttle cap** (§52.2) held throttle at 0.105, which
+   will not launch 1920 kg. Lifted below `CREEP_SPEED`.
+2. **`MIN_BRAKE_NO_THROTTLE`** then held 0.10 for 0.5 s *against* a `v_ref`
+   of 4.8 km/h. A floor meant to give the no-throttle side of a
+   deceleration a definite value was braking a stationary car away from its
+   own target. Now suppressed when `v_target > v_ego + deadband`.
+3. **`STOP_HOLD_S`** ended the run 1.0 s after the wheels stopped. Even
+   with 1 and 2 fixed the creep needs ~2.0 s from 3.5 m, so the harness was
+   recording a final gap the controller had not finished producing.
+
+Simulated end-to-end from the gap this run actually reached:
+
+```
+   t=0.00  gap 3.46
+   t=1.00  gap 2.75   <- old STOP_HOLD_S cutoff
+   t=2.05  gap 1.81   STANDSTILL latches
+```
+
+### 53.1 The stop test now waits for the manoeuvre, not the wheels
+
+`ego.speed < STOP_SPEED_MPS` held for 1 s is a reasonable definition of "at
+rest" and a poor one of "finished": CARLA snaps velocity to zero from
+~5 km/h, so a stop ends wherever the snap lands and the controller then
+creeps the remainder. The test now also requires that the controller has
+stopped asking for speed (`speed_reference` below `STOP_CREEP_VREF_KMH`, or
+mode `STANDSTILL`), bounded by `STOP_CREEP_TIMEOUT_S = 6 s` so a controller
+that never settles cannot hang a 30-point matrix. A run that times out
+still records `stopped` and says so in `note`.
+
+This is a change to the measurement, so worth being explicit: it does not
+make any number pass. It lets the vehicle finish the manoeuvre it was
+already performing before the final gap is read.
+
+### 53.2 A bug the simulation caught before the vehicle did [FIXED]
+
+The §53 brake-floor edit referenced `v_ref` inside `speed_control`, where
+the parameter is named `v_target`. It compiled — the name resolves at
+runtime, not import — and would have raised `NameError` on the first tick
+the ACC branch ran, killing the controller node mid-approach.
+
+It surfaced because the creep was being simulated against the real class
+rather than reasoned about. Now also checked statically: an AST pass over
+`speed_control` confirms every loaded name is a parameter or assigned
+locally.
+
+Third scripted edit in this strand to break on a name (§50.5 twice, this
+once). **Compiling is not evidence that an edit is correct in Python.**
+
+### 53.3 Open
+
+* All three fixes are verified only against a crude plant model, which puts
+  the final gap at 1.81 m — 0.19 m inside `d0`. If the real run undershoots
+  similarly the answer is a gentler taper at low speed, not a wider window.
+* `STOP_CREEP_TIMEOUT_S = 6 s` is a guess. If runs start hitting it, the
+  creep is not converging and that is the thing to fix, not the timeout.
+
+---
+
+## 54. Plot: show what the KPI excludes, do not delete it [FIXED]
+
+§50.8 made `plot_run.py` blank deceleration samples below
+`DECEL_VALID_SPEED_MPS`, so the plot would agree with the harness's peak.
+It agreed by erasing the last ~1.5 s of every trace — including real
+low-speed braking — and the panel simply looked broken from 13 s onward.
+
+Matching a plot to a number by hiding data is the wrong direction. Both are
+now drawn: the excluded tail in grey, the valid samples in black, the
+excluded span shaded and annotated with the reason. The standstill snap is
+visible as an off-scale spike at ~13.4 s in run `20260812_122638`, which is
+what the reader should see — it is the thing being argued about.
+
+Also fixed while there: `pk = max(meas_d)` ran over a list containing
+`nan`. `max([1.0, float('nan')])` is order-dependent in Python and returns
+`nan` if the `nan` comes first, so the annotated peak could silently have
+become `nan` on any run whose first measure sample was excluded. Now
+filtered before the max, and the peak's time comes from the same tuple
+rather than a second `.index()` lookup that would have found the wrong
+sample on ties.
+
+## 55. Curved-road (R171 §4.2.5.2.2) and lane-keeping (R79 Annex 8) harnesses [DONE]
+
+Two new scenario scripts, a shared harness module, and a map survey tool.
+
+```
+scenarios/curve_survey.py        catalogues constant-radius arcs in every map
+scenarios/curve_adapter.py       CarlaCurveAdapter + the surveyed site table
+scenarios/scenario_common.py     bridge / camera pump / speed hold, shared
+scenarios/r171_curved_target.py  R171 Annex 4 §4.2.5.2.2
+scenarios/r79_lka_validation.py  R79 Annex 8 §3.2.1, §3.2.2, §3.2.5
+```
+
+`r171_stationary_target.py` now imports its bridge, camera pump, speed
+hold, lane hold and process guards from `scenario_common` instead of
+defining them. The move is code-identical (verified by AST diff — only
+docstrings and an added `name` argument differ), and the refactored script
+was re-flown at 30 km/h afterwards: `pass`, a_req 0.70, achieved
+5.89 m/s², first detection 75 m, which matches §49's figures for that
+point.
+
+### 55.1 The survey's radius was wrong by the distance from the walk's start [FIXED]
+
+`radius_of(samples)` computed the arc length as `samples[-1][0]` — the
+s-coordinate of the last sample — rather than `samples[-1][0] -
+samples[0][0]`. For a slice starting at index 0 the two agree, which is
+why the function looked right in isolation; for the windowed radii the
+constant-arc search runs on, it scales every radius by (distance from the
+walk's start / window length).
+
+The result was a site table where Town06 road 20 was published as a 400 m
+curve. It is 40 m. Every radius in the first survey was inflated by
+roughly 10×, and the curve sites chosen from it did not exist.
+
+What caught it: `CarlaCurveAdapter.connect()` re-measures the radius from
+the loaded map and refuses to run if it disagrees with the table by more
+than 25 %. That check was written as belt-and-braces against map version
+drift and instead caught the tool that produced the table. Keep it.
+
+### 55.2 Stock CARLA has no R171-grade curve geometry; Town12 does [KNOWN]
+
+R171 §4.2.4.1's reference section is a clothoid S-bend, first turn
+R = 787 m, second turn R = 374 m. Measured across Town03/04/05/06/07/10HD:
+
+| map | largest constant arc | usable arc length | lead-in |
+|---|---|---|---|
+| Town07 | 386 m | 38 m | 14 m |
+| Town07 | 364 m | 34 m | 92 m |
+| Town04 | **199 m** | **296 m** | **462 m** |
+| Town04 | 182 m | 270 m | 126 m |
+| Town06 | 144 m | 36 m | 132 m |
+
+So on the small maps the tightest usable radius is 199 m, which reaches
+the 3 m/s² M1 lateral limit at 88 km/h — the curved matrix cannot carry
+110 or 130 km/h there at all.
+
+Town12 (Large Map, minutes to load) does have highway geometry:
+
+| site | R | arc | lead-in | note |
+|---|---|---|---|---|
+| t12_r1185 | 1185 m | 1026 m | 500 m | only site that fits 130 km/h |
+| t12_r500 | 500 m | 276 m | 500 m | first-turn analogue, more severe |
+| t12_r417 | 417 m | 460 m | 500 m | second-turn analogue, +11 % |
+| t12_r345 | 345 m | 314 m | 210 m | second-turn analogue, −8 % |
+
+§4.2.4.1 permits a different curvature "provided this does not change the
+intention or lower the severity", so sites are chosen at or below the
+reference radius wherever possible and every run records the radius the
+map actually has. t12_r1185 is larger than the reference and is therefore
+labelled a high-speed case rather than a substitute for §4.2.4.1.
+
+All twelve sites were re-measured through the adapter against the live
+maps: table vs measured agree to within 1 % (worst: t12_r417, 417.1 vs
+412.3).
+
+### 55.3 Arc length, not chord — and the ego's half-length [FIXED]
+
+Two placement/measurement decisions the straight harness does not have to
+make:
+
+* **Gap is arc length along the lane.** The straight adapter projects onto
+  the ego's forward axis. On a 200 m radius a 100 m separation has a 6.3 m
+  sagitta, so the chord under-reads distance-to-go by 6 % and biases
+  `a_req` by the same margin. `gap_m()` is arc length;
+  `gap_projected_m()` keeps the chord in the trace because that is what a
+  monocular range estimate approximates, so `gap_perceived_m` has
+  something fair to be compared against.
+* **The ego's half-length was missing from the placement.** `arm()` placed
+  the target at `s_start + placement`, but both are centre positions and
+  only the target's half-length was added back by the nudge. Every target
+  landed 2.5 m closer than requested. Caught by the placement assertion
+  (`-2.37 m off`) before a single run was recorded — the same assertion
+  that caught the stale-pose bug in the straight adapter.
+
+### 55.4 Cross-track on a curve cannot come from `get_waypoint()` [DECIDED]
+
+§2 of the straight adapter's `lane_error` already records why a per-tick
+waypoint lookup is unusable as a lateral metric: it snaps to whichever
+lane is nearest, so a departure reads as an oscillation. The straight
+scenario's answer was to measure against the start-line ray, which only
+works on a straight.
+
+The curve adapter builds the lane centreline as a polyline once at
+`connect()` (1 m spacing, ~1 km) and projects the ego onto it. The
+reference cannot re-snap, so the reported error is unbounded by lane
+width — which is what a lane-departure criterion needs — and the same
+projection gives the ego's arc position for free.
+
+### 55.5 R79's lateral-acceleration measurement chain [DONE]
+
+Annex 8 §2.4 requires ay at the CoG, sampled at ≥ 100 Hz, filtered with a
+fourth-order Butterworth at 0.5 Hz, with jerk as the 500 ms moving average
+of its derivative. The director loop runs at ~20 Hz, so:
+
+* a CARLA IMU is attached at 200 Hz (measured 205.8 Hz in the first run)
+  and drained per tick;
+* samples are resampled onto a uniform grid before filtering — CARLA's
+  sensor ticks jitter and a Butterworth assumes constant dt;
+* **both** filterings are reported. `ay_peak_mps2` applies the
+  regulation's filter causally (the compliance figure);
+  `ay_peak_zerophase_mps2` is the zero-phase equivalent, which places the
+  peak correctly in time. In a steady-state curve they agree; in the
+  §3.2.2 transient they do not, and the difference is the filter's group
+  delay, not the vehicle. §45.1 is the reason both are kept.
+
+The IMU sits at the actor origin, roughly 0.6 m below the CoG, so a
+roll-rate term rides on ay. CARLA does not expose the CoG height, so this
+is recorded rather than corrected.
+
+### 55.6 What R79 cannot be assessed for in simulation [KNOWN]
+
+* **§3.2.3 overriding force** — needs 50 N measured at the steering
+  control. CARLA has no steering-torque interface and the stack's steer is
+  a normalised position command, so there is no force to measure.
+* **§3.2.4 hands-on transition** — needs hands-on detection and the
+  escalating warning chain of §5.6.2.2.5. The stack has no driver
+  monitoring, so there is nothing to test. This is itself the finding: a
+  Category B1 approval is not reachable without it.
+* **§3.2.5 lane-crossing warning** — the crossing is measured; the warning
+  is not, because nothing in the stack publishes a lane-departure signal.
+  Reported as `not_assessable` with the crossing time attached, never as a
+  pass. `--warning-topic` wires a Bool topic in the day one exists.
+
+### 55.7 First results [DONE]
+
+Single points, ADAS stack live, to prove the chain rather than to report:
+
+* **Curved, t04_r199 (R = 199 m), 50 km/h, TTC 6 s:** handover at 83.3 m
+  of arc (chord 81.4 m), target bearing +2.2°, already outside the
+  straight-ahead corridor. First detection 101 m at +1.8°. Brake onset
+  16 m → a_req 5.83 m/s², `fail_collision`. The straight matrix's 50 km/h
+  point sits at 5.8–6.6 m/s² (§49), so the curve did not by itself move
+  the reaction — worth confirming across the matrix before drawing the
+  conclusion.
+* **R79 lane keeping, t04_r076 (R = 76 m), 35.5 km/h, declared
+  aysmax 1.5:** demand 1.27 m/s² (inside the 80–90 % window), measured
+  peak 2.14 m/s² zero-phase / 2.30 causal, jerk 2.19 m/s³, |cte| max
+  0.61 m, closest approach to the marking +0.26 m → `pass`.
+
+  The 68 % overshoot of the demanded figure at curve entry is the number
+  to look at next: it is inside §3.2.1's criteria (which are crossing and
+  jerk only) but would breach §5.6.2.1.1's sustained allowance
+  (1.5 + 0.3 = 1.8 m/s²) if it lasted, and it lasted 0.67 s.
+
+## 57. The UI's interpreter has no scipy, and an errored run wrote defaults that read like results [FIXED]
+
+The first R79 run launched from the UI drove the whole scenario and then
+died in the analysis step with `No module named 'scipy'`. UI.py starts
+scenarios with `CARLA_PYTHON`
+(`/home/sirius/CARLA_0.9.16/carla-env/bin/python3`), which has numpy 1.24
+but no scipy; every CLI run until then had used the system interpreter,
+which has scipy 1.15.
+
+Two separate defects, and the second is the dangerous one.
+
+### 57.1 The dependency [FIXED]
+
+`analyse_lateral` imported `scipy.signal.butter/lfilter/filtfilt` for
+R79 Annex 8 §2.4's fourth-order Butterworth. The harness has to run under
+whichever interpreter launches it, so the filter is now written out:
+`butter_lowpass()` designs the cascade by bilinear transform with
+prewarping, `_biquad` runs each section seeded in DC steady state (a
+zero-state start rings for about a second at 0.5 Hz, and the R79 window
+opens mid-corner, so that ring would land straight in the reported peak).
+
+Verified against scipy on a realistic ay trace (step into a curve, 1.7 Hz
+ripple, noise, 200 Hz):
+
+| quantity | agreement |
+|---|---|
+| causal 4th order vs `lfilter` + `lfilter_zi` | 1.1e-8 |
+| zero-phase peak vs `filtfilt` | 1.3e-4 m/s² (0.005 %) |
+
+The zero-phase residual is `filtfilt`'s edge padding; the peak is what
+gets reported and it agrees to four decimal places.
+
+### 57.2 A failed run must not be readable as a measured one [FIXED]
+
+The errored run still wrote a summary row — and every metric in it was a
+dataclass default: `kept_lane=True`, `max_abs_cte_m=0.0`,
+`min_marking_clearance_m=nan`, `window_valid=False`. Read straight, that
+row says the vehicle held the lane perfectly with zero error. It says
+nothing of the sort: nothing was measured.
+
+`LkaMetrics.measured` is now set only when a run reaches the end of its
+loop, and:
+
+* the summary table prints `not measured — <reason>` instead of numbers;
+* the kept-lane grid shows `?` rather than `.`;
+* `plot_lka.py --sweep` drops unmeasured rows instead of plotting a
+  default as a passing cell.
+
+### 57.3 A crossing under the fallback is not the LKAS's crossing [FIXED]
+
+While the LKAS is silent (§56.3) the scenario steers. A tyre over a
+marking during that stretch was still being recorded as
+`tyre_crossed_marking`. The check now requires `lateral_owner == 'lkas'`;
+the outage is already reported, far more precisely, as `lkas_silent_s`.
+
+### 57.4 Steering export [DONE]
+
+`plot_lka.py --export-steering` writes `<run_id>_steering.csv`: time,
+phase, who was steering, speed, the lane's radius and curvature, and the
+four angles (commanded, required, feed-forward, realised) plus the
+cross-track they were reacting to. Curve and exit rows only by default —
+on the straight lead-in every angle is ~0 and the comparison says
+nothing. `--whole-run` keeps everything.
+
+### 57.5 The same point, measured [DONE]
+
+t04_r199, lane_keeping, aysmax 1.5 → derived 57.4 km/h, R = 199 m, run
+under the CARLA interpreter that previously failed:
+
+| metric | value |
+|---|---|
+| verdict | **pass** |
+| lane kept | yes, closest approach to the marking 0.67 m |
+| max \|cte\| | 0.21 m |
+| lateral demand | 1.28 m/s² (window 1.20–1.35) |
+| ay peak | 2.75 m/s² causal / measured |
+| jerk peak | 2.07 m/s³ (limit 5) |
+| steer error vs geometry | rms 0.68°, mean +0.47° |
+
+The mean +0.47° is the interesting figure: Stanley sits slightly outside
+the geometric requirement for the whole curve, which is consistent with
+the small positive cte bias in the same run and is what a steady-state
+Stanley offset looks like.
