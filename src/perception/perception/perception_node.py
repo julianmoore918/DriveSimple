@@ -90,7 +90,25 @@ LANE_FALLBACK_HALF_W = 1.5
 # published distance to it — or blending, IPM close where boxes clip and
 # pinhole far — is the obvious next step and would make this cap generous
 # rather than load-bearing.
-MAX_IPM_TRUST_M = 150.0
+#
+# SET BACK TO 80.0 (2026-08-13). It had drifted to 150.0 while every word
+# of the comment above still said 80 — 150 m is roughly 2x past where the
+# measured error reaches 38 %, so the far half of that range was
+# publishing distances the controller had no reason to believe.
+#
+# Note what this cap is NOT. It does not explain late detection on the
+# curved-target runs: raising a ceiling cannot delay a detection, and in
+# scenarios/results/20260813_153123_curve_t04_r199 ten of twelve runs
+# first perceived the target at 24-33 m, nowhere near either value. The
+# gate that actually bound them is the ego-lane one below (see
+# LANE_FALLBACK_HALF_W and DEBUG §65).
+#
+# It does cost the two runs that DID acquire early: B_..._v30_off0_ttc10
+# saw the target at 101 m and B_..._v50_off0_ttc4.5 at 92 m, and both are
+# now clipped to 80. Those were the two best acquisitions in the block, so
+# this is a real trade — bought deliberately, because a +38 % distance
+# feeding a stopping profile is worse than no distance at all.
+MAX_IPM_TRUST_M = 80.0
 # Real-world heights [m] for the pinhole range estimate, d = f*H/bb_height.
 # This is the pre-IPM approach, reinstated as a PARALLEL diagnostic rather
 # than a replacement — see the pinhole publisher in estimateLeadDist.

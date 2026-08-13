@@ -105,27 +105,43 @@ SITES: dict[str, CurveSite] = {
         'and the only one where the whole approach AND the whole braking '
         'manoeuvre happen inside the bend. Larger than R171\'s 787 m '
         'first turn, so it is LESS severe than the reference: quote it as '
-        'a high-speed curved-road case, not as a substitute for §4.2.4.1.'),
+        'a high-speed curved-road case, not as a substitute for §4.2.4.1.\n'
+        'Approach is not clean — 64 m of junction and two road changes in '
+        'the last 250 m — which is the first thing to suspect if a high '
+        'speed row on it departs.'),
     't12_r500': CurveSite(
         't12_r500', 'Town12', 820, -3, 684.3, 500.0, 'right', 276.0, 500.0,
         3.5, 1, 1,
         'First-turn analogue: 500 m against the reference 787 m, so more '
         'severe (2.60 m/s^2 at 130 km/h against the reference\'s 1.66). '
         'R_spread 0.00, 276 m of arc, 500 m of lead-in, traffic lane '
-        'either side. The site to fly the high-speed rows on.'),
-    't12_r417': CurveSite(
-        't12_r417', 'Town12', 924, -2, 56.9, 417.1, 'right', 460.0, 500.0,
-        3.5, 0, 2,
-        '460 m of arc and 500 m of lead-in — the most room of any site '
-        'near the reference second turn (374 m), at +11 % so marginally '
-        'less severe. R_spread 0.10.'),
+        'either side. Approach vets CLEAN over 250 m — no junction, no '
+        'lane change — which is why it is the reference site to compare '
+        'anything else against. The site to fly the high-speed rows on.'),
+    't12_r412': CurveSite(
+        't12_r412', 'Town12', 1157, -3, 632.7, 412.0, 'right', 130.0, 500.0,
+        3.5, 1, 1,
+        'Second-turn analogue (+10 % on the reference 374 m) and the only '
+        'site in its radius band with a CLEAN approach: vet_site.py walks '
+        '250 m back and finds no junction, no road or lane change, and a '
+        'traffic lane on both sides the whole way. Middle lane of three, '
+        'so UFLD gets a marking on each edge. R_spread 0.02.\n'
+        'Replaced t12_r417 (road 924), which had the same radius and four '
+        'times the arc but crossed three roads and a junction on the way '
+        'in, with a lane split whose left marking peels away from the '
+        'curve. Every speed failed there, 30 km/h included, while '
+        't12_r500 held 0.1 m at the same speed — DEBUG §61.'),
     't12_r345': CurveSite(
         't12_r345', 'Town12', 701, -2, 21.6, 345.2, 'right', 314.0, 210.0,
         3.5, 0, 1,
         'Second-turn analogue on the severe side: 345 m against the '
         'reference 374 m (-8 %), with 314 m of arc. 210 m of lead-in caps '
         'the approach at about 110 km/h with a 1.5 s settle. '
-        'R_spread 0.17.'),
+        'R_spread 0.17.\n'
+        'DIRTY APPROACH: 40 m of junction and four road/lane changes in '
+        'the last 250 m, and no lane to its right. Prefer t12_r412 for '
+        'the second turn; keep this one only for a deliberately harder '
+        'perception case, and read lkas_silent_s before the verdict.'),
     # --- Stock maps: quicker to load, tighter than the reference --------
     't07_r364': CurveSite(
         't07_r364', 'Town07', 44, -1, 26.4, 363.6, 'right', 34.0, 92.0,

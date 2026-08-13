@@ -328,6 +328,19 @@ the controller stop holding the lane*. Cells above `--sweep-ay-cap`
 (default 4.5 m/s²) are dropped, because past that the tyres decide the
 outcome rather than the controller.
 
+> **The cap is a plant limit, not the regulation's.** 4.5 m/s² is where
+> this vehicle understeers out of the lane regardless of the controller.
+> R79's limit is lower: aysmax is declared at 3.0 and §5.6.2.1.1 allows a
+> transient of `min(1.4·aysmax, table_max + 0.3)` = 3.30. So the sweep
+> deliberately runs cells the regulation would never ask for — at R = 42 m
+> the grid stops at 30 km/h because 50 km/h needs 4.59 m/s², which is 1.5×
+> the declaration. Above aysmax the applicable paragraph is §3.2.2, where
+> running wide is the *correct* response, not a lane-keeping failure.
+> Three cells in the default grid already demand more than 3.0 (t12_r412
+> @ 130, t04_r199 @ 90, t03_r060 @ 50); they characterise the controller
+> but are **not** compliance evidence. Use `--sweep-ay-cap 3.3` for a grid
+> containing only cells R79 would actually ask for. DEBUG §63.
+
 ```bash
 python3 scenarios/r79_lka_validation.py --sweep --list      # the grid
 python3 scenarios/r79_lka_validation.py --sweep             # fly it
@@ -411,14 +424,40 @@ Plot the pair over time, or export it:
 ```bash
 python3 scenarios/results/plot_lka.py                     # newest R79 run
 python3 scenarios/results/plot_lka.py --all               # every trace in it
-python3 scenarios/results/plot_lka.py --sweep             # kept-lane map, R × v
+python3 scenarios/results/plot_lka.py --sweep             # R × v matrix + map
+python3 scenarios/results/plot_lka.py --trim-s 0          # whole run, edges too
 python3 scenarios/results/plot_lka.py --export-steering   # <run_id>_steering.csv
 ```
+
+Trace plots cut the **first and last 2 s** (`--trim-s`). Both ends are
+harness artefacts — teleport settling and the warm-up hold at the start,
+the departure abort or the post-arc tail at the end — and drawing them
+squeezes the y axis around transients nobody is reading. It is a display
+window only: every statistic annotated on the panels comes from
+`summary.csv` over the harness's measurement window, so the trim cannot
+move a reported number, and the time axis states which window is drawn so
+the two are not confused. A run too short to survive the cut is drawn
+whole and says so. `--export-steering` is **not** trimmed.
 
 `--export-steering` writes just the comparison — time, phase, who was
 steering, speed, the lane's radius and curvature, the four angles and the
 cross-track — for the curve and exit only (`--whole-run` keeps the
 straight lead-in, where every angle is ~0).
+
+`--sweep` also renders `sweep_matrix.png`, which carries **two
+independent channels** because a cell can fail one and pass the other:
+
+* **fill** — §3.2.1.2, did a tyre cross a marking. This is what decides
+  the sweep verdict (with jerk).
+* **amber border** — §5.6.2.1.1, did lateral acceleration exceed
+  `min(1.4·aysmax, table_max + 0.3)`. Recorded but does **not** fail a
+  sweep cell, so a green square can carry an amber border: `t03_r060` at
+  50 km/h keeps the lane while pulling 4.84 m/s² against a 3.30 ceiling.
+
+Each cell shows `demand` (v²/R, what the cell was built from) and `peak`
+(measured zero-phase ay, against the ceiling). The border reads the
+harness's own `ay_within_limits` column rather than recomputing a
+threshold, so the figure cannot disagree with the summary it is drawing.
 
 > **Read `measured` before anything else.** A run that errors or times out
 > still writes a summary row, and every metric in it is a dataclass
@@ -430,6 +469,21 @@ straight lead-in, where every angle is ~0).
 No scipy needed: the Annex 8 §2.4 Butterworth is implemented in the
 script, because UI.py launches scenarios with CARLA's bundled Python,
 which does not have it (DEBUG §57.1).
+
+## Towns are changed by rebooting CARLA, not by load_world()
+
+Both scenario scripts reboot the CARLA server into a site's town before
+running it, via `scenarios/carla_server.py`. `client.load_world()` is not
+safe on this install — UI.py has said so since it was written — and using
+it per site was why every group after the first measured nothing at all
+(DEBUG §59). A server already in the right town is left alone.
+
+The ADAS stack does **not** need restarting with it; leave it up. Pass
+`--no-carla-restart` only if CARLA is managed elsewhere.
+
+One consequence: a harness-started server is not the one the UI's Start
+CARLA button launched, so the UI's process handle goes stale. Stop CARLA
+still works (it pkills by name).
 
 ## Who is steering, and when
 
@@ -456,6 +510,29 @@ The LKAS does not get the wheel at t=0, and the trace says so in
 it is large did not measure the controller.
 
 ---
+
+# Vetting a site before trusting it
+
+`curve_survey.py` finds arcs. It says nothing about what the lane
+markings do on the approach, and that turned out to decide whether a site
+measures the controller at all:
+
+```bash
+python3 scenarios/vet_site.py                 # every site in the loaded town
+python3 scenarios/vet_site.py t12_r412 --verbose
+```
+
+It walks 250 m back from the arc entry and reports junctions, road/lane
+changes, whether a driving lane exists on each side the whole way, and
+lane-width variation. `t12_r417` failed at every speed — 30 km/h
+included — because its approach crossed three roads and a junction with a
+lane split whose left marking peels away from the curve; it was replaced
+by `t12_r412`, which vets clean and passes 30/50/70 km/h with 0.13-0.28 m
+of cross-track (DEBUG §61).
+
+A dirty approach is not automatically disqualifying — it is a harder
+perception case, which may be what you want — but a result from one is
+about the site as much as the system.
 
 # Surveying new curves
 

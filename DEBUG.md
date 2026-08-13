@@ -5259,3 +5259,565 @@ The mean +0.47° is the interesting figure: Stanley sits slightly outside
 the geometric requirement for the whole curve, which is consistent with
 the small positive cte bias in the same run and is what a steady-state
 Stanley offset looks like.
+
+## 58. The sweep died on Town12, and one failing site took the run with it [FIXED]
+
+The first full 27-cell sweep stopped after nine cells. Timeline: last cell
+written 17:49, next group was `t12_r1185`, and the CarlaUE4 process that
+is running now started at 17:50 — the server went away while loading
+Town12 into a session that had already been through Town03, Town04 and
+Town10HD.
+
+Three fixes:
+
+* **A failing site no longer aborts the run.** Its remaining cells are
+  recorded as `not measured — <reason>` and the next site is attempted.
+  Before, the summary simply ended early with no indication why.
+* **Large Maps get a 600 s RPC timeout** (`CarlaCurveAdapter.LARGE_MAP_TIMEOUT_S`)
+  instead of the stock 120 s.
+* **A memory preflight** refuses a Large Map when less than 8 GB is
+  available, naming the fix (restart CARLA, run Town12 in its own
+  session) rather than letting the load take the server down.
+
+## 59. Every site after the first measured nothing, because the harness used load_world() [FIXED]
+
+The overnight sweep produced 27 cells and 25 of them were meaningless.
+Only the first site group — whichever town CARLA already had loaded —
+had the LKAS in the loop; every group after a `client.load_world()` ran
+with `/Car_1/cmd_steer` stale for the entire run while the harness's own
+fallback held the lane. `kept_lane` came back True on nearly all of them,
+which reads like a passing lane-keeping result and is not one.
+
+### 59.1 It was in the repo the whole time
+
+`UI.py:213`, `set_boot_map`:
+
+> "Rewrite the three *.Map entries in CARLA's DefaultEngine.ini so the
+> next server boot lands in the requested town. **(In-band load_world()
+> segfaults on this install — the boot-map ini is the only reliable
+> way.)**"
+
+The harness called `load_world()` once per site anyway. The operator had
+independently worked out the same thing from the other end — "I clicked
+restart when switching the town" — which is what prompted looking here.
+
+### 59.2 Evidence
+
+| configuration | result |
+|---|---|
+| `t04_r076` alone, fresh process (one load_world at start) | **pass**, camera 13.7 Hz, coeffs 12.9 Hz, cmd_steer 20 Hz |
+| `t03_r060` then `t04_r076`, one process | first passes; second silent 21.8 s, camera still 328 frames @ 13 fps |
+| same pair, server rebooted between towns | **both steer**: silent 0.0 s, steer_max_age 0.05 s |
+
+So it is not the town, not the site, and not the ADAS stack — a stack
+that has been up for hours is fine. It is the second world inside one
+server session.
+
+### 59.3 The fix
+
+`scenarios/carla_server.py`: `ensure_town()` writes the boot map, kills
+the server, restarts it and waits until it reports the requested town.
+Both scenario scripts call it before each site group; `--no-carla-restart`
+falls back to the old `load_world` path for setups where CARLA is managed
+elsewhere. A server already in the right town is left alone.
+
+### 59.4 Three things that had to be fixed to make rebooting survivable
+
+* **A control-sink error killed the ROS executor.** When a group ended, a
+  late `/Car_1/cmd_steer` reached a sink still pointing at the destroyed
+  ego: `AttributeError` inside a subscription callback, which rclpy
+  re-raises out of the executor — killing the spin thread and every other
+  topic with it. The sink is now detached in the group's `finally`,
+  `apply_control`/`poll_camera` are no-ops on a closed adapter, and the
+  sink call is wrapped so a failure detaches it instead of taking the
+  process down.
+* **The client outlived its server and core-dumped the process.**
+  `connect()` calls `get_trafficmanager()`, which leaves a background
+  connection and thread inside the client. Rebooting CARLA while that
+  existed raised `carla::client::TimeoutException` on a non-Python thread
+  — `terminate()`, core dump, no traceback that Python can catch.
+  `close()` now shuts the traffic manager down, drops the client, world
+  and map references and forces a `gc.collect()`.
+* **Teardown order**: detach sink → stop pump (5 s join) → close adapter →
+  only then reboot.
+
+### 59.5 What the corrected run shows
+
+`t03_r060` then `t04_r076`, 30 km/h, with the reboot:
+
+| run | silent | steer err rms | verdict |
+|---|---|---|---|
+| t03_r060 | 0.0 s | 3.14° | pass |
+| t04_r076 | 0.0 s | 2.33° | **fail — lateral jerk 7.50 > 5 m/s³** |
+
+t04_r076 is the first real controller result from that site: the lane is
+kept with 0.37 m of clearance and it fails on ride quality, not on
+tracking. Every earlier conclusion drawn from a multi-site sweep should be
+re-run before it is quoted.
+
+## 60. Large Maps need a nested boot-map path, and a silent boot failure looks exactly like a slow one [FIXED]
+
+A sweep reached the Town12 group, rebooted CARLA for it, and then sat
+there. Nine cells were done; nothing moved for ten minutes.
+
+State at the time: no `CarlaUE4-Linux-Shipping` process, nothing listening
+on port 2000, and two `CarlaUE4.sh` entries in `Zs` (defunct) — the engine
+had exited immediately and the harness was polling for a server that was
+never coming.
+
+### 60.1 The path
+
+Stock towns are a single umap:
+
+```
+Content/Carla/Maps/Town04.umap   ->  /Game/Carla/Maps/Town04.Town04
+```
+
+Large Maps are a directory of streaming tiles with a master umap inside:
+
+```
+Content/Carla/Maps/Town12/Town12.umap  ->  /Game/Carla/Maps/Town12/Town12.Town12
+```
+
+`carla_server.set_boot_map` wrote the flat form for every town. The engine
+starts, cannot find the map, and exits — no error the harness could see,
+because `start()` sent stdout and stderr to `/dev/null`.
+
+`boot_map_value()` now decides from the filesystem (`Maps/<town>/<town>.umap`
+exists?) rather than from a hardcoded list, so a newly installed Large Map
+works without editing anything. Measured after the fix: **Town12 boots in
+20 s.**
+
+The server's own map name reflects the same nesting — Town12 reports as
+`Town12/Town12`, stock towns as `Town04` — which `is_town()` already
+handled by comparing the last path element.
+
+### 60.2 Three ways this hid itself
+
+* **Output discarded.** `start()` used `DEVNULL`. It now writes
+  `/tmp/carla_server_harness.log`, and a boot failure quotes its last
+  eight lines.
+* **No liveness check.** `wait_until_ready()` polled for the full 420 s
+  without noticing the child had exited. It now takes the `Popen` handle
+  and fails the moment `poll()` returns, naming the boot map it used.
+* **The memory preflight was in the wrong place.** It lived in
+  `CarlaCurveAdapter.connect()`, which runs *after* `ensure_town()` — i.e.
+  after the old server has already been killed. Moved into `ensure_town`,
+  before the kill, so a machine that cannot hold the map keeps the one it
+  has.
+
+### 60.3 Recovery, and a note on running processes
+
+Booting Town12 by hand with the corrected path let the stalled sweep
+continue: every remaining site was Town12, so its `ensure_town` found the
+right town already loaded and skipped the reboot entirely. The first
+Town12 cell then ran properly — `t12_r1185` at 30 km/h, lane kept, LKAS
+silent 0.0 s, steer error rms **0.41°**, jerk 2.26 — the first genuine
+high-radius result from this stack.
+
+Worth remembering: a scenario process holds the version of
+`carla_server.py` it imported at start. Fixing the file does not fix a run
+already in flight.
+
+## 61. t12_r417 was a broken site, not a broken controller [FIXED]
+
+In the first complete sweep, `t12_r417` failed at **every** speed —
+including 30 km/h, where |cte| reached 1.76 m and 50 km/h upwards ended in
+a departure. On the same map at the same speeds, `t12_r500` held 0.09 m
+and `t12_r1185` 0.11 m. A site that fails at 30 km/h while its neighbours
+hold 0.1 m is not telling you about the controller.
+
+The operator spotted it from the camera: there is a lane split shortly
+before the bend, the left marking peels away to the left while the road
+goes right, and the detector has two plausible ego lanes.
+
+### 61.1 vet_site.py
+
+`curve_survey.py` finds arcs; it never asked what the markings do on the
+way in. `scenarios/vet_site.py` walks the approach backwards from the arc
+entry and reports what a lane detector will meet:
+
+| site | junction | road/lane changes | lanes either side | verdict |
+|---|---|---|---|---|
+| t12_r417 | 4 m | 3 | right only | dirty — 924 → 1103 → junction → 927 |
+| t12_r345 | 40 m | 4 | right only | dirty |
+| t12_r1185 | 64 m | 2 | both | dirty |
+| t12_r500 | 0 m | 0 | both | **clean** |
+| t12_r412 | 0 m | 0 | both | **clean** |
+
+t12_r500 being the only clean Town12 site is exactly the one that
+behaved, which is the correlation worth remembering: vet a site before
+believing a result from it.
+
+### 61.2 The replacement
+
+Moving the entry later along road 924 does not help — the whole area is
+interchange geometry, and every entry keeps a junction 72 m behind it. A
+scan of 34 candidate (road, lane) pairs in Town12 with R 250-700 m, arc
+≥ 120 m and lead-in ≥ 150 m found nine clean sites, of which three have
+traffic lanes on both sides.
+
+`t12_r417` → **`t12_r412`**: Town12 road 1157 lane -3, s = 632.7,
+R = 412 m right, 130 m of arc, 500 m of lead-in, R_spread 0.02, middle
+lane of three so UFLD gets a marking on each edge. Still a second-turn
+analogue (+10 % on the reference 374 m, against the old site's +11 %).
+The trade is arc length: 130 m instead of 460 m.
+
+Measured immediately after the swap, and to be read against the old
+site's failures at the same speeds:
+
+| speed | ay | kept | \|cte\|max | clearance | jerk | steer err rms |
+|---|---|---|---|---|---|---|
+| 30 | 0.17 | yes | 0.13 m | 0.74 m | 0.24 | 0.43° |
+| 50 | 0.47 | yes | 0.25 m | 0.63 m | 0.90 | 0.81° |
+| 70 | 0.92 | yes | 0.28 m | 0.59 m | 1.96 | 1.18° |
+
+All pass. The old site departed at 50.
+
+### 61.3 Still to do
+
+`t12_r345` and `t12_r1185` both vet dirty and their notes now say so.
+t12_r1185's high-speed departures (90/110/130 km/h) were read in §56 as a
+controller limit; with 64 m of junction in the approach that reading is
+not safe yet. The small-map sites have not been vetted at all — each
+needs its town loaded, so do it the next time one is up.
+
+## 62. Stanley went unstable above 70 km/h because its loop gain grows with speed [FIXED]
+
+**Symptom.** On `t12_r500` (R = 500 m, CLEAN approach), 30/50/70 km/h kept
+lane and 90/110/130 km/h departed — `|cte|` pinned at 3.1–3.2 m, jerk 12–31
+against R79's 5 m/s³ ceiling, runs aborting after 4.5–5.7 s.
+
+### It was not the curve
+
+`kappa_1pm` is `0.00000` for every logged sample of all three failures, and
+`v_mean_in_curve_kmh` is `0.0`. They departed on the straight lead-in, before
+the measurement window opened. That is also why `steer_rms_err_deg` and
+`steer_ff_mean_deg` read `nan` in those summary rows — not a metric bug, the
+window never opened.
+
+### Mechanism
+
+Regressing the published command against lane heading error over the traces:
+
+| v [km/h] | lag(hdg→cmd) | K_ψ regressed | envelope growth/cycle | outcome |
+|---|---|---|---|---|
+| 70 | 0.20 s | 1.10 | 1.06 | rings at 0.8 Hz, passes |
+| 90 | 0.28 s | 0.79 | **2.01** | departs t = 5.7 s |
+| 110 | 0.28 s | 1.05 | 1.39 | departs t = 4.9 s, cmd peaks −42.8° |
+| 130 | 0.28 s | 1.06 | 1.45 | departs t = 4.5 s |
+
+Measured K_ψ ≈ 1.0 is exactly `STANLEY_HEADING_GAIN`, and at these speeds it
+is the only term doing anything: at 90 km/h with `cte` = 0.07 m the
+cross-track term `atan2(0.5·e, v+0.5)` contributes **0.08°** while the command
+tracks heading error one-for-one (−1.72° against −1.75°). So the loop is pure
+heading feedback through a dead time — `ψ̇ = v·δ/L`, stable only while
+
+    STANLEY_HEADING_GAIN · v · τ / L  <  π/2
+
+With K = 1.0, L = 3.048 m, τ = 0.20 s that crosses over at 86 km/h: 81 % of
+the limit at 70, 104 % at 90. Predicted from two constants, and it lands
+where the runs actually fail.
+
+τ is perception, not transport — `steer_age_s` peaked at 0.048 s, so the
+0.2 s is UFLD tick + IPM + KF. **Raising the detector rate is the durable
+fix.** The gain schedule buys margin against the dead time we have.
+
+### Fix: cap the feedback loop gain above 50 km/h
+
+    g = min(1, V_GAIN_SCHED_MPS / v)
+    δ = g·[ψ + arctan(k·e/v)] + arctan(κ·L)
+
+`g` multiplies the **feedback terms only**. The curvature feed-forward is
+open-loop, has no bearing on the criterion, and scaling it would just make
+the car run wide in curves at exactly the speeds where holding the line
+matters. Verified: steady-state δ on R = 500/200/60 is unchanged to
+0.000000° at every speed, and every case is unchanged to 0.000000° at and
+below 50 km/h.
+
+Since the criterion is linear in K·v, freezing K·v holds the margin constant
+(58 %) at all higher speeds instead of letting it erode.
+
+### Why 50 km/h and not 70
+
+70 was the obvious boundary — the fastest speed that passed before the
+change, so the most conservative no-op. **Repeating the column showed 70 is
+not a pass, it is a coin flip:** `|cte|` max came out 0.37, 0.23, 3.18 and
+3.18 m over four runs of the same site, two of them departures. At 70 the cap
+is inactive (`g` = 1.0) in all four, so that scatter is the *untouched
+original controller* sitting at 81 % of the stability limit. Anchoring a
+"safe" boundary to a value already known to be marginal is the opposite of
+what the schedule is for. 30 and 50 repeated at 0.09–0.11 m in every run —
+that is the region the tune is genuinely validated in.
+
+This is the general trap: **a single passing run is not a pass.** Four runs
+of one cell spanned 0.23 m to a departure with the code held constant.
+
+### Result — `t12_r500`, `|cte|` max [m], two repeats per cell
+
+| v [km/h] | 30 | 50 | 70 | 90 | 110 | 130 |
+|---|---|---|---|---|---|---|
+| no cap | 0.09 | 0.10 | 0.37 / 0.23 / 3.18 / 3.18 | 3.12 | 3.20 | 3.20 |
+| cap @ 50 | 0.09 / 0.08 | 0.10 / 0.10 | 0.12 / 0.11 | 0.19 / 0.18 | 0.53 / 0.63 | 0.87 / 0.90 |
+
+11 of 12 pass (`20260813_141200_cap50`), against 3 of 6 before. Low speed is
+bit-identical by construction. The repeat spread collapsing — v70 from
+{0.23 … 3.18} to {0.12, 0.11} — is the strongest single piece of evidence
+that the marginal loop was the cause.
+
+130 km/h remains on the line (clearance 0.00 m then −0.02 m). It no longer
+oscillates: jerk 2.63/3.05 against 15.36, and it now runs *wide by 0.9 m*
+rather than diverging. That residual is the cross-track term being too weak
+to pull it back — gain `k/(v+ε)` is 0.0137 rad/m at 130 against 0.057 at 30 —
+and `ay` demanded there is 2.61 against a declared aysmax of 3.0, i.e. near
+the envelope anyway. Open, and a different problem from this one.
+
+### Dead-time compensation: three variants, all rejected [DECIDED]
+
+Do not re-derive these.
+
+1. **Spatial preview** — evaluate `y(x)` at `x_p = v·τ`. Provably useless
+   here: on a straight lane the slope is identical at every x, so it moves
+   the heading term by exactly 0.0000° at every speed — and every failure was
+   on the straight. On a curve it double-counts the bend the feed-forward
+   already handles (−0.35° of excess steer at R = 500).
+2. **Smith predictor from commanded steer** — `ψ̇ = (v/L)·δ − v·κ`. Exact if
+   the car yaws at `v·δ/L`. Regressing measured yaw rate against `v·δ/L`
+   gives 0.76 at 30 km/h falling to 0.22 at 90 (part real tyre slip, part
+   phase corruption from regressing an oscillating signal — unusable either
+   way). Bench-simulated at those gains it was the *only* variant worse than
+   doing nothing: 6.33 m peak offset at 130 against a 1.58 m baseline,
+   because over-predicting the yaw makes it under-command.
+3. **Model-free derivative lead** — `ψ̂ = ψ + T·dψ/dt` from successive coeff
+   messages, EMA-smoothed, clamped at 5°. Flown live at T = 0.15 s
+   (`20260813_135414`) and worse than the cap alone at every speed:
+
+   | steer err rms [deg] | 30 | 50 | 70 | 90 | 110 | 130 |
+   |---|---|---|---|---|---|---|
+   | cap + lead 0.15 s | 0.58 | 1.70 | 9.92 | 11.44 | 1.53 | 2.03 |
+   | cap alone | 0.27 | 0.41 | 0.76 | 0.77 | 0.36 | 1.47 |
+
+   A derivative across a ~10 Hz signal is dominated by perception noise, not
+   by the heading swing it was meant to lead. The clamp bounded it without
+   fixing it (v50 peak steer error +10.75°, one clamped spike per noisy
+   pair). This is a *sample-rate* defect rather than a design defect — the
+   same lead on a 20–30 Hz detector has a far better noise floor — but it
+   does not pay at the rate perception actually runs, so it is not in the
+   tree.
+
+### Also worth knowing
+
+The baseline high-speed runs had `imu_rate_hz` at 32–66 against a nominal
+100, and ~10 fps camera; the post-change runs sit at 85–104 Hz. Some of the
+baseline's severity was a starved simulator. The effect survives that — the
+capped runs are bounded across two repeats where the uncapped departed in all
+three — but do not quote the exact crossover speed as a property of the
+controller alone.
+
+Live override, no rebuild: `-p v_gain_sched_mps:=1e9` restores the exact
+pre-§62 formula. That is how the before/after columns above were measured.
+
+## 63. The sweep's tyre cap is looser than R79's own limit, and the matrix hid it [FIXED]
+
+**Question that surfaced it.** "Why is R = 42 m only tested at 30 km/h — would
+higher speeds exceed the 3 m/s² R79 threshold?" Yes, and the more useful
+answer is that the sweep's cap and the regulation's limit are two different
+numbers, and the looser one was doing the gating.
+
+`build_sweep` drops any cell whose geometric demand `v²/R` exceeds
+`SWEEP_AY_CAP = 4.5` m/s² — a **plant** limit ("past roughly 0.45 g this
+vehicle understeers out of the lane whatever the controller does"). R79's
+limit is a **regulatory** one: aysmax is declared at 3.0, and §5.6.2.1.1
+allows a transient of `min(1.4·aysmax, table_max + 0.3)` = 3.30.
+
+Highest speed each radius allows, by which limit is applied:
+
+| site | R [m] | aysmax 3.0 | ceiling 3.30 | tyre cap 4.5 | actually run |
+|---|---|---|---|---|---|
+| t12_r1185 | 1185 | 215 | 225 | 263 | 30–130 |
+| t12_r500 | 500 | 139 | 146 | 171 | 30–130 |
+| t12_r412 | 412 | 127 | 133 | 155 | 30–130 |
+| t04_r199 | 199 | 88 | 92 | 108 | 30–90 |
+| t04_r076 | 76 | 54 | 57 | 67 | 30–50 |
+| t03_r060 | 60 | 48 | 51 | 59 | 30–50 |
+| t10_r042 | 42 | **40** | 42 | 49 | 30 |
+
+So R = 42 m stops at 30 km/h because 50 km/h demands 4.59 m/s² — over the
+4.5 cap, and **1.5× the declared aysmax**. At 70 it would be 9.00, 3× the
+declaration. Those are not lane-keeping tests at all: above aysmax the
+applicable paragraph is §3.2.2 (maximum lateral acceleration), where the
+correct system behaviour is to *refuse* the demand and run wide. A departure
+there would be compliance, not failure.
+
+Because 4.5 > 3.30, three cells in the grid already demand more than the
+declaration and get run anyway: t12_r412 @ 130 (3.17), t04_r199 @ 90 (3.14),
+t03_r060 @ 50 (3.22). Left as-is deliberately — they are useful as controller
+characterisation, and §3.2.1.2's verdict (crossing + jerk) is still
+meaningful — but they are not R79 lane-keeping points and should not be
+quoted as compliance evidence. Run with `--sweep-ay-cap 3.3` for a grid that
+only contains cells the regulation would actually ask for.
+
+### The matrix was drawing one channel of two
+
+`plot_matrix` coloured cells by `kept_lane` alone. On the 27-cell sweep that
+showed 3 red squares while **5** runs had breached the ay ceiling — the two
+missing ones being cells that kept the lane while exceeding it:
+
+| run | peak ay | ceiling | kept | verdict |
+|---|---|---|---|---|
+| t12_r500 v130 | 3.88 | 3.30 | no | fail |
+| t12_r412 v130 | 4.37 | 3.30 | no | fail |
+| t04_r076 v30 | 5.78 | 3.30 | **yes** | fail (jerk) |
+| t04_r076 v50 | 10.89 | 3.30 | no | fail |
+| t03_r060 v50 | 4.84 | 3.30 | **yes** | **pass** |
+
+`t03_r060 v50` passing while pulling 4.84 against a 3.30 ceiling is *by
+design*, not a bug: `_verdict` scopes a sweep cell to §3.2.1.2's two
+questions (did a tyre cross, was jerk ≤ 5 m/s³) and routes §5.6.2.1.1
+breaches to the note. Defensible — but it means the acceleration envelope is
+a genuinely independent axis, and a plot that renders only the crossing
+channel makes a green square look unambiguous when it is not.
+
+Fixed by giving it its own visual channel rather than folding it into the
+fill: **amber border = ay over the §5.6.2.1.1 ceiling**, fill still
+crossing/kept. Each cell now carries both numbers — `demand` (v²/R, what the
+cell was built from) and `peak` (measured zero-phase ay, against the
+ceiling). The legend counts the breaches so the number is on the figure.
+
+The border flag reads the harness's own `ay_within_limits` column rather than
+recomputing a threshold in the plotter; `ay_ceiling()` reads `ay_table_max`
+back from the manifest for the *displayed* number, so a plot can never
+quietly disagree with the verdict it is drawing. Same reason `peak` uses the
+zero-phase figure: that is what §5.6.2.1.1 is judged on and what the run note
+quotes, and the causal peak lags its own filter.
+
+## 64. Trace plots trim 2 s off each end [DONE]
+
+`plot_lka.plot_run` now drops the first and last `TRIM_EDGE_S` (2.0 s) of
+every trace before drawing. Both ends are harness artefacts, not controller
+behaviour: the run opens with the teleport settling and the scenario's own
+warm-up centreline hold, and it ends either at the departure abort or at the
+tail past the arc where the lane demands nothing. Drawing them compresses the
+y axis around transients nobody is trying to read — on `t12_r500_v130` the
+useful 0.5 deg of steering detail was sharing an axis with the settling
+transient.
+
+Three things keep it honest:
+
+* **It is a display window, not a measurement one.** Every statistic
+  annotated on the panels (`steer_rms_err_deg`, `steer_mean_err_deg`, the
+  crossing time) comes from `summary.csv`, which the harness computes over
+  its own window. The trim therefore cannot move a reported number — but the
+  two windows are now visibly different, so the time axis states which one is
+  drawn. Silently trimming an axis while leaving statistics unqualified is
+  how a reader measures one window with another's ruler.
+* **Short runs are not destroyed.** A departure can abort in under 4 s;
+  `trim_edges` refuses below `TRIM_MIN_KEEP_S` (3 s) or `TRIM_MIN_KEEP_N`
+  (20 samples) and draws the whole run with a note saying why. In the 27-cell
+  sweep the shortest survivor keeps 5.2 s (`t04_r076_v50`), so this only
+  bites on aborts.
+* **`--trim-s` overrides it**, `0` disables. `--export-steering` is
+  deliberately *not* trimmed: it is the raw comparison the CSV exists to
+  provide.
+
+Only `plot_run` is affected. `plot_sweep` and `plot_matrix` read scalars from
+`summary.csv` and have no time axis to trim.
+
+## 65. Curved R171: the ACC brake cap turned late detection into collisions [FIXED]
+
+Block `20260813_153123_curve_t04_r199` (R = 199 m, stationary target 35 m
+into the arc): **5 of 12 runs ended in a collision**, at 26-58 km/h impact,
+including runs whose geometry was comfortably stoppable.
+
+### Detection, and what is NOT causing it
+
+Ten of twelve runs first perceived the target at **24-33 m**. Two saw it at
+92 and 101 m. Same site, same target.
+
+`gap_perceived_m` and `gap_pinhole_m` turn non-null on the *identical*
+sample in all twelve runs, so whatever gates it sits **upstream of both
+range estimators** — it is the ego-lane selection in `perception_node`, not
+IPM, and not `MAX_IPM_TRUST_M`. Raising a range ceiling cannot delay a
+detection in any case.
+
+The gate is `_bb_intersects_centerline`, and specifically its fallback.
+When UFLD's polylines do not reach the target's range the test returns
+`None`, and the code falls back to a **straight ±`LANE_FALLBACK_HALF_W`
+(1.5 m) corridor at Y = 0**. On a curve that assumption is wrong: a target
+35 m into an R = 199 m bend sits 35²/(2·199) ≈ **3.08 m** off the ego's
+tangent while genuinely in the ego lane. Measured lateral offset at first
+detection is 2.1-3.2 m in every run — twice the corridor. The target is
+therefore rejected until the ego has rotated far enough into the bend for
+its ground-Y to fall inside ±1.5 m, which is exactly the 24-33 m observed.
+The two early acquisitions are the runs where UFLD's centreline did reach,
+so the real (curved) test ran instead of the fallback.
+
+**Open.** The fallback needs to bend with the road — the ego's own
+curvature estimate is already available from the lane KF (`kappa`), so the
+corridor could be swept along an arc instead of a straight line. Not
+attempted yet; recorded so the next person does not re-diagnose it as YOLO.
+
+`MAX_IPM_TRUST_M` was nevertheless **restored to 80.0** — it had drifted to
+150.0 while every word of its comment still said 80, i.e. the far half of
+its range was publishing distances measured at ~38 % error. This costs the
+two good acquisitions (92 m and 101 m are now clipped to 80) and is a
+deliberate trade: a +38 % gap feeding a stopping profile is worse than none.
+
+### The cap is what made it a collision
+
+`ACC_BRAKE_CAP = 0.4` bounded ACC service brake at 0.4 × 5.69 = 2.28 m/s²
+plus coast. Its comment argued the cap "costs nothing … when it does bind,
+the loop's answer is to hold the brake LONGER, not harder". That holds only
+when there is time left to be long in.
+
+`A_t04_r199_v50_off0_ttc6`, from the trace: target perceived at 30 m at
+50 km/h; brake command sits pinned at **exactly 0.40 for 1.3 s** while
+achieved deceleration plateaus at ~2.6 m/s² and the required rate `v²/2s`
+climbs through 5 and past 8. EMERGENCY (uncapped, brake = 1.0) only arms
+below a 1 m gap, with 32.6 km/h still on the clock. Impact at 29.0 km/h.
+
+The stop needed ~4.5 m/s² from 30 m — inside both the tyres and R171, and
+simply not commandable. **`ACC_BRAKE_CAP` is now 1.0.**
+
+Consequence, stated plainly: ACC can now command more than 5 m/s², so an
+R171 deceleration breach is reachable through this branch instead of being
+structurally impossible. That is the accepted trade for now — stopping
+beats a compliant collision — and bounding deceleration belongs in the
+PROFILE (`a_profile` / `DECEL_LIMIT`), where it is designed, not in a brake
+clamp. Operator is aware and will take the 5 m/s² limit separately.
+
+### The standstill hold was stopping the car early
+
+`STANDSTILL_WINDOW` was 0.5 m, so the hold latched at `d_lead < d0 + 0.5`
+and *ended control there*. Whatever gap the car happened to be at when the
+window admitted it became the final gap. `A_t04_r199_v30_off0_ttc6` latched
+on a tracked gap of 2.36 m and finished with **3.55 m of real gap**.
+
+Now 0.0, and the test is `<=`: the hold latches AT d0 = 2.0 m and the
+governor keeps control all the way down, where `v_ref = sqrt(2a(gap-d0))`
+reaches zero exactly at d0. The hold itself is kept — it exists to stop the
+derivative term chasing estimator noise at rest — it just no longer fires
+before the car has arrived.
+
+Note the last metre is closed against the TRACKED gap, which reads ~1.2 m
+short of truth at close range as the bounding box clips. Resting gap is
+still set by estimator bias, now conservatively. Perception problem,
+deliberately not papered over in the controller.
+
+### Plotting
+
+`plot_acc.py` already handles curved traces unchanged — same columns plus
+`cte_m`. Added:
+
+* **lateral acceleration** on a twin axis of the lateral panel, computed as
+  `|v·ψ̇|` from the logged path because this trace has no ay column
+  (`accel_mps2` is longitudinal). Same estimator as `plot_lka.py`.
+* **lane kept/crossed** in the title and header strip. The curved-R171
+  summary has no `kept_lane` column — that scenario scores the ACC side —
+  so it is derived from `cte_m` against R79's tyre-on-the-marking rule
+  (`LANE_HALF_W - TYRE_HALF_W`), and reports "not measured" rather than
+  "kept" when the trace carries no cte.
+* removed the grey "excluded from KPI" overlay from the deceleration panel
+  (§54). The masking still drives the reported peak and the event markers —
+  the sim's standstill snap cannot be quoted as a braking result — only the
+  two-tone drawing is gone.

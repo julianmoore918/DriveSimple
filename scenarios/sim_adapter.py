@@ -23,6 +23,7 @@ Coordinate / sign conventions used across the interface:
 from __future__ import annotations
 
 import abc
+import gc
 import math
 import queue
 import time
@@ -534,6 +535,24 @@ class CarlaAdapter(SimAdapter):
                 self.world.apply_settings(self._original_settings)
         except Exception:
             pass
+        # Release the client, and the traffic manager with it.
+        #
+        # connect() calls get_trafficmanager(), which leaves a background
+        # connection and its own thread inside the client. Keeping the
+        # client alive after a run meant that thread was still talking to
+        # the server when the harness rebooted CARLA for the next town —
+        # and an RPC that outlives its server raises a C++
+        # TimeoutException on a non-Python thread, which calls terminate()
+        # and core-dumps the whole process. Python cannot catch that, so
+        # the only fix is to not be connected (DEBUG §59).
+        try:
+            if self.client is not None:
+                self.client.get_trafficmanager().shut_down()
+        except Exception:
+            pass
+        self.world = self.map = self.client = None
+        self._original_settings = None
+        gc.collect()
 
     # -- per-tick -----------------------------------------------------------
     def wait_for_tick(self) -> float:
@@ -634,6 +653,11 @@ class CarlaAdapter(SimAdapter):
 
     def apply_control(self, throttle: float, brake: float,
                       steer: float) -> None:
+        # Between site groups the ego is destroyed and a late cmd_steer
+        # can still arrive. Silently ignoring it is right: there is
+        # nothing to steer.
+        if self.ego is None:
+            return
         self.ego.apply_control(self._carla.VehicleControl(
             throttle=float(min(max(throttle, 0.0), 1.0)),
             brake=float(min(max(brake, 0.0), 1.0)),
@@ -645,6 +669,13 @@ class CarlaAdapter(SimAdapter):
             x=fwd.x * speed_mps, y=fwd.y * speed_mps, z=0.0))
 
     def poll_camera(self) -> bytes | None:
+        # Same reason as apply_control, with sharper teeth: the pump runs
+        # in its own thread, and an RPC issued against a server that is
+        # being shut down raises a C++ TimeoutException that Python cannot
+        # catch — it calls terminate() and takes the process with it. A
+        # closed adapter must not touch the simulator at all.
+        if self.camera is None:
+            return None
         if self._encode_jpeg is None:
             import cv2
             import numpy as np

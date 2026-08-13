@@ -72,11 +72,94 @@ WHEELBASE_M   = 3.048
 # filters are uninitialised or the user has ticked Kalman OFF in the UI.
 KF_COEFF_STALE_S = 0.3
 
+# ── High-speed stabilisation (DEBUG §62) ────────────────────────────────
+# Measured on scenarios/results/20260813_125601_r79_lka, site t12_r500,
+# STRAIGHT lead-in (kappa = 0 for every logged sample — none of the
+# failures reached the arc):
+#
+#   v [km/h]   lag(hdg→cmd)   K_psi regressed   envelope growth/cycle
+#      70          0.20 s          1.10              1.06  (rings, passes)
+#      90          0.28 s          0.79              2.01  (departs 5.7 s)
+#     110          0.28 s          1.05              1.39  (departs 4.9 s)
+#     130          0.28 s          1.06              1.45  (departs 4.5 s)
+#
+# At those speeds the cross-track term is inert — at 90 km/h with
+# cte = 0.07 m it contributes 0.08 deg while the published command tracks
+# the heading error one-for-one (-1.72 vs -1.75 deg). So the loop is pure
+# heading feedback through a dead time, psi_dot = v*delta/L, which is
+# stable only while
+#
+#     STANLEY_HEADING_GAIN * v * tau / L  <  pi/2
+#
+# With K = 1.0, L = 3.048 m and the measured tau = 0.20 s that crosses
+# over at 86 km/h: 81 % of the limit at 70 (hence the 0.8 Hz ring and
+# jerk 4.45 against R79's 5 m/s^3), 104 % at 90. The threshold predicted
+# from two constants is exactly where the runs fail.
+#
+# tau is dominated by perception, not transport (steer_age_s peaked at
+# 0.048 s): UFLD tick + IPM + KF is most of the 0.2 s budget. Raising the
+# detector rate is the durable fix; the constant below buys margin
+# against the dead time we have.
+#
+# Cap the feedback loop gain above this speed. Since the criterion above
+# is linear in K*v, freezing K*v at its value here holds the margin
+# constant at every higher speed instead of letting it erode as v grows.
+#
+# Set to 50 km/h, not 70, and the difference is the whole point. 70 was
+# the obvious choice — the fastest speed that passed before the change,
+# so the most conservative possible no-op boundary. Repeating the column
+# showed 70 km/h is not a pass, it is a coin flip: |cte| max came out
+# 0.37, 0.23, 3.18 and 3.18 m over four runs of the SAME site, two of
+# them departures. At 70 the cap is inactive (g = 1.0) in every one of
+# those runs, so that scatter is the untouched original controller
+# sitting at 81 % of the stability limit and flipping on whatever
+# disturbance it happens to meet. Anchoring a "safe" boundary to it
+# would have frozen the loop gain at a value already known to be
+# marginal, which is the opposite of what the schedule is for.
+#
+# 30 and 50 km/h repeated at 0.09-0.11 m across all four runs. That is
+# the region the tune is genuinely validated in, so that is where the
+# no-op boundary belongs. 58 % of the limit is the margin the schedule
+# now holds at every speed above it.
+#
+# Measured, t12_r500 column, with the threshold still at 70 km/h:
+#
+#   v [km/h]     30     50     70     90    110    130
+#   |cte| max  0.09   0.10   0.37   3.12   3.20   3.20   no cap
+#              0.09   0.09   0.23   0.36   0.33   0.93   cap@70 #1
+#              0.10   0.11   3.18   0.29   0.95   0.89   cap@70 #2
+#
+# 90/110/130 stay bounded under the cap in both runs where the uncapped
+# controller departed outright in all three. That part is the real,
+# repeated effect; see DEBUG §62 for the shipped-threshold numbers.
+#
+# Adding dead-time compensation on TOP of this was tried and rejected —
+# three variants, all worse or useless. See DEBUG §62; do not re-derive.
+#
+# Written as the division rather than a decimal so the boundary is exact.
+# At 13.9 the threshold falls just below 50 km/h and the 50 km/h row
+# picks up a few thousandths of a degree of change — harmless in size,
+# but it makes "identical at and below" false, and that claim is the
+# whole reason this ships without re-validating the low-speed tune.
+V_GAIN_SCHED_MPS = 50.0 / 3.6
+
+
+def gain_scale(speed_mps: float) -> float:
+    """Loop-gain multiplier for this speed — exactly 1.0 at and below
+    V_GAIN_SCHED_MPS, then 1/v so K*v stays at its 70 km/h value."""
+    return min(1.0, V_GAIN_SCHED_MPS / max(speed_mps, 1e-3))
+
 
 def stanley_steer(e_lat: float, e_head: float, speed_mps: float) -> float:
-    """Returns a normalised steer ∈ [-1, 1]. Positive = right."""
-    delta = (STANLEY_HEADING_GAIN * e_head
-             + math.atan2(STANLEY_K * e_lat, speed_mps + STANLEY_EPS))
+    """Returns a normalised steer ∈ [-1, 1]. Positive = right.
+
+    Gets the same speed schedule as the coeff path — the stability
+    criterion is a property of the loop, not of which formulation
+    produced the error, and it is simulator-independent.
+    """
+    g = gain_scale(speed_mps)
+    delta = g * (STANLEY_HEADING_GAIN * e_head
+                 + math.atan2(STANLEY_K * e_lat, speed_mps + STANLEY_EPS))
     return max(-1.0, min(1.0, delta / MAX_STEER_RAD))
 
 
@@ -92,7 +175,8 @@ def stanley_steer_from_coeffs(a: float, b: float, c: float,
         ψ    = arctan(b)                         heading error (analytic)
         e    = c                                 cross-track at x = 0
         κ    = 2 a / (1 + b²)^(3/2)              road curvature at x = 0
-        δ    = ψ + arctan(k·e / v) + arctan(κ·L)
+        g    = min(1, V_GAIN_SCHED / v)          loop-gain cap
+        δ    = g·[ψ + arctan(k·e / v)] + arctan(κ·L)
 
     Term 1 zeros the heading error, term 2 is the classic Stanley
     cross-track law (proven asymptotically stable for fixed scalar k),
@@ -102,16 +186,29 @@ def stanley_steer_from_coeffs(a: float, b: float, c: float,
     curves. δ is computed in Y-LEFT convention; we flip sign at the
     end because CARLA's cmd_steer takes positive = RIGHT.
 
+    g multiplies the two FEEDBACK terms only. The feed-forward is
+    open-loop — it has no bearing on the stability criterion g exists to
+    satisfy, and scaling it would simply make the car run wide in curves
+    at exactly the speeds where holding the line matters most.
+
+    g is exactly 1.0 at and below V_GAIN_SCHED_MPS, so the schedule
+    cannot touch the validated low-speed tune — verified to 0.0000 deg
+    across straight, offset, heading-error and R = 500/200/60 curve
+    cases at 10/30/50/70 km/h, and to 0.0000 deg on the curve cases at
+    every speed, since a steady-state curve is held by the feed-forward
+    that g does not scale.
+
     Returns (steer_norm, delta_rad, kappa, e_head_rad) so the caller
     can log the per-frame Stanley terms for the sensitivity study.
     """
+    g     = gain_scale(speed_mps)
     kappa = 2.0 * a / (1.0 + b * b) ** 1.5
     psi   = math.atan(b)                              # heading error
     e_lat = c                                         # cross-track
-    delta_left = (STANLEY_HEADING_GAIN * psi
-                  + math.atan2(STANLEY_K * e_lat,
-                               speed_mps + STANLEY_EPS)   # feedback
-                  + math.atan(kappa * WHEELBASE_M))       # feed-forward
+    delta_left = (g * (STANLEY_HEADING_GAIN * psi
+                       + math.atan2(STANLEY_K * e_lat,
+                                    speed_mps + STANLEY_EPS))  # feedback
+                  + math.atan(kappa * WHEELBASE_M))            # feed-forward
     delta_carla = -delta_left   # Y-LEFT → CARLA Y-RIGHT (+ = right)
     steer_norm  = max(-1.0, min(1.0, delta_carla / MAX_STEER_RAD))
     return steer_norm, delta_carla, kappa, psi
@@ -156,7 +253,7 @@ class StanleyNode(Node):
         # Module-level constants, read as defaults below and then
         # overridden from ROS params -- must be declared global before
         # any reference to the names within this function.
-        global STANLEY_K, STANLEY_HEADING_GAIN
+        global STANLEY_K, STANLEY_HEADING_GAIN, V_GAIN_SCHED_MPS
         super().__init__('Stanley_Node', namespace='LKAS')
         self.get_logger().info("=== Stanley Node starting ===")
 
@@ -184,6 +281,12 @@ class StanleyNode(Node):
         self.declare_parameter('stanley_heading_gain',
             STANLEY_HEADING_GAIN_MORAI if simulator == 'morai' else STANLEY_HEADING_GAIN)
         STANLEY_HEADING_GAIN = float(self.get_parameter('stanley_heading_gain').value)
+        # High-speed stabilisation (DEBUG §62), live-tunable so the change
+        # can be backed out against a running stack rather than a rebuild:
+        # -p v_gain_sched_mps:=1e9 restores the exact pre-§62 formula.
+        # That is also how the before/after columns in §62 were measured.
+        self.declare_parameter('v_gain_sched_mps', V_GAIN_SCHED_MPS)
+        V_GAIN_SCHED_MPS = float(self.get_parameter('v_gain_sched_mps').value)
         self.lookahead = self.get_parameter('lookahead_m').value
         speed_topic    = self.get_parameter('speed_topic').value
         rate           = self.get_parameter('control_rate_hz').value
@@ -232,7 +335,8 @@ class StanleyNode(Node):
         self.get_logger().info(
             f"Stanley initialised | lookahead={self.lookahead} m | "
             f"rate={rate} Hz | speed_topic={speed_topic} | "
-            f"stanley_k={STANLEY_K} | stanley_heading_gain={STANLEY_HEADING_GAIN}"
+            f"stanley_k={STANLEY_K} | stanley_heading_gain={STANLEY_HEADING_GAIN} | "
+            f"gain cap above {V_GAIN_SCHED_MPS * 3.6:.0f} km/h"
         )
 
     # ── Convert nav_msgs/Path (REP 103, Y LEFT) → list of (X_fwd, Y_right) ─
@@ -361,8 +465,9 @@ class StanleyNode(Node):
         elif mode == 'KF-STAN':
             self.get_logger().info(
                 f'KF-STAN engaged (coeff channel fresh) — canonical Stanley '
-                f'+ curvature feed-forward: δ = arctan(b̂) + arctan(k·ĉ/v) '
-                f'+ arctan(κ·L), k={STANLEY_K}, L={WHEELBASE_M} m.')
+                f'+ curvature feed-forward: δ = g·[ψ + arctan(k·ĉ/v)] '
+                f'+ arctan(κ·L), k={STANLEY_K}, L={WHEELBASE_M} m, '
+                f'g=min(1, {V_GAIN_SCHED_MPS:.1f}/v).')
         else:
             self.get_logger().info('STANLEY re-engaged (lane re-acquired).')
         self._prev_mode = mode

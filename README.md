@@ -153,10 +153,10 @@ bound by `DECEL_LIMIT`.
 | `ZERO_THROTTLE_DAMPING` | `damping_rate_zero_throttle_clutch_engaged` applied to the VUT at spawn, replacing CARLA's default 2.0 (§50.2) | 0.4 |
 | `BRAKE_AUTHORITY` | Deceleration per unit brake, coast removed, lag aligned. **Re-fitted in §50.7**; the old 4.44 had stock engine braking in its residual | 5.69 m/s² |
 | `THROTTLE_AUTHORITY` | Acceleration per unit throttle | 6.0 m/s² |
-| `ACC_BRAKE_CAP` | Ceiling on ACC service brake — 2.28 m/s² before coast (§50.8). EMERGENCY is not capped | 0.40 |
+| `ACC_BRAKE_CAP` | Ceiling on ACC service brake. **Removed** — was 0.40 (2.28 m/s² before coast), which pinned the command flat while the required rate climbed past 8 and turned late detections into collisions (§65). Deceleration is now bounded by the profile alone, so ACC *can* exceed the R171 5 m/s² | 1.0 |
 | `CREEP_SPEED` | Below this the set-speed throttle cap is lifted so the vehicle can close the last metres to `d0`; the cap is 0.105 and will not launch from rest (§52.2) | 2.0 m/s |
 | `MIN_BRAKE_NO_THROTTLE` suppression | The brake floor is lifted whenever the governor asks for more speed than the vehicle has, so it cannot hold a stopped car away from `d0` (§53) | — |
-| `STANDSTILL_WINDOW` | Tolerance on `d0` for latching the standstill hold. Was effectively 2.0 m, which set the final gap instead of `d0` (§50.8) | 0.5 m |
+| `STANDSTILL_WINDOW` | Tolerance on `d0` for latching the standstill hold. Any non-zero value ends control early, so whatever gap the car was at became the final gap — 0.5 m left one run resting at 3.55 m (§65). Now latches at `d0` exactly | 0.0 m |
 | `MIN_BRAKE_NO_THROTTLE` | Brake floor whenever throttle is off | 0.10 |
 | `cruise_gain` / `cruise_ki` | Speed-loop PI gains | 0.3 / 0.2 |
 | `AB_ALPHA` | α-β tracker gain (β = α²/(2−α)) | 0.20 |
@@ -236,6 +236,27 @@ positive-right steering convention.
 | `LOOKAHEAD_M` | Path-mode Stanley lookahead | 5.0 m |
 | `WHEELBASE_M` | CARLA `vehicle.dodge.charger_2020` wheelbase (`L`) | 3.048 m |
 | `KF_COEFF_STALE_S` | Freshness window for KF-STAN mode | 0.3 s |
+| `V_GAIN_SCHED_MPS` | Speed above which the feedback loop gain is capped | 50 km/h |
+
+**Speed-scheduled loop gain.** Both Stanley formulations scale their
+**feedback** terms by `g = min(1, V_GAIN_SCHED_MPS / v)`:
+
+    δ = g·[ψ + arctan(k·e / v)] + arctan(κ·L)
+
+The curvature feed-forward is deliberately outside `g` — it is open-loop
+and does not affect stability, and scaling it would make the car run wide
+in curves. Above ~70 km/h Stanley is effectively pure heading feedback
+(the cross-track term contributes 0.08° at 90 km/h), and that loop is
+stable only while `K·v·τ/L < π/2`. With the measured τ = 0.20 s of
+perception delay, the margin erodes with speed alone — 35 % of the limit
+at 30 km/h, 81 % at 70, 104 % at 90 — and the car departed at 90/110/130.
+Capping `K·v` holds the margin at 58 % everywhere above 50 km/h, and is
+bit-identical at and below it. `t12_r500` went from 3/6 to 11/12 cells
+passing. DEBUG §62 — including three dead-time-compensation variants that
+were tried and rejected, so they are not re-derived.
+
+Override live without rebuilding: `-p v_gain_sched_mps:=1e9` restores the
+pre-§62 formula.
 
 ## UFLD-V2 — trained lane detector
 

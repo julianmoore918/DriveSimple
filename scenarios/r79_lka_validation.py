@@ -90,6 +90,7 @@ from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import carla_server  # noqa: E402
 from curve_adapter import SITES, CarlaCurveAdapter  # noqa: E402
 from scenario_common import (  # noqa: E402
     LOG_HZ, CameraPump, LaneHold, SpeedHold, check_no_bridge_conflict,
@@ -150,7 +151,7 @@ TESTS = ('lane_keeping', 'max_lateral_accel', 'lane_crossing_warning')
 # kept_lane per cell. The regulation's criteria still decide the verdict.
 SWEEP_SPEEDS_KMH = (30, 50, 70, 90, 110, 130)
 # Sites are ordered by radius so a sweep reads as a curve-severity ladder.
-SWEEP_SITES = ('t12_r1185', 't12_r500', 't12_r417', 't04_r199',
+SWEEP_SITES = ('t12_r1185', 't12_r500', 't12_r412', 't04_r199',
                't04_r076', 't03_r060', 't10_r042')
 # Above this the tyres, not the controller, decide the outcome, and the
 # run stops measuring lane keeping. Deliberately above the 3.0 m/s^2 M1
@@ -486,6 +487,11 @@ class LkaMetrics:
     # Seconds the LKAS spent not publishing a steer command after it had
     # the wheel — stanley_node's HOLD mode, where it expects a fallback
     # controller that the harness does not provide.
+    # Frames the harness actually published to the stack during the run.
+    # Perception cannot find a lane in images it never received, so this
+    # is the first column to read when lkas_silent_s is large.
+    camera_frames: int = 0
+    camera_fps: float = 0.0
     lkas_silent_s: float = 0.0
     t_first_silence_s: float = float('nan')
     max_abs_cte_m: float = 0.0
@@ -561,13 +567,14 @@ class WarningWatch:
 # ---------------------------------------------------------------------------
 class LkaRunner:
 
-    def __init__(self, adapter, bridge, args, warning=None):
+    def __init__(self, adapter, bridge, args, warning=None, pump=None):
         self.adapter = adapter
         self.bridge = bridge
         self.args = args
         self.speed_hold = SpeedHold()
         self.lane_hold = LaneHold()
         self.warning = warning
+        self.pump = pump
 
     def run(self, point: LkaPoint, out_dir: Path):
         args = self.args
@@ -614,6 +621,7 @@ class LkaRunner:
 
         samples: list[dict] = []
         imu: list = []
+        frames_at_start = self.pump.frames_published if self.pump else 0
         t0 = self.adapter.wait_for_tick()
         prev_t = t0
         last_log = -1.0
@@ -884,6 +892,8 @@ class LkaRunner:
             if stats.get('note'):
                 m.note = (m.note or '') + ' ' + stats['note']
 
+        if self.pump is not None:
+            m.camera_frames = self.pump.frames_published - frames_at_start
         m.kept_lane = not m.tyre_crossed_marking
         m.measured = m.outcome in ('completed', 'departed')
         m.lookahead_m = args.lookahead_m
@@ -899,6 +909,8 @@ class LkaRunner:
         m.v_mean_in_curve_kmh = round(v_mean * 3.6, 2)
         m.ay_geometric_mps2 = round(v_mean ** 2 / geometry.radius_m, 3)
         m.duration_s = round(prev_t - t0, 2)
+        if m.camera_frames:
+            m.camera_fps = round(m.camera_frames / max(m.duration_s, 1e-3), 1)
         m.warning_status = ('not_implemented' if not args.warning_topic
                             else 'seen' if m.warning_seen else 'absent')
         if t_warning is not None and t_crossing is not None:
@@ -1122,6 +1134,17 @@ def parse_args(argv=None):
     g.add_argument('--vehicle', default='vehicle.dodge.charger_2020')
     g.add_argument('--weather', default='ClearNoon')
     g.add_argument('--keep-existing-actors', action='store_true')
+    g.add_argument('--no-carla-restart', action='store_true',
+                   help='Do not reboot the CARLA server when a site needs a '
+                        'different town, and use client.load_world() '
+                        'instead. That is what the harness used to do, and '
+                        'it is why every site group after the first '
+                        'produced no steering at all — in-band load_world '
+                        'is not safe on this install (DEBUG §59). Only pass '
+                        'this if CARLA is managed elsewhere.')
+    g.add_argument('--carla-quality', default='Epic',
+                   choices=['Low', 'Epic'],
+                   help='Quality level for a harness-started CARLA.')
     g.add_argument('--sync', action='store_true')
     g.add_argument('--imu-hz', type=float, default=200.0,
                    help='IMU rate [Hz]. R79 Annex 8 §2.4 needs >= 100.')
@@ -1318,6 +1341,13 @@ def main(argv=None) -> int:
     try:
         for site_name, group in groups:
             site = SITES[site_name]
+            if not args.no_carla_restart:
+                # Reboot into the town rather than load_world() into it.
+                # The stack stays up across this: a fresh server plus a
+                # long-running ADAS stack is the combination that works.
+                carla_server.ensure_town(site.town, host=args.host,
+                                         port=args.port,
+                                         quality=args.carla_quality)
             adapter = CarlaCurveAdapter(
                 site=site, with_imu=True, imu_hz=args.imu_hz,
                 host=args.host, port=args.port,
@@ -1358,8 +1388,8 @@ def main(argv=None) -> int:
                           f"(aysmax {point.ay_max:g})", flush=True)
                     try:
                         m, geometry = LkaRunner(
-                            adapter, bridge, args, warning).run(
-                                point, out_dir)
+                            adapter, bridge, args, warning,
+                            camera_pump).run(point, out_dir)
                     except KeyboardInterrupt:
                         raise
                     except Exception as exc:
@@ -1412,9 +1442,19 @@ def main(argv=None) -> int:
                 exit_code = 1
                 _write(out_dir, results, geometry, args)
             finally:
+                # Order matters: detach the sink first so no late
+                # cmd_steer can reach a dying adapter, then stop the pump
+                # (generously — it may be mid-encode), then close.
+                bridge.set_control_sink(None)
                 if camera_pump is not None:
                     camera_pump.stop()
-                    camera_pump.join(timeout=2.0)
+                    camera_pump.join(timeout=5.0)
+                    if camera_pump.is_alive():
+                        print('[warn] camera pump did not stop; leaving the '
+                              'adapter open so its thread cannot RPC a dead '
+                              'server', flush=True)
+                        camera_pump = None
+                        continue
                 adapter.close()
 
     except KeyboardInterrupt:
@@ -1435,6 +1475,10 @@ def _report_point(m: LkaMetrics) -> None:
           f"ay {m.ay_geometric_mps2:.2f} demanded / "
           f"{m.ay_peak_zerophase_mps2:.2f} measured peak  "
           f"jerk {m.jerk_peak_mps3:.2f} m/s^3", flush=True)
+    if m.camera_fps and m.camera_fps < 5.0:
+        print(f"       camera only {m.camera_fps:.1f} fps "
+              f"({m.camera_frames} frames) — perception was starved, so "
+              f"nothing below is about the LKAS", flush=True)
     if m.lkas_silent_s > 0:
         print(f"       LKAS silent {m.lkas_silent_s:.1f} s from "
               f"t={m.t_first_silence_s:.1f} s — scenario held the lane",

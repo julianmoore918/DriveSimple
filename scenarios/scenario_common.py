@@ -211,9 +211,22 @@ class ScenarioBridge(Node):
             # Apply immediately with the most recent longitudinal command.
             # The lock serialises this against the director's own
             # apply_control so the two never interleave a simulator RPC.
-            with self._sink_lock:
-                thr, brk = self._longitudinal
-                sink(thr, brk, self.stack_steer)
+            #
+            # Guarded because an exception in a subscription callback does
+            # not stay local: rclpy re-raises it out of the executor and
+            # the spin thread dies, taking every other topic with it. That
+            # is what happened when a site group ended and a late
+            # cmd_steer reached a sink pointing at a destroyed ego —
+            # AttributeError in here, and the whole run's ROS side went
+            # down with it (DEBUG §59).
+            try:
+                with self._sink_lock:
+                    thr, brk = self._longitudinal
+                    sink(thr, brk, self.stack_steer)
+            except Exception as exc:
+                self._control_sink = None
+                self.get_logger().warn(
+                    f'control sink failed and was detached: {exc}')
 
     def set_control_sink(self, fn) -> None:
         self._control_sink = fn

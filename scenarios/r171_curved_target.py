@@ -95,6 +95,7 @@ from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import carla_server  # noqa: E402
 from curve_adapter import SITES, DEFAULT_SITE, CarlaCurveAdapter  # noqa: E402
 from scenario_common import (  # noqa: E402
     LOG_HZ, DECEL_VALID_GAP_M, DECEL_VALID_SPEED_MPS, DECEL_PLAUSIBLE_MAX,
@@ -166,7 +167,7 @@ NOMINAL_OFFSET_M = 0.0
 # in Town12, so the matrix costs a single (slow) world load and then runs
 # straight through. `--matrix-sites t04_r199` is the fast local
 # alternative at the cost of an 88 km/h ceiling.
-MATRIX_SITES = ('t12_r417', 't12_r500')
+MATRIX_SITES = ('t12_r412', 't12_r500')
 
 
 def site_max_speed_kmh(site_name: str) -> float:
@@ -585,6 +586,17 @@ def parse_args(argv=None):
                    help='Blueprint for BOTH the VUT and the target.')
     g.add_argument('--weather', default='ClearNoon')
     g.add_argument('--keep-existing-actors', action='store_true')
+    g.add_argument('--no-carla-restart', action='store_true',
+                   help='Do not reboot the CARLA server when a site needs a '
+                        'different town, and use client.load_world() '
+                        'instead. That is what the harness used to do, and '
+                        'it is why every site group after the first '
+                        'produced no steering at all — in-band load_world '
+                        'is not safe on this install (DEBUG §59). Only pass '
+                        'this if CARLA is managed elsewhere.')
+    g.add_argument('--carla-quality', default='Epic',
+                   choices=['Low', 'Epic'],
+                   help='Quality level for a harness-started CARLA.')
     g.add_argument('--sync', action='store_true',
                    help='Synchronous world. Off by default — sync mode '
                         'regressed forward motion in this multi-process '
@@ -714,6 +726,13 @@ def main(argv=None) -> int:
     try:
         for site_name, group in groups:
             site = SITES[site_name]
+            if not args.no_carla_restart:
+                # Reboot into the town rather than load_world() into it.
+                # The stack stays up across this: a fresh server plus a
+                # long-running ADAS stack is the combination that works.
+                carla_server.ensure_town(site.town, host=args.host,
+                                         port=args.port,
+                                         quality=args.carla_quality)
             adapter = CarlaCurveAdapter(
                 site=site, host=args.host, port=args.port,
                 ego_bp=args.vehicle, target_bp=args.vehicle,
@@ -809,9 +828,19 @@ def main(argv=None) -> int:
                 exit_code = 1
                 _write(out_dir, results, geometry, args)
             finally:
+                # Order matters: detach the sink first so no late
+                # cmd_steer can reach a dying adapter, then stop the pump
+                # (generously — it may be mid-encode), then close.
+                bridge.set_control_sink(None)
                 if camera_pump is not None:
                     camera_pump.stop()
-                    camera_pump.join(timeout=2.0)
+                    camera_pump.join(timeout=5.0)
+                    if camera_pump.is_alive():
+                        print('[warn] camera pump did not stop; leaving the '
+                              'adapter open so its thread cannot RPC a dead '
+                              'server', flush=True)
+                        camera_pump = None
+                        continue
                 adapter.close()
 
     except KeyboardInterrupt:

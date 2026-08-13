@@ -149,7 +149,9 @@ class ACCNode(Node):
         self.target_speed      = cruise_kmh / 3.6  # [m/s]
         self.d0                = 2.0       # standstill bumper gap [m]
         # Tolerance on d0 for latching the standstill hold — see control_loop.
-        self.STANDSTILL_WINDOW = 0.5       # [m]
+        # 0.0: the hold latches AT d0, not before it. Was 0.5, which let the
+        # vehicle declare itself stopped with a metre still to go.
+        self.STANDSTILL_WINDOW = 0.0       # [m]
         # d_desired = d0 + T_gap * v_ego. T_gap=0.3 s → at 20 km/h cruise
         # (5.5 m/s), d_desired ≈ 6.65 m, settling to d0=5 m at rest.
         # That matches the "follow at roughly 5 m gap" mental model and
@@ -270,20 +272,38 @@ class ACCNode(Node):
         # residual RMS 0.88. The fit is flat in lag — 5.54 to 5.79 across
         # 0-300 ms — so unlike the old one it is not lag-sensitive.
         self.BRAKE_AUTHORITY = 5.69
-        # Ceiling on ACC service brake. 0.4 * BRAKE_AUTHORITY = 2.28 m/s^2,
-        # plus coast, so the loop cannot command much over 2.9 m/s^2 no
-        # matter what the profile asks — comfortably inside the R171 5.
+        # Ceiling on ACC service brake. REMOVED (1.0 = full authority).
         #
-        # It costs nothing in the nominal case: at a 99 m acquisition the
-        # stop needs 1.0 m/s^2 and the latched plan asks ~1.3, both far
-        # under the cap. When the cap does bind, the loop's answer is to
-        # hold the brake LONGER, not harder — the speed error persists, so
-        # the command stays saturated until the profile is caught. That is
-        # what "brake more often" gets you without pulsing, which would
-        # only add jerk for no extra retardation.
+        # It was 0.4, i.e. 0.4 * BRAKE_AUTHORITY = 2.28 m/s^2 plus coast,
+        # chosen to keep the loop comfortably inside R171's 5 m/s^2. The
+        # reasoning above it read "it costs nothing in the nominal case …
+        # when the cap does bind, the loop's answer is to hold the brake
+        # LONGER, not harder". That holds only when there is time left to
+        # be long in, and on the curved-target runs there is not.
         #
-        # EMERGENCY is a separate branch and is NOT capped.
-        self.ACC_BRAKE_CAP = 0.4
+        # Measured, scenarios/results/20260813_153123_curve_t04_r199,
+        # A_t04_r199_v50_off0_ttc6: the target is first perceived at 30 m
+        # while doing 50 km/h. The governor asks for everything it can get
+        # and the command sits pinned at exactly 0.40 for 1.3 s, holding
+        # ~2.6 m/s^2 while the required rate climbs through 5 and past 8.
+        # EMERGENCY (uncapped) only arms below a 1 m gap, by which point
+        # 32.6 km/h of closing speed is left. Impact at 29.0 km/h.
+        # Five of twelve runs in that block ended the same way.
+        #
+        # So the cap converted "late detection" into "collision" rather
+        # than into "hard stop". Uncapping cannot create sight distance,
+        # but it lets the vehicle spend what it has: the same run needs
+        # ~4.5 m/s^2 from the 30 m acquisition, which is inside both the
+        # tyres and R171 and was simply not commandable before.
+        #
+        # This DOES mean ACC can now command more than 5 m/s^2 when the
+        # geometry demands it, so an R171 deceleration-limit breach is now
+        # reachable through this branch instead of being structurally
+        # impossible. That is the intended trade for now — stopping beats
+        # a compliant collision — and bounding it belongs in the PROFILE
+        # (a_profile / DECEL_LIMIT), which is where deceleration is
+        # actually designed, not in a brake clamp. See DEBUG §65.
+        self.ACC_BRAKE_CAP = 1.0
         # Speed below which the vehicle is closing the last metres rather
         # than driving, and the set-speed throttle cap is lifted so it can
         # actually launch. See speed_control.
@@ -1205,19 +1225,29 @@ class ACCNode(Node):
         # Latch the hold only once the vehicle is actually AT the standstill
         # gap, not merely somewhere inside it.
         #
-        # This window was d0 + 2.0 = 4.0 m, which is why runs kept finishing
-        # at 3.4-3.5 m with d0 set to 2.0: CARLA snaps a vehicle's velocity
-        # to zero from ~6 km/h (§50.7), and wherever that snap caught the
-        # car, a 4 m window accepted it and stopped controlling. The gap the
-        # vehicle ended at was set by the sim's standstill behaviour, not by
-        # d0 — d0 itself was never wrong.
+        # This window was d0 + 2.0 = 4.0 m, then d0 + 0.5. Both stopped the
+        # vehicle EARLY: whatever gap the car happened to be at when the
+        # window admitted it became the final gap, because latching ends
+        # control. CARLA snaps velocity to zero from ~6 km/h (§50.7), so
+        # the snap plus a window is what set the resting gap — not d0.
+        # Measured with the 0.5 window: A_t04_r199_v30_off0_ttc6 latched on
+        # a tracked gap of 2.36 m and stopped with 3.55 m of real gap left.
         #
-        # STANDSTILL_WINDOW is the tolerance on d0. Outside it the governor
-        # keeps control and closes in: v_ref = sqrt(2a(gap - d0)) is ~7 km/h
-        # at 3.5 m and reaches zero exactly at d0, so the last metre is the
-        # profile doing its ordinary job.
+        # STANDSTILL_WINDOW is now 0.0, so the hold latches AT d0 and the
+        # governor keeps control right down to it: v_ref = sqrt(2a(gap-d0))
+        # is ~7 km/h at 3.5 m and reaches zero exactly at d0, so the last
+        # metre is the profile doing its ordinary job rather than a
+        # separate early stop taking over. The hold itself is kept — it
+        # exists to stop the derivative term chasing estimator noise at
+        # rest — it just no longer fires before the car has arrived.
+        #
+        # NOTE this closes the last metre against the TRACKED gap, which on
+        # these runs reads ~1.2 m short of truth at close range (IPM
+        # under-reads as the bb clips). Resting gap is therefore still set
+        # by estimator bias, now in the conservative direction. That is a
+        # perception problem and is deliberately not papered over here.
         if (self.v_ego < 0.5 and self.d_lead is not None
-                and self.d_lead < self.d0 + self.STANDSTILL_WINDOW):
+                and self.d_lead <= self.d0 + self.STANDSTILL_WINDOW):
             control_msg.linear.y = 0.05  # light hold brake
             self.cruise_integral = 0.0
             self.prev_acc_brake = 0.0
