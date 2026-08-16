@@ -29,4 +29,11 @@ src/perception/models/UFLD_F1=0.67.pth:Zone.Identifier
 .gitignore
 src/perception/models/RLD_best.pth:Zone.Identifier
 
-scenarios/results
+# Scenario run output: traces, summaries and figures are regenerable and
+# large, so they stay out. The PLOTTING SCRIPTS live in the same directory
+# and are source — a bare `scenarios/results` swept them up too, which is
+# how commit cbd3179 ("R79 results") shipped the harness and the controller
+# changes but none of the code that draws the R79 figures.
+scenarios/results/*
+!scenarios/results/*.py
+
