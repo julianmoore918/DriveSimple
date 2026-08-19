@@ -339,7 +339,14 @@ class ACCNode(Node):
         # that speed_error stays large). Hard-cap MORAI's cruise throttle
         # well below full send regardless of what the gain computes;
         # CARLA keeps its original 1.0 ceiling.
-        self.cruise_throttle_cap = 0.8 if simulator == 'morai' else 1.0
+        # Lowered 0.8 -> 0.2 (2026-08-15): at 0.8 the loop settled around
+        # ~0.525 throttle and the ego kept accelerating past set speed,
+        # since MORAI speed feedback is too noisy for the integrator to
+        # ever catch it. 0.2 bounds the open-loop authority instead.
+        # Raised 0.2 -> 0.3 same day: 0.2 saturated at the cap (MORAI
+        # reported throttle 0.200000 continuously) without overcoming
+        # standstill drag, so the ego never pulled away.
+        self.cruise_throttle_cap = 0.3 if simulator == 'morai' else 1.0
         self.a_max             = 3.0       # [m/s²]
         # Emergency threshold is now a bumper gap, not a camera distance.
         # IPM also saturates near gap ≤ 2 m (bb-bottom clips at frame

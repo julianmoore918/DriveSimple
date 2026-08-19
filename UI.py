@@ -36,6 +36,40 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, scrolledtext
 
+ROS_SETUP     = '/opt/ros/humble/setup.bash'
+
+
+def _reexec_under_ros() -> None:
+    """Re-exec self under a ROS-sourced shell if rclpy isn't importable.
+
+    Launching the UI from a shell that never sourced ROS leaves the camera
+    and telemetry panes dead. Patching sys.path here would not help:
+    rclpy's C extension dlopens librcl*.so, and the dynamic linker reads
+    LD_LIBRARY_PATH once at interpreter start, so it has to be set before
+    we exist. Re-exec is the only in-process fix.
+
+    The env flag makes this a one-shot: if rclpy is still missing after
+    sourcing (broken install, wrong distro), we fall through to the
+    CAMERA_AVAILABLE=False path instead of exec-looping forever.
+    """
+    if os.environ.get('ADAS_UI_ROS_BOOTSTRAP') == '1':
+        return
+    if not os.path.exists(ROS_SETUP):
+        return
+    try:
+        import rclpy  # noqa: F401
+        return                      # already sourced — nothing to do
+    except ImportError:
+        pass
+    os.environ['ADAS_UI_ROS_BOOTSTRAP'] = '1'
+    script = os.path.abspath(__file__)
+    cmd = (f'source {shlex.quote(ROS_SETUP)} && '
+           f'exec {shlex.quote(sys.executable)} {shlex.quote(script)} "$@"')
+    os.execvp('bash', ['bash', '-c', cmd, 'bash', *sys.argv[1:]])
+
+
+_reexec_under_ros()
+
 try:
     import cv2
     import numpy as np
@@ -133,7 +167,7 @@ CURVE_AY_CEILING = 3.0
 # R79 §3.2's default declaration; see r79_lka_validation --declared-ay.
 LKA_DECLARED_AY_DEFAULT = '60:1.5,100:3.0,130:3.0'
 START_ADAS_SH  = ADAS_WK / 'start_adas.sh'
-ROS_SETUP     = '/opt/ros/humble/setup.bash'
+# ROS_SETUP is defined above the rclpy import — _reexec_under_ros needs it.
 
 CAMERA_TOPIC       = '/Car_1/camera/front/compressed'
 ACC_DEBUG_TOPIC    = '/ACC/perception/debug_image'
@@ -671,7 +705,8 @@ class ADASUI:
         # no effect on CARLA (carlaaccsim bridge doesn't read this).
         self.dry_run_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(procs, text='Dry run (no vehicle commands)',
-                        variable=self.dry_run_var).grid(
+                        variable=self.dry_run_var,
+                        command=self._push_dry_run).grid(
             row=7, column=0, columnspan=2, sticky='w', pady=(0, 4))
         ttk.Button(procs, text='Run start_adas.sh', command=self.run_start_adas).grid(
             row=8, column=0, columnspan=2, sticky='ew', pady=2)
@@ -1851,6 +1886,25 @@ class ADASUI:
                                      capture_output=True, text=True)
             pids += [p for p in result.stdout.split() if p]
         return pids
+
+    def _push_dry_run(self):
+        """Apply the Dry Run checkbox to an already-running control adapter.
+
+        The checkbox is only read when the bridge is launched, and
+        start_morai_bridge refuses to start a second adapter over a live
+        one -- so without this the box silently did nothing whenever the
+        bridge was already up (the common case, since start_adas.sh
+        brings it up too). control_adapter_node reads the parameter live
+        in _publish(), so setting it here takes effect on the next frame.
+        No-op when the node isn't running; the launch-time -p flag covers
+        that case.
+        """
+        val = 'true' if self.dry_run_var.get() else 'false'
+        self._popen(['ros2', 'param', 'set', '/Morai_Control_Adapter',
+                     'dry_run', val],
+                    cwd=str(ADAS_WK), source_ros=True, source_workspace=True,
+                    prefix='dry-run')
+        self._log(f'[ui] dry_run -> {val} (live; also applied at next bridge start)')
 
     def start_morai_bridge(self):
         if any(p.poll() is None for p in self.morai_bridge_procs):

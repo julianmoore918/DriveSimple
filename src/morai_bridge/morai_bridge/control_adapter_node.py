@@ -119,7 +119,11 @@ class MoraiControlAdapter(Node):
         self._publish()
 
     def _publish(self):
-        if self.dry_run:
+        # Read live rather than using the __init__ snapshot: the UI's Dry
+        # Run checkbox is toggled while this node is already spinning, and
+        # it refuses to restart an adapter that is already up. Caching the
+        # value here made the checkbox a no-op for the whole session.
+        if bool(self.get_parameter('dry_run').value):
             return
         out = VehicleManualControl()
         out.throttle = float(self._throttle) * self.throttle_scale

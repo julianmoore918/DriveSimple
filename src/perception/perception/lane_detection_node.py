@@ -705,7 +705,26 @@ class LaneDetectionNode(Node):
         if (self.frame_count - 1) % self.skip_n != 0:
             return
         arr = np.frombuffer(msg.data, np.uint8)
-        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        # MORAI intermittently publishes a CompressedImage with an empty
+        # data buffer (seen at low sim FPS, where the camera topic drops
+        # to 1-3 Hz). cv2.imdecode does NOT return None for that -- it
+        # raises cv2.error("!buf.empty()"), which escapes the callback,
+        # propagates out of rclpy.spin, and kills the node with exit 1.
+        # That is what repeatedly took LKAS down mid-run. Drop the frame
+        # and keep spinning; the next good frame recovers on its own.
+        if arr.size == 0:
+            self.get_logger().warn(
+                f'empty camera frame on {self.cam_topic} — skipping',
+                throttle_duration_sec=5.0)
+            return
+        try:
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        except cv2.error as e:
+            self.get_logger().warn(
+                f'undecodable camera frame ({len(msg.data)} bytes) on '
+                f'{self.cam_topic}: {e} — skipping',
+                throttle_duration_sec=5.0)
+            return
         if bgr is None:
             return
         if self.frame_count == 1:
