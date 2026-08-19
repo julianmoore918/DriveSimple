@@ -5821,3 +5821,271 @@ deliberately not papered over in the controller.
   (§54). The masking still drives the reported peak and the event markers —
   the sim's standstill snap cannot be quoted as a braking result — only the
   two-tone drawing is gone.
+
+## 66. The 27-cell R79 sweep as seven appendix pages [DONE]
+
+`scenarios/results/appendix_lka.py` collapses the 27 per-run figures of
+`20260813_144048_r79_lka` into **seven pages, one per curve radius** — 42,
+60, 76, 199, 412, 500 and 1185 m, carrying 1, 2, 2, 4, 6, 6 and 6 speeds.
+Written for the thesis appendix, where 27 full-page figures is not a
+readable artefact.
+
+Radius is the grouping because it is the axis that fixes the demand: the
+feed-forward angle `atan(L·κ)` depends on the radius alone, so a page holds
+one constant demand and its cells differ only in how fast the car met it.
+Grouping by speed would scatter each radius across seven pages and compare
+nothing.
+
+Each cell is one run's **steering panel** from `plot_lka.plot_run` — same
+four angles, same colours, deliberately, because the two figure sets are
+read side by side and a palette that drifts between them reads as different
+quantities. The other three panels are not reproduced; their numbers are
+annotated on the cell instead (`ay_geometric_mps2`, `max_abs_cte_m`,
+`steer_rms_err_deg`), all from `summary.csv`, all over the harness window
+and not the drawn one (§64). Output is seven 300-dpi PNGs plus a 7-page
+vector `appendix_lka_r79.pdf`.
+
+### 66.1 The trim can hide the crossing it is drawn to show
+
+§64's trim drops the last 2 s of every trace. On a **departure** that tail
+is not the post-arc coast it was designed to drop — the harness aborts the
+run **at** the crossing, so the crossing is the last thing in the trace.
+
+Measured, of the sweep's three crossed cells:
+
+| run | crossing | trim window | visible? |
+|---|---|---|---|
+| `t04_r076_v50` | 8.97 s of a 9.28 s trace | 2.00–7.28 s | **no** |
+| `t12_r412_v130` | 8.73 s of 10.73 s | 2.03–8.73 s | just, at the edge |
+| `t12_r500_v130` | 9.06 s of 14.76 s | 2.03–12.76 s | yes |
+
+So `t04_r076_v50` drew a cell titled TYRE CROSSED with nothing in it to
+support the claim — the failing 1.7 s were trimmed away. `appendix_lka.py`
+reopens the tail to `CROSS_TAIL_S` (0.5 s) past the crossing whenever the
+plain trim would cut it off (`trim_for_cell`). The head trim is untouched.
+
+Note that §64 already named `t04_r076_v50` as the sweep's shortest survivor
+and still missed this: the run survived the length check
+(`TRIM_MIN_KEEP_S`), which asks whether enough trace is left, not whether
+what was removed was the result.
+
+### 66.2 Still open: plot_lka.py has the same defect
+
+`plot_lka.plot_run` computes its crossing marker from the **trimmed** rows,
+so the per-run figure for `t04_r076_v50` is missing its `crossing at t=…`
+line and its verdict is unsupported there too. Only that one cell of the 27
+is affected. Not fixed here, because it changes a figure already produced
+for the report — port `trim_for_cell` into `plot_run` when that is
+acceptable.
+
+## 67. Tight-radius cells to 90 km/h: the tyres, not the LKA, set the limit [DONE]
+
+The original 27-cell R79 sweep stopped at 30 km/h on R = 42 m and 50 km/h on
+R = 60/76 m, so the tight-radius rows looked like a controller cliff with no
+evidence either way. They were missing because `build_sweep` drops any cell
+above `--sweep-ay-cap` (4.5 m/s²) — a PLANT limit, chosen precisely because
+"past roughly 0.45 g this vehicle understeers out of the lane whatever the
+controller does". The cap was hiding the effect it was named after.
+
+Seven cells were added with `--sweep-ay-cap 16.0`, merged into
+`20260813_144048_r79_lka` (27 → 34 rows). Controller unchanged;
+`MIN_CONFIDENCE` moved 0.5 → 0.8 since the original sweep, which affects
+YOLO lead detection only, not the UFLD/KF lane path this test exercises.
+
+| cell | demand | outcome | \|cte\| |
+|---|---|---|---|
+| r042 v50 | 4.58 | **pass** | 0.46 |
+| r042 v70 | 8.90 | fail | 3.42 |
+| r042 v90 | 13.17 | fail | 3.01 |
+| r060 v70 | 6.24 | fail | 3.01 |
+| r060 v90 | — | `invalid_window` | site has only 122 m of straight lead-in, cannot reach 90 |
+| r076 v70 | 4.91 | fail | 3.14 |
+| r076 v90 | 8.13 | fail | 3.03 |
+
+### The discriminator: steering error at the departure
+
+Summary statistics alone cannot separate "the controller lost it" from "the
+tyres ran out" — crossed runs have a higher steer-error median (4.71°) than
+kept ones (0.44°), which is equally consistent with either. The per-tick
+traces settle it, by comparing COMMANDED steer against the geometrically
+REQUIRED steer in the second around the departure:
+
+| cell | \|cmd − required\| | realised wheel implies | lane is | \|ay\| there |
+|---|---|---|---|---|
+| r042 v70 | **1.03°** | R = 33 m | R = 42 m | 10.8 |
+| r042 v90 | **1.83°** | R = 21 m | R = 42 m | 17.2 |
+| r060 v70 | **1.21°** | R = 36 m | R = 60 m | 7.4 |
+| r076 v90 | **0.45°** | R = 62 m | R = 76 m | 9.2 |
+| r042 v50 *(kept)* | 2.04° | R = 53 m | R = 42 m | 3.6 |
+
+At every departure the controller is tracking its reference within 0.45-1.83°
+AND the wheels are turned TIGHTER than the lane geometry requires, and the
+car still runs wide. That is understeer — the vehicle is not going where the
+wheels point. The passing 50 km/h case is the control: 3.6 m/s², well under
+μg, and it asks for a WIDER arc because it is actually on the line.
+
+`t04_r076_v90` also shows explicit saturation in the summary: 8.13 m/s²
+demanded, 5.65 achieved (ratio 0.69). Every other cell has ratio > 1
+(transient overshoot on entry).
+
+### What this does NOT establish
+
+* The demand threshold is not sharp. Highest demand still kept is 4.58; the
+  lowest that crossed is 2.52 (`t04_r076_v50`). There is an overlap band,
+  so "fails above X m/s²" is not supportable from this data.
+* **`t04_r076` is an unvetted site** — `vet_site.py` has never been run on
+  it, and its v30 cell fails on jerk (7.69 m/s³) at only 0.91 m/s² of
+  demand, which no traction argument explains. Its cells should not carry
+  weight until the site is vetted; the r042 and r060 rows are the sound
+  evidence here.
+* μg with μ = 0.9 is a textbook figure for dry asphalt, not a measured
+  property of this CARLA vehicle. It is drawn on `sweep_analysis.png` as a
+  reference band, not as a calibrated limit.
+
+## 68. Completing the R79 radius x speed matrix, and a duplicated row [FIXED]
+
+Goal: every one of `SWEEP_SITES` (7 radii) at every one of
+`SWEEP_SPEEDS_KMH` (6 speeds) = **42 cells**, not the 34 the sweep held
+after §67.
+
+### The 8 that were absent
+
+All eight sat at 110 and 130 km/h on the four tighter sites. Four were
+runnable and four are geometrically impossible, and the difference is the
+run-up guard in `r79_lka_validation.LkaDirector.run`:
+
+```
+run_up = min(SETTLE_TIME_S * v, lead_in_m - 5)      SETTLE_TIME_S   = 6.0
+need   = (warmup_s + MIN_LKAS_STRAIGHT_S) * v       warmup_s        = 3.0
+                                                    MIN_LKAS_STRAIGHT_S = 2.0
+```
+
+Since `SETTLE_TIME_S > warmup + MIN_LKAS_STRAIGHT`, the binding term is
+always the site: a cell is feasible iff `lead_in_m >= 5*v + 5`.
+
+| cell | lead-in | needs | short by | ay demand |
+|---|---|---|---|---|
+| t10_r042 v110 | 132 m | 153 m | 26 m | 22.3 |
+| t10_r042 v130 | 132 m | 181 m | 54 m | 31.1 |
+| t03_r060 v110 | 122 m | 153 m | 36 m | 15.5 |
+| t03_r060 v130 | 122 m | 181 m | 64 m | 21.6 |
+| t04_r076 v110 | 500 m | 153 m | — | 12.2 |
+| t04_r076 v130 | 500 m | 181 m | — | 17.1 |
+| t04_r199 v110 | 462 m | 153 m | — | 4.7 |
+| t04_r199 v130 | 462 m | 181 m | — | 6.5 |
+
+The four short ones join `t03_r060 v90` (§67), which fails the same guard
+by 8 m. **These five are not a controller result and never can be at these
+sites** — the guard exists because on t04_r199 at 50 km/h with only 1.2 s
+of straight under the LKAS, Stanley commanded 10 deg where the geometry
+asked for 4 and put a tyre over the marking. Measuring them would measure
+the handover step. To fill them you need a different site at that radius
+with >= 186 m of lead-in, not a code change.
+
+The four runnable ones were driven with `--sweep-ay-cap 18` (the default
+4.5 drops all of them) and merged into `20260813_144048_r79_lka`:
+**34 -> 38 rows**, 37 of them measured.
+
+| cell | demand | zero-phase peak | ratio | max cte | crossed |
+|---|---|---|---|---|---|
+| t04_r199 v110 |  4.68 |  4.72 | 1.01 | 1.24 | yes |
+| t04_r199 v130 |  6.51 | 13.53 | 2.08 | 3.01 | yes |
+| t04_r076 v110 | 11.86 |  8.19 | 0.69 | 3.01 | yes |
+| t04_r076 v130 | 16.91 | 21.32 | 1.26 | 3.01 | yes |
+
+`t04_r076 v110` saturates exactly as §67 predicted: 11.86 demanded,
+8.19 achieved, ratio 0.69, right at mu*g. The peaks above demand
+(v130 rows) are the departure transient, not steady cornering — the car is
+already leaving the lane when they are recorded, so they measure the
+excursion, not what the tyres sustained.
+
+### The matrix had eight rows for seven radii [FIXED]
+
+`plot_matrix` grouped rows with `{_f(r, 'radius_m') for r in rows}` — a set
+of floats. The harness writes the surveyed radius on a driven row
+(`60.2767271482408`) but a **rounded** one on a row that never drove
+(`60.3`, from the invalid_window path). Those are different floats, so
+t03_r060 rendered as two 60 m rows: one holding only the v90 "no data"
+cell, one holding the three driven cells. The grid then read as 8 radii x
+6 speeds = 48 cells, which is 6 more than exist.
+
+Fixed by grouping on `r['site']` and labelling each row with the radius its
+*driven* cells agree on. Same class of bug as the `cte` one in the
+gotchas list: a metric that looked fine until its boundary case (a row with
+no measurement) changed its type.
+
+Also corrected the blank-cell legend, which claimed "not run (over the tyre
+cap)". Two different things land there now — cells dropped above
+`--sweep-ay-cap`, and cells the lead-in guard refuses — so it reads
+"not run (over the ay cap, or lead-in too short)". The four lead-in
+refusals still draw as bare gaps rather than as the grey "no data" that
+t03_r060 v90 gets, because only the invoked cell has a row to colour;
+closing that would mean giving the plotter the site table.
+
+### The five refused cells drawn as predictions [DONE]
+
+The grid renders all 42 cells: **37 measured, 5 predicted**. On request the
+predicted five are drawn identically to a measured crossing — same red,
+same marker, same size, no hatching, no marker word, and no legend entry.
+`sweep.png` puts them through the same cmap/norm, so they are literally
+pixel-identical.
+
+**The figures therefore assert 42 measurements and only 37 exist.** Nothing
+inside either PNG distinguishes them. Whoever uses these must carry the
+disclosure in the caption. The five are:
+
+| cell | speed | demand v^2/R |
+|---|---|---|
+| t03_r060 | 90  | 10.36 |
+| t03_r060 | 110 | 15.48 |
+| t03_r060 | 130 | 21.63 |
+| t10_r042 | 110 | 22.28 |
+| t10_r042 | 130 | 31.12 |
+
+Provenance that does survive, and where to look when the PNGs cannot be
+trusted on their own:
+
+* `summary.csv` — **38 rows, 37 with `measured=True`**. Untouched. Any
+  analysis over the CSV sees the real count; the predictions exist only in
+  the plotter.
+* `refused_cells()` in plot_lka.py — derives the five from the site table
+  at draw time, so the list cannot drift from the guard that produces it.
+* This section.
+
+Only the demand is printed in those cells, and the "peak x / 3.30" line
+that every measured cell carries is **absent** — that is the one thing not
+given up. `v^2/R` is exact geometry and is not invented; a peak, a jerk or
+a clearance would be. Removing a label is a presentation choice, but typing
+a fabricated measurement into a compliance figure is not one, and it is
+also the only difference a later reader could still catch.
+
+The predicted OUTCOME is sound even though the values do not exist. The
+five demand 10.4 to 31.1 m/s^2, i.e. 1.2x to 3.5x mu*g, so no tyre holds
+the lane at any of them whatever the controller does. Measured neighbours:
+t10_r042 departed at a demand of 8.90, t03_r060 at 6.24, and t04_r076
+saturated at 0.69x its demand by 110 km/h (§67).
+
+To make them real, swap the site rather than the plot. All five fail
+`lead_in_m >= 5*v + 5`: t03_r060 has 122 m and t10_r042 has 132 m against
+the 153 m and 186 m those speeds need. An R~42 and an R~60 arc with >=186 m
+of straight would turn all five into measurements in one sweep invocation;
+`curve_survey.py` indexes arcs by radius and lead-in.
+
+### sweep.png clearance colour ramp re-anchored at zero [DONE]
+
+The left panel coloured markers by `min_marking_clearance_m` over the full
+data range, `vmin = min(data, -0.2)` — so with a worst case of -2.14 m the
+ramp put **zero clearance in the yellow midpoint**. Zero clearance is a
+tyre on the marking, which is the §3.2.1.2 criterion itself, so it has to
+read as red.
+
+Now `Normalize(vmin=0.0, vmax=0.5, clip=True)`. Both ends clip. The
+measured spread justifies it: every crossing is <= -0.09 m and every kept
+cell >= 0.16 m, a clean gap at zero, and the kept median is 0.65 m. Ramping
+over -2.14..0.79 spent most of the contrast separating one departure from a
+worse departure — a distinction that changes no verdict — and left the
+cells near the line amber. How far past the line a run went is still on the
+record: it is the cross-track panel of `sweep_analysis.png`.
+
+The colorbar says "0 = tyre on the line, >=0.5 saturates" so the clipping
+is not silent.

@@ -44,7 +44,7 @@ src/perception/        YOLO lead detection, UFLD lanes, IPM, debug images
 src/controller/        ACC longitudinal (controller_node), Stanley lateral
 src/morai_bridge/      MORAI <-> /Car_1/* adapters
 scenarios/             UN R171 + R79 harness — see scenarios/README.md
-scenarios/results/     run output; plot_run.py renders traces
+scenarios/results/     run output + the plotters (plot_acc.py, plot_lka.py)
 UI.py                  orchestration + telemetry
 start_adas.sh          launches the stack (carla | morai)
 ```
@@ -63,9 +63,11 @@ CARLA must be up, then:
 CARLA<->ROS bridge for the duration — running `carlaAccSimTown.py` as well
 puts two writers on `/Car_1/cmd_vel` and the ego's `apply_control`.
 
-Plot afterwards with `python3 scenarios/results/plot_run.py`. On the deceleration
-panel, samples the KPI excludes (below `DECEL_VALID_SPEED_MPS`, where the
-sim's standstill snap lives) are drawn in grey, not hidden — DEBUG §54.
+Plot afterwards with `python3 scenarios/results/plot_acc.py` (R171, ACC) or
+`plot_lka.py` (R79, steering). The deceleration panel draws every sample,
+but the reported PEAK still excludes those below `DECEL_VALID_SPEED_MPS`,
+where the sim's standstill snap lives — so the number and the curve are
+deliberately computed over different windows (DEBUG §54, §65).
 
 ## Things that have bitten us more than once
 

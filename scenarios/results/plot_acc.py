@@ -149,6 +149,46 @@ def lateral_accel(rows, ts):
     return out
 
 
+# Below this the v*psi_dot estimate is dominated by heading noise: psi_dot
+# is a path-tangent difference, and a nearly stationary car has no reliable
+# tangent. Same threshold and same reasoning as DECEL_VALID_SPEED_MPS.
+AY_VALID_SPEED_MPS = 2.0
+
+
+def peak_ay(rows, ts, ay):
+    """Largest lateral acceleration that describes DRIVING, not the crash.
+
+    `lateral_accel` is v*psi_dot off the logged path, which is honest right
+    up until the vehicle hits something: contact swings the path tangent
+    violently and the estimate explodes. Measured on
+    A_t12_r412_v110_off0_ttc6 the raw peak is 18.36 m/s^2 — at a gap of
+    0.14 m and 12.8 km/h, i.e. the impact — while the largest value the car
+    actually cornered at is 2.09. Reporting 18.36 against a 3.3 ceiling
+    would be a lateral-acceleration breach that never happened, and it
+    would mask the real result (comfortably inside).
+
+    So: everything from CLOSEST APPROACH onward is dropped, and slow
+    samples are dropped too. Returns None when nothing valid is left,
+    which callers must render as "not measured" rather than as zero.
+
+    Closest approach rather than a `gap <= 0` test, because the deflection
+    starts on contact and not when the logged gap finally changes sign —
+    on that same run the 18.36 peak lands at gap = 0.14 m, so a
+    sign-change cutoff lets it straight through. argmin needs no threshold
+    and is right for a clean stop too: the car is at rest by then, so
+    nothing is lost.
+    """
+    if not ay:
+        return None
+    n = min(len(ay), len(rows), len(ts))
+    gaps = [(_f(rows[i], 'gap_gt_m'), i) for i in range(n)]
+    gaps = [(g, i) for g, i in gaps if g is not None]
+    end = min(gaps)[1] if gaps else n
+    vals = [ay[i] for i in range(end)
+            if _f(rows[i], 'v_kmh', 0.0) / 3.6 > AY_VALID_SPEED_MPS]
+    return max(vals) if vals else None
+
+
 def lane_kept(rows):
     """(kept, worst |cte|) against R79's tyre-on-the-marking criterion.
 
@@ -511,8 +551,9 @@ def plot_run(csv_path, show=False):
         if kept is not None:
             bits.append(f'lane {"KEPT" if kept else "CROSSED"}'
                         f' (|cte| {worst_cte:.2f} m)')
-        if ay:
-            bits.append(f'peak ay {max(ay):.2f} m/s²')
+        pk_ay = peak_ay(rows, ts, ay)
+        if pk_ay is not None:
+            bits.append(f'peak ay {pk_ay:.2f} m/s²')
         if bits:
             fig.text(0.01, 0.995, '   |   '.join(bits), fontsize=9,
                      va='top', color='#333')
@@ -568,9 +609,20 @@ def plot_matrix(results_root, show=False):
     a2.set_xlabel('approach speed (km/h)')
     a2.set_ylabel('min gap (m)')
     a2.set_title('Closest approach vs speed', loc='left', fontweight='bold')
+    # Tick the speeds actually driven rather than whatever round numbers
+    # matplotlib picks. This axis is a set of test points, not a continuum,
+    # and a tick at 40 or 120 invites reading a cell that was never run.
+    # Taken from the data so a block flown at other speeds still labels
+    # itself correctly.
+    speeds = sorted({r[0] for r in runs})
     for ax in (a1, a2):
         ax.grid(alpha=0.25)
         ax.legend(fontsize=8)
+        if speeds:
+            ax.set_xticks(speeds)
+            ax.set_xticklabels([f'{v:g}' for v in speeds])
+            pad = (max(speeds) - min(speeds)) * 0.06 or 5.0
+            ax.set_xlim(min(speeds) - pad, max(speeds) + pad)
     fig.tight_layout()
     out = os.path.join(results_root, 'matrix_summary.png')
     fig.savefig(out, dpi=130)

@@ -340,6 +340,27 @@ outcome rather than the controller.
 > @ 130, t04_r199 @ 90, t03_r060 @ 50); they characterise the controller
 > but are **not** compliance evidence. Use `--sweep-ay-cap 3.3` for a grid
 > containing only cells R79 would actually ask for. DEBUG §63.
+>
+> Conversely, `--sweep-ay-cap 16` lifts it far enough to drive the
+> tight-radius cells the default hides. That is how the R = 42/60/76 m
+> rows to 90 km/h were added: past mu*g (~8.8 m/s^2 on dry asphalt) the
+> vehicle understeers out of the lane whatever the controller does, and
+> `sweep_analysis.png` now draws that band so a reader can tell a tyre
+> limit from an LKA failure. DEBUG §67.
+>
+> The full grid is 7 sites x 6 speeds = 42 cells, of which 37 can be
+> measured. Five cannot, at any cap: `t03_r060` v90/v110/v130 and
+> `t10_r042` v110/v130 fail the run-up guard, which needs
+> `lead_in_m >= 5*v + 5` so the LKAS gets its warm-up plus 2 s of straight
+> before the arc. Filling those needs a site of the same radius with a
+> longer lead-in, not a flag. DEBUG §68.
+>
+> Those five ARE drawn on `sweep.png` and `sweep_matrix.png`, styled
+> identically to measured crossings and with no marker in the figure — so
+> **both PNGs show 42 cells where only 37 were measured, and any caption
+> using them has to say so.** They carry the exact `v^2/R` demand and no
+> invented peak, jerk or clearance. `summary.csv` is the authority: 38
+> rows, 37 with `measured=True`. DEBUG §68 lists the five.
 
 ```bash
 python3 scenarios/r79_lka_validation.py --sweep --list      # the grid
@@ -438,6 +459,32 @@ window only: every statistic annotated on the panels comes from
 move a reported number, and the time axis states which window is drawn so
 the two are not confused. A run too short to survive the cut is drawn
 whole and says so. `--export-steering` is **not** trimmed.
+
+### The sweep as seven appendix pages
+
+27 per-run figures is not a readable appendix. `appendix_lka.py` merges
+them into **one page per curve radius** — seven pages for the 27-cell
+sweep — as a 3-wide grid, one cell per speed:
+
+```bash
+python3 scenarios/results/appendix_lka.py                    # newest R79 run
+python3 scenarios/results/appendix_lka.py 20260813_144048_r79_lka
+python3 scenarios/results/appendix_lka.py --no-sharey        # per-cell y scaling
+python3 scenarios/results/appendix_lka.py --trim-s 0         # whole runs
+```
+
+Writes `appendix_lka_r79_R0042.png` … `_R1185.png` plus a 7-page vector
+`appendix_lka_r79.pdf` into the run directory. Each cell is `plot_lka.py`'s
+steering panel, unchanged in colour and meaning, with that run's `ay`,
+`max|cte|` and steering rms annotated from `summary.csv`. Radius is the
+grouping because `atan(L·κ)` depends on the radius alone, so a page holds
+one constant lane demand and the cells differ only in speed.
+
+Page width is constant and only the height varies with the row count, so
+`\includegraphics[width=\textwidth]` scales every page by the same factor.
+The 2 s tail trim is **reopened past a crossing** when it would otherwise
+cut one off — a departure aborts the run at the crossing, so on exactly
+the failing cells the last 2 s are the result (DEBUG §66.1).
 
 `--export-steering` writes just the comparison — time, phase, who was
 steering, speed, the lane's radius and curvature, the four angles and the

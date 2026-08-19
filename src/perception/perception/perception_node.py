@@ -36,7 +36,7 @@ from ament_index_python.packages import get_package_share_directory
 # is empty (UFLD warm-up or the bridge has paused inference inside a
 # junction zone).
 USE_LANE_ROI        = True
-MIN_CONFIDENCE      = 0.5     # detections below this are ignored.
+MIN_CONFIDENCE      = 0.8     # detections below this are ignored.
 # Was 0.1 — far too permissive: weak YOLO boxes on buildings / poles /
 # foliage at ~0.3-0.5 confidence were slipping through the lane-ROI
 # filter (when the UFLD polylines either didn't reach the false bb's
@@ -81,7 +81,7 @@ LANE_FALLBACK_HALF_W = 1.5
 # 5 m/s^2 ceiling, and the cap was holding first detection at ~34 m.
 # 70 km/h passes at 80 m. The controller tolerates the noisier far-range
 # estimate far better than it used to — the alpha-beta tracker smooths it
-# and the rate-limited speed reference means gap noise can no longer turn
+# and the rate-limited speed reference meaCheckns gap noise can no longer turn
 # into deceleration (see DEBUG §45).
 #
 # NOTE the parallel pinhole estimate on /ACC/lead_distance_pinhole measured
@@ -608,8 +608,21 @@ class YoloDetection(Node):
                     # fixed at Y=0 and only used when the measured
                     # centerline is unavailable.
                     y_lo, y_hi = sorted((left_g[1], right_g[1]))
-                    if (y_lo > LANE_FALLBACK_HALF_W
-                            or y_hi < -LANE_FALLBACK_HALF_W):
+                    # CENTRE, not overlap. This used to accept any footprint
+                    # that merely touched the corridor:
+                    #     if y_lo > HALF_W or y_hi < -HALF_W: continue
+                    # A parked or oncoming car whose near edge clips the
+                    # corridor edge was therefore selected as the lead, and
+                    # in town driving that is constant — the ACC braked for
+                    # cars beside the road. A vehicle is ~1.9 m wide, so a
+                    # kerbside car centred 2.4 m away spans [1.45, 3.35] and
+                    # got in on 5 cm of overlap.
+                    #
+                    # The corridor is 1.5 m each side, which already carries
+                    # a real lead offset (R171 tests to 1.0 m) plus margin,
+                    # so the CENTRE of the footprint is the honest test and
+                    # costs nothing for genuine in-lane leads.
+                    if abs(0.5 * (y_lo + y_hi)) > LANE_FALLBACK_HALF_W:
                         continue
                 # The corridor fallback above now serves both simulators.
                 # MORAI reaches it constantly for a different reason —
@@ -643,6 +656,30 @@ class YoloDetection(Node):
             h_real = OBJECT_HEIGHTS.get(class_name, OBJECT_HEIGHT_DEFAULT)
             pinhole_m = max(MIN_PUBLISHED_GAP_M,
                             focal_px * h_real / bb_h_px - self.ego_extent_x)
+
+            # CUT: close-range pinhole substitution.
+            #
+            # The idea was sound — IPM projects the bb BOTTOM, so once that
+            # edge leaves the frame the projection under-reads — but the
+            # measurement said pinhole is WORSE there, not better. From
+            # results/20260816_144335_odd, stationary behind a lead, the
+            # published gap flip-flopped frame to frame as the box clipped
+            # and unclipped:
+            #
+            #     2.92 -> 0.56 -> 2.95 -> 0.10 -> 2.95 -> 0.66 -> ...
+            #
+            # IPM read ~2.95 m; pinhole read 0.10-0.76 m for the same
+            # instant. focal*H/bb_h assumes the box spans exactly H (1.5 m
+            # for a car); at a few metres the box covers considerably more
+            # than that, so the quotient collapses. That is worse than the
+            # error it replaced, and the 0.10 values tripped EMERGENCY full
+            # brake (measured at t=33.1 s).
+            #
+            # The close-range under-read is REAL and remains OPEN — it is
+            # why the vehicle stops around 4 m and then creeps in to d0 —
+            # but bb-height is not the estimator to fix it with. A blend
+            # needs something that degrades gracefully when the box clips,
+            # and neither of these two does. DEBUG §66.
 
             if min_distance is None or distance_m < min_distance:
                 best_pinhole = pinhole_m

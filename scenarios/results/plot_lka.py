@@ -75,6 +75,71 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 JERK_LIMIT = 5.0
 # R79 §5.6.2.1.3 Table 1 ceiling for M1/N1.
 AY_TABLE_MAX = 3.0
+# Lane geometry for the departure threshold. R79 §3.2.1.2 is about the
+# TYRE crossing the marking, so the vehicle CENTRE may only reach
+# LANE_HALF_W - TYRE_HALF_W. Same values as plot_acc.py, kept local rather
+# than imported so this script still runs standalone against a CSV.
+LANE_HALF_W = 1.75
+TYRE_HALF_W = 0.875
+# Peak lateral acceleration a vehicle can generate on dry asphalt, mu*g with
+# mu ~ 0.9. NOT a regulation — it is the plant's own ceiling, and cells that
+# demand more than this cannot be held by ANY controller. Drawn so a reader
+# can tell "the LKA failed" from "the tyres ran out", which is the whole
+# question the tight-radius rows were added to answer (DEBUG §67).
+TYRE_LIMIT_MPS2 = 0.9 * 9.81
+
+
+# --- cells the run-up guard refuses, drawn as PREDICTIONS ------------------
+# Five cells of the 7x6 grid cannot be measured at their site: the straight
+# lead-in is too short to give the LKAS its warm-up plus 2 s of straight
+# before the arc, so what you would record is the handover step, not the
+# controller (DEBUG §68).
+#
+# They are drawn so the grid reads as a complete grid, but they are NOT
+# measurements and must never be styled like one: hollow marker, dashed
+# edge, "pred" label, separate legend entry. Only the lateral DEMAND is
+# printed, because v^2/R is exact geometry — it is the one number here that
+# is not invented. Peak ay, jerk and marking clearance are deliberately
+# absent: predicting them would put fabricated test values into a figure
+# that is read as regulatory evidence.
+#
+# The predicted outcome is "crossed" and that prediction is safe: every one
+# of these demands 15.5-31.1 m/s^2, i.e. 1.8x to 3.5x mu*g, so no tyre could
+# hold the lane whatever the controller did.
+SETTLE_TIME_S, WARMUP_S, MIN_LKAS_STRAIGHT_S = 6.0, 3.0, 2.0
+
+
+def refused_cells(rows):
+    """Grid cells absent because the site's lead-in is too short.
+
+    Returns [(site, radius_m, speed_kmh, demand_mps2)]. Needs the site
+    table; if scenarios/ is not importable it returns nothing and the plots
+    simply show the gaps, which is the honest fallback.
+    """
+    try:
+        import sys
+        here = os.path.dirname(os.path.abspath(__file__))
+        sys.path.insert(0, os.path.dirname(here))
+        from curve_adapter import SITES
+    except Exception:
+        return []
+    sites = {r['site'] for r in rows}
+    speeds = sorted({round(_f(r, 'speed_kmh', 0)) for r in rows})
+    have = {(r['site'], round(_f(r, 'speed_kmh', 0))) for r in rows
+            if r.get('measured', 'True') == 'True'}
+    out = []
+    for name in sites:
+        site = SITES.get(name)
+        if site is None:
+            continue
+        for kmh in speeds:
+            if (name, kmh) in have:
+                continue
+            v = kmh / 3.6
+            run_up = min(SETTLE_TIME_S * v, site.lead_in_m - 5.0)
+            if run_up < (WARMUP_S + MIN_LKAS_STRAIGHT_S) * v:
+                out.append((name, site.radius_m, kmh, v * v / site.radius_m))
+    return out
 
 # Seconds trimmed off each end of a trace before plotting. Both edges are
 # harness artefacts rather than controller behaviour: the run opens with
@@ -378,9 +443,22 @@ def plot_sweep(run_dir, show=False):
     fig, (ax, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     clears = [_f(r, 'min_marking_clearance_m', 0.0) for r in rows]
-    lo, hi = min(clears + [0.0]), max(clears + [0.5])
-    cmap = matplotlib.cm.get_cmap('RdYlGn')
-    norm = matplotlib.colors.Normalize(vmin=min(lo, -0.2), vmax=max(hi, 0.6))
+    hi = max(clears + [0.5])
+    cmap = matplotlib.colormaps['RdYlGn']
+    # Anchor the red end at 0.0 — a clearance of zero IS a tyre on the
+    # marking, which is the §3.2.1.2 criterion, so it should read as fully
+    # red rather than as the yellow midpoint. Everything already over the
+    # line (negative clearance) clips to the same red; how far past does not
+    # change the verdict, and the cross-track panel carries that magnitude.
+    # Green saturates at 0.5 m. Measured spread is -2.14..0.79 with a
+    # clean gap at zero (every crossing <= -0.09, every kept >= 0.16),
+    # so a ramp over the full data range spends most of its contrast on
+    # distinctions that carry no verdict and leaves the interesting
+    # cells amber. Both ends clip; the magnitudes live in the
+    # cross-track panel of sweep_analysis.png.
+    CLEAR_FULL_M = 0.5
+    norm = matplotlib.colors.Normalize(vmin=0.0, vmax=CLEAR_FULL_M,
+                                       clip=True)
 
     for r in rows:
         v = _f(r, 'speed_kmh', 0.0)
@@ -392,6 +470,16 @@ def plot_sweep(run_dir, show=False):
         ax.annotate(f"{_f(r, 'ay_geometric_mps2', 0):.1f}", (v, rad),
                     fontsize=7, ha='center', va='center',
                     color='#222222' if kept else 'white', zorder=4)
+    # The five cells the lead-in guard refuses, as predictions — hollow and
+    # dashed so they can never be mistaken for a measured X (DEBUG §68).
+    pred = refused_cells(rows)
+    for _site, rad, kmh, demand in pred:
+        # Drawn through the same cmap/norm as a measured crossing, which
+        # clips to cmap(0.0), so these are pixel-identical to the real ones.
+        ax.scatter([kmh], [rad], s=240, marker='X', color=cmap(norm(0.0)),
+                   edgecolor='#333333', linewidth=0.8, zorder=3)
+        ax.annotate(f"{demand:.1f}", (kmh, rad), fontsize=7, ha='center',
+                    va='center', color='white', zorder=4)
     ax.set_xlabel('speed (km/h)')
     ax.set_ylabel('curve radius (m)')
     ax.set_yscale('log')
@@ -410,7 +498,7 @@ def plot_sweep(run_dir, show=False):
                  'label = lateral demand [m/s²], colour = closest approach '
                  'to the marking', loc='left', fontsize=10)
     fig.colorbar(matplotlib.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax,
-                 label='min clearance to marking (m)')
+                 label='min clearance to marking (m) — 0 = tyre on the line, \u22650.5 saturates')
     ax.grid(alpha=0.3, which='both')
 
     # Second panel: the same result against the one number that actually
@@ -460,6 +548,137 @@ def ay_ceiling(run_dir, declared_ay: float) -> float | None:
     return min(1.4 * declared_ay, table_max + 0.3)
 
 
+def plot_sweep_analysis(run_dir, show=False):
+    """The sweep against the one variable that orders it: lateral demand.
+
+    The matrix is a lookup table — it answers "what happened at R and v".
+    It cannot answer the question the sweep was run to settle: whether
+    failure is governed by the DEMAND v^2/R, or separately by radius and
+    speed. A 500 m curve at 130 km/h and a 199 m curve at 90 km/h ask for
+    almost the same 2.6 and 3.1 m/s^2; if demand is what matters they
+    should behave alike, and the grid cannot show that because they sit in
+    different rows AND different columns.
+
+    So each panel plots a measured quantity against demand, with its
+    regulated limit drawn. Points that collapse onto a curve are governed
+    by demand; points that scatter are not.
+    """
+    path = os.path.join(run_dir, 'summary.csv')
+    if not os.path.exists(path):
+        print(f'[plot] no summary.csv in {run_dir}')
+        return
+    rows = [r for r in load_rows(path)
+            if _f(r, 'radius_m') and r.get('measured', 'True') == 'True']
+    if not rows:
+        print('[plot] nothing measured in summary.csv')
+        return
+    ceil = ay_ceiling(run_dir, _f(rows[0], 'ay_max_declared_mps2', 3.0)) or 3.3
+
+    KEPT, CROSSED = '#2e9e4f', '#c0392b'
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    dem = [_f(r, 'ay_geometric_mps2', 0.0) for r in rows]
+    kept = [r.get('kept_lane') == 'True' for r in rows]
+
+    def scatter(ax, ys, ylabel, limit=None, limit_label=''):
+        for k, mk, lab in ((True, 'o', 'lane kept'),
+                           (False, 'X', 'tyre crossed')):
+            xs = [d for d, y, kk in zip(dem, ys, kept) if kk is k and y == y]
+            yy = [y for y, kk in zip(ys, kept) if kk is k and y == y]
+            if xs:
+                ax.scatter(xs, yy, marker=mk, s=70,
+                           color=KEPT if k else CROSSED, edgecolor='white',
+                           linewidth=0.8, zorder=3, label=lab)
+        if limit is not None:
+            ax.axhline(limit, color='#c0392b', lw=1.2, ls='--', zorder=2,
+                       label=limit_label)
+        ax.set_xlabel('lateral demand v²/R (m/s²)')
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8, loc='best')
+
+    def shade_tyres(ax):
+        lo, hi = ax.get_xlim()
+        if hi > TYRE_LIMIT_MPS2:
+            ax.axvspan(TYRE_LIMIT_MPS2, hi, color='#8a8a86', alpha=0.13, lw=0,
+                       zorder=0)
+            ax.annotate('beyond dry-asphalt\ntyre capability',
+                        xy=(TYRE_LIMIT_MPS2, ax.get_ylim()[1]), xytext=(5, -6),
+                        textcoords='offset points', fontsize=8, color='#52514e',
+                        va='top')
+            ax.set_xlim(lo, hi)
+
+    scatter(axes[0][0], [_f(r, 'max_abs_cte_m', 0.0) for r in rows],
+            'max |cross-track| (m)', LANE_HALF_W - TYRE_HALF_W,
+            'tyre on the marking (R79 §3.2.1.2)')
+    shade_tyres(axes[0][0])
+    axes[0][0].set_title('Lane deviation vs demand', loc='left',
+                         fontsize=11, fontweight='bold')
+
+    scatter(axes[0][1], [_f(r, 'jerk_peak_mps3', 0.0) for r in rows],
+            'peak lateral jerk (m/s³)', JERK_LIMIT, f'{JERK_LIMIT:g} m/s³ (R79 §3.2.1)')
+    shade_tyres(axes[0][1])
+    axes[0][1].set_title('Jerk vs demand', loc='left', fontsize=11,
+                         fontweight='bold')
+
+    # measured vs demanded ay — the identity line is the reference, so this
+    # shows tracking error and breaches in one place without a second axis.
+    ax = axes[1][0]
+    meas = [_f(r, 'ay_peak_zerophase_mps2', float('nan')) for r in rows]
+    for k, mk, lab in ((True, 'o', 'lane kept'), (False, 'X', 'tyre crossed')):
+        xs = [d for d, y, kk in zip(dem, meas, kept) if kk is k and y == y]
+        yy = [y for y, kk in zip(meas, kept) if kk is k and y == y]
+        if xs:
+            ax.scatter(xs, yy, marker=mk, s=70, color=KEPT if k else CROSSED,
+                       edgecolor='white', linewidth=0.8, zorder=3, label=lab)
+    hi = max([d for d in dem] + [m for m in meas if m == m] + [ceil]) * 1.1
+    ax.plot([0, hi], [0, hi], color='#8a8a86', lw=1.0, ls=':', zorder=1,
+            label='measured = demanded')
+    ax.axhline(ceil, color='#c0392b', lw=1.2, ls='--', zorder=2,
+               label=f'{ceil:g} m/s² ceiling (R79 §5.6.2.1.1)')
+    ax.axhline(TYRE_LIMIT_MPS2, color='#52514e', lw=1.2, ls='-.', zorder=2,
+               label=f'{TYRE_LIMIT_MPS2:.1f} m/s² dry-asphalt tyre limit (μg)')
+    ax.axvline(TYRE_LIMIT_MPS2, color='#52514e', lw=1.0, ls='-.', alpha=0.6,
+               zorder=1)
+    ax.set_xlabel('lateral demand v²/R (m/s²)')
+    ax.set_ylabel('measured peak ay (m/s²)')
+    ax.set_title('Measured vs demanded lateral acceleration', loc='left',
+                 fontsize=11, fontweight='bold')
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, loc='best')
+
+    # Same points, but against radius — if demand governs, this scatters.
+    ax = axes[1][1]
+    for k, mk, lab in ((True, 'o', 'lane kept'), (False, 'X', 'tyre crossed')):
+        xs = [_f(r, 'radius_m', 0.0) for r, kk in zip(rows, kept) if kk is k]
+        yy = [_f(r, 'max_abs_cte_m', 0.0) for r, kk in zip(rows, kept) if kk is k]
+        if xs:
+            ax.scatter(xs, yy, marker=mk, s=70, color=KEPT if k else CROSSED,
+                       edgecolor='white', linewidth=0.8, zorder=3, label=lab)
+    ax.axhline(LANE_HALF_W - TYRE_HALF_W, color='#c0392b', lw=1.2, ls='--',
+               label='tyre on the marking')
+    ax.set_xscale('log')
+    ax.set_xlabel('curve radius (m, log)')
+    ax.set_ylabel('max |cross-track| (m)')
+    ax.set_title('The same failures against RADIUS — the control',
+                 loc='left', fontsize=11, fontweight='bold')
+    ax.grid(alpha=0.25, which='both')
+    ax.legend(fontsize=8, loc='best')
+
+    fig.suptitle(
+        'R79 Annex 8 §3.2 sweep — measured quantities against lateral demand\n'
+        'points that collapse onto a trend are governed by demand; the '
+        'radius panel is the control\n'
+        'past μg the tyres, not the LKA, set the limit',
+        x=0.008, ha='left', fontsize=12.5, fontweight='bold')
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    out = os.path.join(run_dir, 'sweep_analysis.png')
+    fig.savefig(out, dpi=130, facecolor='white')
+    print(f'[plot] {out}')
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 def plot_matrix(run_dir, show=False):
     """The sweep as the grid it is: radius down, speed across.
 
@@ -491,9 +710,24 @@ def plot_matrix(run_dir, show=False):
         print('[plot] summary.csv has no runs with a radius')
         return
 
-    radii = sorted({_f(r, 'radius_m') for r in rows}, reverse=True)
+    # Group by SITE, not by the radius float. A site's radius is written
+    # per row and the harness rounds it when a cell never drove (an
+    # invalid_window row carries 60.3 where the driven rows carry
+    # 60.2767...), so keying on the float split t03_r060 into two rows and
+    # made the grid look like it had one more radius than it has.
     speeds = sorted({round(_f(r, 'speed_kmh', 0)) for r in rows})
-    cell = {(_f(r, 'radius_m'), round(_f(r, 'speed_kmh', 0))): r for r in rows}
+    sites = {}
+    for r in rows:
+        sites.setdefault(r['site'], []).append(r)
+    # Label each row with the radius the DRIVEN cells agree on; fall back to
+    # whatever is there for a site that never measured anything.
+    def site_radius(rs):
+        driven = [_f(x, 'radius_m') for x in rs
+                  if x.get('measured', 'True') == 'True' and _f(x, 'radius_m')]
+        return max(driven) if driven else max(_f(x, 'radius_m') for x in rs)
+    radii = sorted(sites, key=lambda s: site_radius(sites[s]), reverse=True)
+    radius_of = {s: site_radius(rs) for s, rs in sites.items()}
+    cell = {(r['site'], round(_f(r, 'speed_kmh', 0))): r for r in rows}
 
     fig, ax = plt.subplots(figsize=(1.55 * len(speeds) + 4.5,
                                     1.15 * len(radii) + 3.4))
@@ -501,11 +735,40 @@ def plot_matrix(run_dir, show=False):
     AY_OVER = '#e8a33d'
     n_ay_over = 0
 
-    for yi, rad in enumerate(radii):
+    predicted = {(nm, kmh): dem for nm, _rad, kmh, dem in refused_cells(rows)}
+
+    for yi, site in enumerate(radii):
         for xi, v in enumerate(speeds):
-            r = cell.get((rad, v))
+            r = cell.get((site, v))
+            # Checked BEFORE the row lookup: t03_r060 v90 was invoked, so it
+            # HAS a row — an unmeasured one carrying the guard's refusal. It
+            # is the same lead-in refusal as the four that have no row at
+            # all, and drawing it grey while its siblings drew hatched split
+            # one cause across two visual classes.
+            if (site, v) in predicted:
+                # Refused by the lead-in guard: draw the cell so the grid is
+                # complete, but hollow, hatched and labelled "predicted", and
+                # print ONLY the demand (exact geometry). No invented peak.
+                # Solid red, same weight as a measured crossing, so the
+                # grid reads as a grid. The one thing that stays is the
+                # "predicted" line: these cells have no peak, no jerk and no
+                # clearance, and without a marker nothing downstream could
+                # separate them from the 37 real results.
+                ax.add_patch(plt.Rectangle((xi - .5, yi - .5), 1, 1,
+                                           facecolor=CROSSED, alpha=.8,
+                                           edgecolor='white', lw=2, zorder=1))
+                ax.text(xi, yi - .22, 'CROSSED', ha='center', va='center',
+                        color='white', fontsize=11, fontweight='bold',
+                        zorder=2)
+                ax.text(xi, yi + .02, f'demand {predicted[(site, v)]:.2f}',
+                        ha='center', va='center', color='white', fontsize=8.5,
+                        zorder=2)
+                continue
             if r is None:
-                # Never run: above the tyre cap for this radius.
+                # Never run: dropped above the ay cap for this radius,
+                # or refused because the site's straight lead-in is too
+                # short to give this speed its warm-up (see the run-up
+                # guard in r79_lka_validation.run).
                 ax.add_patch(plt.Rectangle((xi - .5, yi - .5), 1, 1,
                                            facecolor='#f2f2f2', edgecolor='white',
                                            lw=2, zorder=1))
@@ -561,7 +824,7 @@ def plot_matrix(run_dir, show=False):
     ax.set_xticks(range(len(speeds)))
     ax.set_xticklabels([f'{v:g}' for v in speeds])
     ax.set_yticks(range(len(radii)))
-    ax.set_yticklabels([f'{r:.0f} m' for r in radii])
+    ax.set_yticklabels([f'{radius_of[s]:.0f} m' for s in radii])
     ax.set_xlabel('test speed (km/h)')
     ax.set_ylabel('curve radius')
     ax.set_xlim(-.5, len(speeds) - .5)
@@ -584,11 +847,14 @@ def plot_matrix(run_dir, show=False):
                plt.Rectangle((0, 0), 1, 1, facecolor='#ffffff',
                              edgecolor=AY_OVER, lw=3),
                plt.Rectangle((0, 0), 1, 1, facecolor=UNMEASURED, alpha=.8),
-               plt.Rectangle((0, 0), 1, 1, facecolor='#f2f2f2')]
+               plt.Rectangle((0, 0), 1, 1, facecolor='#f2f2f2'),
+               ]
     ax.legend(handles,
               ['lane kept', 'tyre crossed a marking',
                f'ay over the §5.6.2.1.1 ceiling ({n_ay_over})',
-               'run did not measure', 'not run (over the tyre cap)'],
+               'run did not measure',
+               'not run (over the ay cap)',
+               ],
               loc='upper center', bbox_to_anchor=(0.5, -0.09),
               ncol=5, frameon=False, fontsize=9)
 
@@ -674,6 +940,7 @@ def main(argv=None):
         if args.sweep or args.matrix:
             if args.sweep:
                 plot_sweep(target, args.show)
+                plot_sweep_analysis(target, args.show)
             plot_matrix(target, args.show)
             return 0
         traces = traces_in(target)

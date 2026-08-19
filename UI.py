@@ -22,6 +22,7 @@ to /Car_1/camera/front/compressed (rclpy, runs in a background thread).
 
 Run with system Python 3.10 (ROS-sourceable, has rclpy + PIL + cv2 + numpy).
 """
+import json
 import math
 import os
 import re
@@ -193,6 +194,7 @@ WEATHER_PRESETS = [
     'MidRainyNoon', 'HardRainNoon', 'SoftRainNoon',
     'ClearSunset', 'CloudySunset', 'WetSunset', 'HardRainSunset',
     'ClearNight', 'CloudyNight',
+    'FogNoon',   # custom, see FOG_PRESETS
 ]
 
 TRAFFIC_OPTIONS = ['0', '5', '10', '20', '30', '50']
@@ -230,14 +232,36 @@ def set_boot_map(ini_path: Path, town: str):
 # Each of these snippets is fed to the carla-env Python via `-c`. They
 # connect to the running CARLA, mutate state, and exit — no long-lived
 # subprocess. Failures bubble up to the caller for logging.
+# FogNoon is not a CARLA preset. The declared ODD (README) covers "clear,
+# cloudy, foggy and rainy", but WeatherParameters ships no foggy preset, so
+# fog was untestable and the declaration claimed coverage the rig could not
+# produce. Built here from CloudyNoon with the operator's values —
+# fog_density 50 %, fog_distance 30 m — so the ODD's fog cell is real.
+# fog_falloff 0.2 keeps the fog low and roughly uniform in the camera's
+# field rather than stacking it above the road.
+FOG_PRESETS = {
+    'FogNoon': dict(base='CloudyNoon', fog_density=50.0,
+                    fog_distance=30.0, fog_falloff=0.2),
+}
+
 _WEATHER_SNIPPET = """
-import carla, sys
+import carla, sys, json
 preset = sys.argv[1]
 port = int(sys.argv[2])
+fog = json.loads(sys.argv[3]) if len(sys.argv) > 3 else None
 client = carla.Client('localhost', port); client.set_timeout(10.0)
 world = client.get_world()
-world.set_weather(getattr(carla.WeatherParameters, preset))
-print(f'[weather] applied {preset}')
+if fog:
+    w = getattr(carla.WeatherParameters, fog['base'])
+    w.fog_density  = fog['fog_density']
+    w.fog_distance = fog['fog_distance']
+    w.fog_falloff  = fog['fog_falloff']
+    world.set_weather(w)
+    print(f"[weather] applied {preset} "
+          f"(fog {fog['fog_density']:.0f}% at {fog['fog_distance']:.0f} m)")
+else:
+    world.set_weather(getattr(carla.WeatherParameters, preset))
+    print(f'[weather] applied {preset}')
 """
 
 _TRAFFIC_SPAWN_SNIPPET = """
@@ -1480,7 +1504,10 @@ class ADASUI:
         preset = self.weather_var.get()
         port = self.port_var.get()
         self._log(f'[ui] applying weather {preset} on port {port}')
-        self._run_carla_snippet(_WEATHER_SNIPPET, [preset, port], 'weather')
+        args = [preset, port]
+        if preset in FOG_PRESETS:
+            args.append(json.dumps(FOG_PRESETS[preset]))
+        self._run_carla_snippet(_WEATHER_SNIPPET, args, 'weather')
 
     def spawn_traffic(self):
         n = self.traffic_var.get()

@@ -55,6 +55,15 @@ class CollisionEvent:
     sim_time: float
     other_id: str
     impact_speed: float       # ego speed [m/s] at the moment of impact
+    # Contact bearing in the EGO frame [deg]: 0 = dead ahead, +90 = struck
+    # on the right flank, 180 = rear. Derived from the collision normal
+    # impulse, which points along the contact normal, so it answers the
+    # question the actor type cannot: did the ego drive into something, or
+    # was it hit? A junction collision where an NPC arrives on the flank is
+    # not the same event as running into a fence, and a validation claim
+    # that scores them alike is not measuring the system.
+    contact_bearing_deg: float = float('nan')
+    impulse_mag: float = float('nan')
 
 
 @dataclass
@@ -397,10 +406,19 @@ class CarlaAdapter(SimAdapter):
 
     def _on_collision(self, event) -> None:
         v = self.ego.get_velocity()
+        # Rotate the impulse into the ego frame to get the contact bearing.
+        imp = event.normal_impulse
+        yaw = math.radians(self.ego.get_transform().rotation.yaw)
+        fwd = imp.x * math.cos(yaw) + imp.y * math.sin(yaw)
+        lat = -imp.x * math.sin(yaw) + imp.y * math.cos(yaw)
+        mag = math.sqrt(imp.x ** 2 + imp.y ** 2 + imp.z ** 2)
+        bearing = math.degrees(math.atan2(lat, fwd)) if mag > 1e-6 else float('nan')
         self._collisions.append(CollisionEvent(
             sim_time=self.world.get_snapshot().timestamp.elapsed_seconds,
             other_id=event.other_actor.type_id,
-            impact_speed=math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2)))
+            impact_speed=math.sqrt(v.x ** 2 + v.y ** 2 + v.z ** 2),
+            contact_bearing_deg=bearing,
+            impulse_mag=mag))
 
     def arm(self, placement_distance_m: float,
             lateral_offset_m: float) -> ScenarioGeometry:
