@@ -1,6 +1,6 @@
 # DriveSimple
 
-![DriveSimple](figures/DriveSimple.svg)
+![DriveSimple](figures/DriveSimple.jpg)
 
 ## ROS 2 ADAS Stack — ACC + LKA
 
